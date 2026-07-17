@@ -94,8 +94,10 @@ def test_analyze_put_heavy_chain_is_short_gamma():
     a = analyze(pd.DataFrame(rows), spot=100.0, asof=ASOF)
     assert a.regime == "short_gamma"
     assert a.total_gex < 0
-    assert a.call_wall == 105.0
-    assert a.put_wall in (95.0, 100.0)
+    assert a.call_wall_strike == 105.0
+    assert abs(a.call_wall - 105.0) <= 5.0  # pinpoint, anchored near the strike
+    assert a.put_wall_strike in (95.0, 100.0)
+    assert abs(a.put_wall - a.put_wall_strike) <= 5.0
 
 
 def test_analyze_sample_chain():
@@ -105,6 +107,29 @@ def test_analyze_sample_chain():
     assert a.gamma_flip is not None and a.gamma_flip < spot
     assert a.call_wall > spot > a.put_wall
     assert len(a.by_expiry) == 4
+
+
+def test_levels_are_pinpoint():
+    from dealer_gex.analytics import side_gamma_density, total_gex_at, _fill_gamma
+
+    chain, spot = read_chain((REPO / "data" / "sample_option_chain.csv").read_bytes())
+    a = analyze(chain, spot, ASOF)
+    df = _fill_gamma(chain, spot, ASOF, a.rate)
+
+    # flip is a true zero of the GEX function, to sub-cent scale
+    scale = abs(total_gex_at(df, spot, a.rate))
+    assert abs(total_gex_at(df, a.gamma_flip, a.rate)) < scale * 1e-3
+
+    # walls are local maxima of each side's smoothed gamma density
+    for wall, strike, side in ((a.call_wall, a.call_wall_strike, "C"),
+                               (a.put_wall, a.put_wall_strike, "P")):
+        assert abs(wall - strike) <= 5.0  # anchored within one strike spacing
+        peak = side_gamma_density(a.by_strike, wall, side, 5.0)
+        assert peak >= side_gamma_density(a.by_strike, wall - 0.25, side, 5.0)
+        assert peak >= side_gamma_density(a.by_strike, wall + 0.25, side, 5.0)
+
+    # max pain interpolates between strikes but stays near the discrete min
+    assert 620.0 <= a.max_pain <= 630.0
 
 
 def test_analyze_drops_expired_contracts():

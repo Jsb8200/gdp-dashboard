@@ -172,8 +172,10 @@ def metrics_row(a: Analysis) -> None:
     )
     cols[0].metric("Spot", f"{a.spot:,.2f}")
     cols[1].metric("Gamma flip", flip_val, flip_delta, delta_color="off")
-    cols[2].metric("Call wall", f"{a.call_wall:,.2f}")
-    cols[3].metric("Put wall", f"{a.put_wall:,.2f}")
+    cols[2].metric("Call wall", f"{a.call_wall:,.2f}",
+                   f"strike {a.call_wall_strike:,.0f}", delta_color="off")
+    cols[3].metric("Put wall", f"{a.put_wall:,.2f}",
+                   f"strike {a.put_wall_strike:,.0f}", delta_color="off")
     cols[4].metric("Net GEX / 1% move", fmt_dollars(a.total_gex))
 
 
@@ -350,10 +352,12 @@ def main() -> None:
   differ; treat every level as an estimate.
 - **GEX** = gamma × OI × 100 × spot² × 1% — dollar hedging demand per 1% move.
 - **Gamma flip** — net GEX recomputed across a ±15% spot grid (Black-Scholes
-  gamma from each contract's IV, held fixed); the zero crossing nearest spot.
-- **Walls** — call wall: strike with the largest positive dealer gamma; put
-  wall: largest negative. Price tends to pin at walls in a long-gamma regime
-  and accelerate through them in a short-gamma regime.
+  gamma from each contract's IV, held fixed); the zero crossing nearest spot,
+  bisected to cent precision.
+- **Walls** — pinpoint levels, not strike-rounded: the exact spot level where
+  each side's aggregate dollar gamma peaks, searched around the heaviest
+  strike (shown as the anchor). Price tends to pin at walls in a long-gamma
+  regime and accelerate through them in a short-gamma regime.
 - Missing greeks are filled with Black-Scholes gamma (rate {rate:.2%}).
   Expired contracts are excluded. Open interest updates daily — this is
   positioning analysis, **not trading advice**.

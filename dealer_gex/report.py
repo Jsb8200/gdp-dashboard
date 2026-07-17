@@ -48,9 +48,9 @@ def build_markdown(a: Analysis, ticker: str = "") -> str:
         "|---|---|---|",
         f"| Spot (as of analysis) | {a.spot:,.2f} | Reference price for all calculations |",
         f"| Gamma flip (zero-gamma) | {flip} | Below: dealers short gamma (destabilizing); above: long gamma (stabilizing) |",
-        f"| Call wall | {a.call_wall:,.2f} | Largest positive dealer gamma — rallies tend to stall/pin here |",
-        f"| Put wall | {a.put_wall:,.2f} | Largest negative dealer gamma — selloffs tend to accelerate below, or find support at, this strike |",
-        f"| Max pain | {a.max_pain:,.2f} | Strike minimizing option-holder payout at expiry |",
+        f"| Call wall | {a.call_wall:,.2f} (strike {a.call_wall_strike:,.0f}) | Peak aggregate dealer call gamma — rallies tend to stall/pin here |",
+        f"| Put wall | {a.put_wall:,.2f} (strike {a.put_wall_strike:,.0f}) | Peak aggregate dealer put gamma — selloffs tend to accelerate below, or find support at, this level |",
+        f"| Max pain | {a.max_pain:,.2f} | Level minimizing option-holder payout at expiry |",
         f"| Net GEX | {fmt_dollars(a.total_gex)} / 1% move | Total dealer hedging demand per 1% move in spot |",
         "",
         "## Per-expiry breakdown",
@@ -94,6 +94,10 @@ def build_markdown(a: Analysis, ticker: str = "") -> str:
         "- Missing greeks are filled with Black-Scholes gamma from each "
         "contract's implied volatility; the gamma-flip curve re-prices gamma "
         "across hypothetical spot levels holding IV fixed (sticky-strike).",
+        "- Levels are pinpoint, not strike-rounded: the flip is bisected to "
+        "cent precision, walls are the exact spot level where each side's "
+        "aggregate dollar gamma peaks (anchor strike shown alongside), and "
+        "max pain is interpolated between strikes.",
         "- Open interest updates once daily; intraday flows are not captured. "
         "This report is analysis of positioning, not trading advice.",
         "",

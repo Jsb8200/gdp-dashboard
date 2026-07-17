@@ -53,8 +53,10 @@ class Analysis:
     total_gex: float          # $ per 1% move, net dealer gamma
     regime: str               # 'long_gamma' | 'short_gamma'
     gamma_flip: float | None  # zero-gamma spot level (None if no crossing)
-    call_wall: float
-    put_wall: float
+    call_wall: float          # pinpoint: spot level of peak aggregate call gamma
+    put_wall: float           # pinpoint: spot level of peak aggregate put gamma
+    call_wall_strike: float   # anchor strike the call wall sits on
+    put_wall_strike: float    # anchor strike the put wall sits on
     max_pain: float
     by_strike: pd.DataFrame   # strike, call_gex, put_gex, net_gex, call_oi, put_oi
     curve: pd.DataFrame       # spot_level, total_gex
@@ -131,19 +133,94 @@ def gamma_flip(curve: pd.DataFrame, spot: float) -> float | None:
     return float(min(crossings, key=lambda x: abs(x - spot)))
 
 
+def refine_flip(df: pd.DataFrame, curve: pd.DataFrame, spot: float,
+                rate: float, tol: float = 0.005) -> float | None:
+    """Bisect the actual GEX function around the curve's crossing to cent
+    precision (the curve alone is only as precise as its grid step)."""
+    approx = gamma_flip(curve, spot)
+    if approx is None:
+        return None
+    lv = curve["spot_level"].to_numpy()
+    i = int(np.clip(np.searchsorted(lv, approx) - 1, 0, len(lv) - 2))
+    lo, hi = lv[i], lv[i + 1]
+    f_lo = total_gex_at(df, lo, rate)
+    if f_lo == 0:
+        return float(lo)
+    while hi - lo > tol:
+        mid = (lo + hi) / 2
+        f_mid = total_gex_at(df, mid, rate)
+        if f_mid == 0:
+            return float(mid)
+        if (f_lo < 0) == (f_mid < 0):
+            lo, f_lo = mid, f_mid
+        else:
+            hi = mid
+    return float((lo + hi) / 2)
+
+
+def side_gamma_density(by_strike: pd.DataFrame, x, side: str, bandwidth: float) -> float:
+    """Kernel-smoothed dealer gamma concentration for one side as a
+    continuous function of price level (Gaussian kernel per strike,
+    weighted by that strike's dollar gamma at the current spot)."""
+    col = "call_gex" if side == "C" else "put_gex"
+    w = by_strike[col].abs().to_numpy()
+    k = by_strike["strike"].to_numpy()
+    return float(np.sum(w * np.exp(-0.5 * ((x - k) / bandwidth) ** 2)))
+
+
+def wall_level(by_strike: pd.DataFrame, seed_strike: float, spacing: float,
+               side: str, tol: float = 0.005) -> float:
+    """Pinpoint wall: the price level where that side's smoothed gamma
+    density peaks, searched around the heaviest strike (golden-section).
+
+    Neighboring strikes pull the peak off the grid, so the wall lands
+    between strikes when the concentration is lopsided."""
+    inv_phi = (np.sqrt(5.0) - 1.0) / 2.0
+    a, b = seed_strike - spacing, seed_strike + spacing
+    c = b - inv_phi * (b - a)
+    d = a + inv_phi * (b - a)
+    f_c = side_gamma_density(by_strike, c, side, spacing)
+    f_d = side_gamma_density(by_strike, d, side, spacing)
+    while b - a > tol:
+        if f_c > f_d:
+            b, d, f_d = d, c, f_c
+            c = b - inv_phi * (b - a)
+            f_c = side_gamma_density(by_strike, c, side, spacing)
+        else:
+            a, c, f_c = c, d, f_d
+            d = a + inv_phi * (b - a)
+            f_d = side_gamma_density(by_strike, d, side, spacing)
+    return float((a + b) / 2)
+
+
 def max_pain(chain: pd.DataFrame) -> float:
-    """Strike minimizing the total intrinsic payout to option holders."""
+    """Level minimizing the total intrinsic payout to option holders.
+
+    Evaluated on the strike grid, then refined off-grid with a parabola
+    through the minimum and its neighbors (the payout function is convex
+    and piecewise-linear between strikes, so this stays inside them).
+    """
     strikes = np.sort(chain["strike"].unique())
     calls = chain[chain["type"] == "C"]
     puts = chain[chain["type"] == "P"]
-    payouts = [
+    payouts = np.array([
         float(
             (np.maximum(s - calls["strike"], 0) * calls["open_interest"]).sum()
             + (np.maximum(puts["strike"] - s, 0) * puts["open_interest"]).sum()
         )
         for s in strikes
-    ]
-    return float(strikes[int(np.argmin(payouts))])
+    ])
+    i = int(np.argmin(payouts))
+    if 0 < i < len(strikes) - 1:
+        x0, x1, x2 = strikes[i - 1], strikes[i], strikes[i + 1]
+        y0, y1, y2 = payouts[i - 1], payouts[i], payouts[i + 1]
+        denom = (x1 - x0) * (y1 - y2) - (x1 - x2) * (y1 - y0)
+        if denom != 0:
+            vertex = x1 - 0.5 * (
+                (x1 - x0) ** 2 * (y1 - y2) - (x1 - x2) ** 2 * (y1 - y0)
+            ) / denom
+            return float(np.clip(vertex, x0, x2))
+    return float(strikes[i])
 
 
 def analyze(chain: pd.DataFrame, spot: float, asof: date,
@@ -159,12 +236,17 @@ def analyze(chain: pd.DataFrame, spot: float, asof: date,
     strikes = gex_by_strike(df, spot)
     curve = gex_curve(df, spot, rate)
     total = total_gex_at(df, spot, rate)
-    flip = gamma_flip(curve, spot)
+    flip = refine_flip(df, curve, spot, rate)
+
+    uniq = np.sort(strikes["strike"].unique())
+    spacing = float(np.median(np.diff(uniq))) if len(uniq) > 1 else spot * 0.01
 
     pos = strikes[strikes["call_gex"] > 0]
     neg = strikes[strikes["put_gex"] < 0]
-    call_wall = float(pos.loc[pos["call_gex"].idxmax(), "strike"]) if not pos.empty else spot
-    put_wall = float(neg.loc[neg["put_gex"].idxmin(), "strike"]) if not neg.empty else spot
+    call_seed = float(pos.loc[pos["call_gex"].idxmax(), "strike"]) if not pos.empty else spot
+    put_seed = float(neg.loc[neg["put_gex"].idxmin(), "strike"]) if not neg.empty else spot
+    call_wall = wall_level(strikes, call_seed, spacing, "C") if not pos.empty else spot
+    put_wall = wall_level(strikes, put_seed, spacing, "P") if not neg.empty else spot
 
     signed = np.where(df["type"] == "C", 1.0, -1.0)
     df = df.assign(net_gex=signed * _dollar_gex(df["gamma"], df["open_interest"], spot))
@@ -188,6 +270,8 @@ def analyze(chain: pd.DataFrame, spot: float, asof: date,
         gamma_flip=flip,
         call_wall=call_wall,
         put_wall=put_wall,
+        call_wall_strike=call_seed,
+        put_wall_strike=put_seed,
         max_pain=max_pain(chain),
         by_strike=strikes,
         curve=curve,
