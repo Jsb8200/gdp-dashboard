@@ -14,7 +14,9 @@ import streamlit as st
 
 from dealer_gex.analytics import Analysis, analyze, fmt_dollars
 from dealer_gex.parsing import ChainParseError, normalize_chain, read_chain
-from dealer_gex.report import build_markdown, markdown_to_html, regime_text
+from dealer_gex.report import (
+    build_markdown, build_playbook, key_ladder, markdown_to_html, regime_text,
+)
 
 SAMPLE_PATH = Path(__file__).parent / "data" / "sample_option_chain.csv"
 SAMPLE_ASOF = date(2026, 7, 17)  # quote date baked into the sample chain
@@ -178,6 +180,28 @@ def metrics_row(a: Analysis) -> None:
                    f"strike {a.put_wall_strike:,.0f}", delta_color="off")
     cols[4].metric("Net GEX / 1% move", fmt_dollars(a.total_gex))
 
+    def flow(x: float) -> str:
+        return f"{'+' if x >= 0 else '-'}{fmt_dollars(abs(x))}"
+
+    cols = st.columns(5)
+    em_val = f"±{a.expected_move:,.2f}" if a.expected_move is not None else "—"
+    em_note = f"into {a.nearest_expiry}" if a.expected_move is not None else None
+    cols[0].metric("Expected move (1σ)", em_val, em_note, delta_color="off",
+                   help="Straddle approximation from near-the-money IV at the nearest expiry.")
+    cols[1].metric("Net DEX", fmt_dollars(a.dex),
+                   help="Net dealer delta inventory under the standard convention.")
+    cols[2].metric("Vanna flow / -1 IV pt", flow(a.vanna_flow),
+                   "buying" if a.vanna_flow >= 0 else "selling", delta_color="off",
+                   help="Forced dealer re-hedging if implied vol drops one point.")
+    cols[3].metric("Charm flow / day", flow(a.charm_flow),
+                   "buying" if a.charm_flow >= 0 else "selling", delta_color="off",
+                   help="Forced dealer re-hedging per calendar day from delta decay.")
+    cols[4].metric("Weighting", "Volume" if a.weight_mode == "volume" else "OI",
+                   "intraday flow" if a.weight_mode == "volume" else "positioning",
+                   delta_color="off",
+                   help="Volume mode reads today's traded flow (intraday/0DTE); "
+                        "OI mode reads standing positioning.")
+
 
 def _level_lines(fig: go.Figure, a: Analysis, walls: bool = True) -> None:
     fig.add_vline(x=a.spot, line_dash="dot", line_color=C["ink"], line_width=1,
@@ -200,6 +224,13 @@ def gex_by_strike_chart(a: Analysis) -> None:
     lo, hi = a.spot * 0.88, a.spot * 1.12
     df = a.by_strike.query("@lo <= strike <= @hi")
     fig = go.Figure()
+    if a.expected_move is not None:
+        fig.add_vrect(x0=max(lo, a.spot - a.expected_move),
+                      x1=min(hi, a.spot + a.expected_move),
+                      fillcolor=C["wash_pos"], line_width=0,
+                      annotation_text="±1σ expected move",
+                      annotation_position="bottom right",
+                      annotation_font_color=C["muted"])
     fig.add_bar(x=df["strike"], y=df["call_gex"] / 1e6, name="Calls (dealers long)",
                 marker_color=C["call"],
                 hovertemplate="strike %{x}<br>call GEX $%{y:,.0f}M<extra></extra>")
@@ -252,6 +283,19 @@ def oi_chart(a: Analysis) -> None:
     st.plotly_chart(_style(fig), use_container_width=True)
 
 
+def playbook_section(a: Analysis) -> None:
+    st.subheader("Trading interpretation")
+    left, right = st.columns([3, 2])
+    with left:
+        # escape $ so st.markdown doesn't read paired dollars as LaTeX math
+        st.markdown("\n".join(f"- {b}" for b in build_playbook(a)).replace("$", "\\$"))
+    with right:
+        ladder = key_ladder(a).copy()
+        ladder["Price"] = ladder["Price"].map(lambda x: f"{x:,.2f}")
+        st.dataframe(ladder, use_container_width=True, hide_index=True)
+        st.caption("Level ladder — all actionable levels, price-sorted.")
+
+
 def tables(a: Analysis) -> None:
     left, right = st.columns(2)
     with left:
@@ -280,7 +324,7 @@ def report_section(a: Analysis, ticker: str) -> None:
     c2.download_button("Download report (.html)", markdown_to_html(md),
                        file_name=f"{stem}.html", mime="text/html")
     with st.expander("Preview report"):
-        st.markdown(md)
+        st.markdown(md.replace("$", "\\$"))
 
 
 # --- main --------------------------------------------------------------------
@@ -309,6 +353,14 @@ def main() -> None:
         help="Time-to-expiry is measured from this date. Use the chain's quote date.",
     )
     rate = st.sidebar.number_input("Risk-free rate (%)", 0.0, 15.0, 4.5, 0.25) / 100
+    weight = st.sidebar.radio(
+        "Weighting",
+        ["Open interest (positioning)", "Volume (intraday / 0DTE flow)"],
+        help="Open interest reads the standing dealer book (updates overnight). "
+             "Volume weights by today's traded contracts — better for intraday "
+             "and 0DTE reads, where OI misses most of the action.",
+    )
+    weight = "volume" if weight.startswith("Volume") else "open_interest"
 
     all_exp = sorted(d for d in chain["expiry"].dt.date.dropna().unique())
     picked = st.sidebar.multiselect(
@@ -319,10 +371,14 @@ def main() -> None:
         chain = chain[chain["expiry"].dt.date.isin(picked)]
 
     try:
-        a = analyze(chain, spot, asof, rate)
+        a = analyze(chain, spot, asof, rate, weight=weight)
     except ValueError as exc:
         st.error(f"{exc} — check the as-of date against the chain's expiries.")
         return
+
+    if weight == "volume" and chain["volume"].sum() == 0:
+        st.warning("This file has no volume data — volume weighting shows nothing. "
+                   "Switch back to open interest.", icon="⚠️")
 
     if inferred_spot is None:
         st.warning(
@@ -340,6 +396,7 @@ def main() -> None:
     with col2:
         oi_chart(a)
 
+    playbook_section(a)
     tables(a)
     report_section(a, ticker)
 
@@ -358,6 +415,13 @@ def main() -> None:
   each side's aggregate dollar gamma peaks, searched around the heaviest
   strike (shown as the anchor). Price tends to pin at walls in a long-gamma
   regime and accelerate through them in a short-gamma regime.
+- **Vanna / charm flows** — Black-Scholes estimates of dealer re-hedging
+  forced by a 1-point IV drop and by one day of delta decay. **Expected
+  move** is the 1σ straddle approximation from near-the-money IV at the
+  nearest expiry.
+- **Weighting** — open interest reads the standing book (updates
+  overnight); volume mode weights by today's traded contracts for
+  intraday/0DTE reads.
 - Missing greeks are filled with Black-Scholes gamma (rate {rate:.2%}).
   Expired contracts are excluded. Open interest updates daily — this is
   positioning analysis, **not trading advice**.

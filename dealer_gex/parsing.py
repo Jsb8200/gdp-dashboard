@@ -215,8 +215,10 @@ def _finalize(df: pd.DataFrame) -> pd.DataFrame:
 
     df["open_interest"] = df["open_interest"].fillna(0)
     df["volume"] = df["volume"].fillna(0)
-    df = df[df["open_interest"] > 0]
+    # Keep zero-OI rows that traded today: they matter in volume-weighted
+    # (intraday/0DTE) mode where fresh positioning has no OI yet.
+    df = df[(df["open_interest"] > 0) | (df["volume"] > 0)]
 
     if df.empty:
-        raise ChainParseError("No rows with positive open interest after normalization.")
+        raise ChainParseError("No rows with positive open interest or volume after normalization.")
     return df[CANONICAL_FIELDS].reset_index(drop=True)

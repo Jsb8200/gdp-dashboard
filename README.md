@@ -51,8 +51,16 @@ sidebar. Multiple files (e.g. one per expiry) can be uploaded together.
 | **Verdict** | Dealers **long gamma** → obliged to buy dips and sell rips (stabilizing, mean-reverting). Dealers **short gamma** → forced to sell weakness and buy strength (destabilizing, trending) |
 | **Gamma flip** | The spot level where net GEX crosses zero — recomputed across a ±15% spot grid and interpolated |
 | **Call / put wall** | Strikes with the largest positive / negative dealer gamma — pin and acceleration levels |
-| **Max pain** | Strike minimizing option-holder payout at expiry |
-| **Report** | Downloadable `.md` / `.html` summary of all of the above with a per-expiry breakdown |
+| **Max pain** | Level minimizing option-holder payout at expiry (interpolated between strikes) |
+| **Expected move** | 1σ straddle-approximation range to the nearest expiry, from near-the-money IV |
+| **Vanna / charm flows** | Forced dealer re-hedging per 1-pt IV drop and per day of delta decay |
+| **Net DEX** | Net dealer delta inventory under the same convention |
+| **Trading interpretation** | Auto-generated playbook: regime read, level-by-level meaning, and a price-sorted level ladder |
+| **Report** | Downloadable `.md` / `.html` summary of all of the above with the playbook and a per-expiry breakdown |
+
+Two weighting modes: **open interest** (standing positioning, updates
+overnight) or **volume** (today's traded flow — better for intraday/0DTE
+reads; zero-OI strikes that traded today are included).
 
 ## Assumptions & caveats
 

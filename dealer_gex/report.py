@@ -30,6 +30,91 @@ def regime_text(regime: str) -> tuple[str, str]:
     return _REGIME_TEXT[regime]
 
 
+def key_ladder(a: Analysis) -> pd.DataFrame:
+    """All actionable levels in one price-sorted ladder (highest first)."""
+    rows = [
+        ("Call wall", a.call_wall, "Rallies stall / pin; premium-selling zone, not a breakout-buy zone"),
+        ("Spot", a.spot, "Current price"),
+        ("Max pain", a.max_pain, "Expiry gravitation level"),
+        ("Put wall", a.put_wall, "Support in long-gamma regime; acceleration marker below the flip"),
+    ]
+    if a.gamma_flip is not None:
+        rows.append(("Gamma flip", a.gamma_flip,
+                     "Regime switch: stabilizing above, destabilizing below"))
+    if a.expected_move is not None:
+        rows.append(("+1σ expected move", a.spot + a.expected_move,
+                     f"1-sigma range top into {a.nearest_expiry}"))
+        rows.append(("-1σ expected move", a.spot - a.expected_move,
+                     f"1-sigma range bottom into {a.nearest_expiry}"))
+    df = pd.DataFrame(rows, columns=["Level", "Price", "Reading"])
+    return df.sort_values("Price", ascending=False).reset_index(drop=True)
+
+
+def _fmt_flow(x: float) -> str:
+    verb = "buying" if x >= 0 else "selling"
+    return f"~{fmt_dollars(abs(x))} of {verb}"
+
+
+def build_playbook(a: Analysis) -> list[str]:
+    """Turn the day's numbers into a trading interpretation (markdown bullets)."""
+    long_g = a.regime == "long_gamma"
+    lines = []
+
+    if long_g:
+        lines.append(
+            "**Regime — long gamma (stabilizing).** Dealer hedging leans against "
+            "price: expect compressed ranges, bought dips, faded breakouts, and "
+            "pinning near heavy strikes. Mean-reversion setups are favored over "
+            "momentum chasing."
+        )
+    else:
+        lines.append(
+            "**Regime — short gamma (destabilizing).** Dealer hedging pushes with "
+            "price: expect extended moves, accelerating selloffs, and squeezes. "
+            "Momentum is favored; fading moves means fighting forced flow."
+        )
+
+    if a.gamma_flip is not None:
+        dist = (a.gamma_flip / a.spot - 1) * 100
+        side = "below" if a.gamma_flip < a.spot else "above"
+        lines.append(
+            f"**Watch {a.gamma_flip:,.2f} (gamma flip, {dist:+.1f}%).** The regime "
+            f"switch sits {abs(dist):.1f}% {side} spot — a sustained break "
+            f"{'below turns the shock absorbers into amplifiers: widen stops and expect range expansion' if long_g else 'above restores dampening: expect moves to lose steam'}."
+        )
+    else:
+        lines.append("**No gamma flip within ±15% of spot** — the current regime is entrenched.")
+
+    lines.append(
+        f"**Range frame: {a.put_wall:,.2f} — {a.call_wall:,.2f}** (put wall to call "
+        f"wall). Into the call wall, dealer selling intensifies; "
+        f"{'toward the put wall, mechanical buying tends to catch price' if long_g else 'through the put wall, hedge selling can accelerate'}."
+    )
+
+    if a.expected_move is not None:
+        lines.append(
+            f"**Options price a ±{a.expected_move:,.2f} (1σ) move** into "
+            f"{a.nearest_expiry} ({a.spot - a.expected_move:,.2f} – "
+            f"{a.spot + a.expected_move:,.2f}). Compare with the walls: a wall "
+            "inside the expected move is likely to be tested; outside, likely to hold."
+        )
+
+    lines.append(
+        f"**Passive flows:** IV down 1pt forces {_fmt_flow(a.vanna_flow)} (vanna); "
+        f"each day of decay forces {_fmt_flow(a.charm_flow)} (charm). In a quiet "
+        "tape these flows lean on price in that direction, typically strongest "
+        "into the close and ahead of expiry."
+    )
+
+    if a.weight_mode == "volume":
+        lines.append(
+            "**Volume-weighted (intraday) view** — levels reflect today's traded "
+            "flow rather than standing open interest; best for 0DTE reads, "
+            "noisier for multi-day positioning."
+        )
+    return lines
+
+
 def build_markdown(a: Analysis, ticker: str = "") -> str:
     title, body = regime_text(a.regime)
     label = f"{ticker.upper()} " if ticker else ""
@@ -52,6 +137,28 @@ def build_markdown(a: Analysis, ticker: str = "") -> str:
         f"| Put wall | {a.put_wall:,.2f} (strike {a.put_wall_strike:,.0f}) | Peak aggregate dealer put gamma — selloffs tend to accelerate below, or find support at, this level |",
         f"| Max pain | {a.max_pain:,.2f} | Level minimizing option-holder payout at expiry |",
         f"| Net GEX | {fmt_dollars(a.total_gex)} / 1% move | Total dealer hedging demand per 1% move in spot |",
+        f"| Net DEX | {fmt_dollars(a.dex)} | Net dealer delta inventory (convention-based) |",
+        f"| Vanna flow | {_fmt_flow(a.vanna_flow)} per -1 IV pt | Forced re-hedging if implied vol drops one point |",
+        f"| Charm flow | {_fmt_flow(a.charm_flow)} per day | Forced re-hedging from delta decay |",
+        "",
+        "## Trading interpretation",
+        "",
+    ]
+    for bullet in build_playbook(a):
+        lines.append(f"- {bullet}")
+
+    ladder = key_ladder(a)
+    lines += [
+        "",
+        "## Level ladder",
+        "",
+        "| Level | Price | Reading |",
+        "|---|---|---|",
+    ]
+    for _, r in ladder.iterrows():
+        lines.append(f"| {r['Level']} | {r['Price']:,.2f} | {r['Reading']} |")
+
+    lines += [
         "",
         "## Per-expiry breakdown",
         "",
@@ -85,7 +192,12 @@ def build_markdown(a: Analysis, ticker: str = "") -> str:
         "## Methodology & assumptions",
         "",
         f"- {a.n_contracts:,} contracts across {len(a.expiries)} expiries; "
-        f"risk-free rate {a.rate:.2%}.",
+        f"risk-free rate {a.rate:.2%}; weighting: "
+        + ("today's traded volume (intraday/0DTE view)." if a.weight_mode == "volume"
+           else "open interest (standing positioning)."),
+        "- Vanna/charm flows are Black-Scholes estimates of dealer re-hedging "
+        "from IV and time changes; the expected move is the 1-sigma straddle "
+        "approximation from near-the-money IV at the nearest expiry.",
         "- Dealer positioning uses the standard GEX convention: dealers assumed "
         "long customer-sold calls and short customer-bought puts, so call OI "
         "contributes positive dealer gamma and put OI negative. Actual dealer "

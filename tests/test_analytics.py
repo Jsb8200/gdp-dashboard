@@ -152,6 +152,50 @@ def test_report_contents():
     assert "<table>" in html and "LONG GAMMA" in html
 
 
+def test_volume_weighting_changes_results():
+    chain, spot = read_chain((REPO / "data" / "sample_option_chain.csv").read_bytes())
+    a_oi = analyze(chain, spot, ASOF)
+    a_vol = analyze(chain, spot, ASOF, weight="volume")
+    assert a_oi.weight_mode == "open_interest" and a_vol.weight_mode == "volume"
+    assert a_vol.total_gex != a_oi.total_gex
+    # volume is a fraction of OI in the sample, so magnitudes shrink
+    assert abs(a_vol.total_gex) < abs(a_oi.total_gex)
+
+
+def test_hedge_flows_and_expected_move():
+    chain, spot = read_chain((REPO / "data" / "sample_option_chain.csv").read_bytes())
+    a = analyze(chain, spot, ASOF)
+    # dealers long calls / short puts => positive delta inventory
+    assert a.dex > 0
+    assert np.isfinite(a.vanna_flow) and np.isfinite(a.charm_flow)
+    # 1-sigma move to the 7-day expiry: roughly spot * iv * sqrt(t)
+    assert a.nearest_expiry == date(2026, 7, 24)
+    approx = spot * 0.16 * np.sqrt(7 / 365)
+    assert 0.5 * approx < a.expected_move < 2 * approx
+
+
+def test_norm_cdf_accuracy():
+    from dealer_gex.analytics import _norm_cdf
+
+    assert _norm_cdf(0.0) == pytest.approx(0.5, abs=1e-7)
+    assert _norm_cdf(1.96) == pytest.approx(0.9750021, abs=1e-6)
+    assert _norm_cdf(-1.96) == pytest.approx(0.0249979, abs=1e-6)
+
+
+def test_playbook_and_ladder():
+    from dealer_gex.report import build_playbook, key_ladder
+
+    chain, spot = read_chain((REPO / "data" / "sample_option_chain.csv").read_bytes())
+    a = analyze(chain, spot, ASOF)
+    text = "\n".join(build_playbook(a))
+    assert "long gamma" in text
+    assert f"{a.gamma_flip:,.2f}" in text
+    assert "vanna" in text and "charm" in text
+    ladder = key_ladder(a)
+    assert list(ladder["Price"]) == sorted(ladder["Price"], reverse=True)
+    assert {"Call wall", "Put wall", "Spot", "Gamma flip"} <= set(ladder["Level"])
+
+
 def test_fmt_dollars():
     assert fmt_dollars(1_460_000_000) == "$1.46B"
     assert fmt_dollars(-441_430_000) == "-$441.43M"
