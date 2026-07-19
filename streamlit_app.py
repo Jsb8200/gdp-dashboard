@@ -12,7 +12,7 @@ import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
 
-from dealer_gex.analytics import Analysis, analyze, fmt_dollars
+from dealer_gex.analytics import Analysis, analyze, fmt_dollars, magnet_levels
 from dealer_gex.parsing import ChainParseError, normalize_chain, parse_file
 from dealer_gex.report import (
     build_markdown, build_playbook, key_ladder, markdown_to_html, regime_text,
@@ -226,7 +226,7 @@ def _level_lines(fig: go.Figure, a: Analysis, walls: bool = True) -> None:
                       annotation_font_color=C["put"])
 
 
-def gex_by_strike_chart(a: Analysis) -> None:
+def gex_by_strike_chart(a: Analysis, magnets: pd.DataFrame | None = None) -> None:
     lo, hi = a.spot * 0.88, a.spot * 1.12
     df = a.by_strike.query("@lo <= strike <= @hi")
     fig = go.Figure()
@@ -246,10 +246,55 @@ def gex_by_strike_chart(a: Analysis) -> None:
                 name="Puts (net dealer)" if flow else "Puts (dealers short)",
                 marker_color=C["put"],
                 hovertemplate="strike %{x}<br>put GEX $%{y:,.0f}M<extra></extra>")
+    if magnets is not None and not magnets.empty:
+        for kind, color, symbol in (("magnet", C["call"], "diamond"),
+                                    ("accelerator", C["put"], "diamond-open")):
+            sub = magnets[magnets["kind"] == kind]
+            if sub.empty:
+                continue
+            fig.add_scatter(
+                x=sub["level"], y=[0] * len(sub), mode="markers",
+                name=f"{'🧲 Magnet' if kind == 'magnet' else '⚡ Accelerator'}",
+                marker=dict(color=color, symbol=symbol, size=11,
+                            line=dict(width=1, color=C["ink"])),
+                customdata=sub["strength"],
+                hovertemplate="%{x:,.2f} · strength %{customdata:.0f}<extra></extra>",
+            )
     fig.update_layout(barmode="relative", title="Dealer gamma by strike",
                       yaxis_title="GEX ($M per 1% move)")
     _level_lines(fig, a)
     st.plotly_chart(_style(fig), use_container_width=True)
+
+
+def magnet_section(a: Analysis, magnets: pd.DataFrame) -> None:
+    st.subheader("🧲 Magnet levels")
+    if magnets.empty:
+        st.info("No gamma concentration peaks found within ±10% of spot.")
+        return
+    left, right = st.columns([3, 2])
+    with left:
+        view = magnets.copy()
+        view["Kind"] = view["kind"].map({"magnet": "🧲 Magnet", "accelerator": "⚡ Accelerator"})
+        view["Level"] = view["level"].map(lambda x: f"{x:,.2f}")
+        view["Distance"] = view["distance_pct"].map(lambda x: f"{x:+.1f}%")
+        view["Anchor"] = view["anchor_strike"].map(lambda x: f"{x:,.0f}")
+        st.dataframe(
+            view[["Level", "Kind", "strength", "Distance", "Anchor"]].rename(
+                columns={"strength": "Pull"}),
+            use_container_width=True, hide_index=True,
+            column_config={"Pull": st.column_config.ProgressColumn(
+                "Pull", min_value=0, max_value=100, format="%.0f")},
+        )
+    with right:
+        st.markdown(
+            "- **🧲 Magnets** — positive dealer-gamma peaks: hedging fades "
+            "moves around them, pulling price in. Pin power is strongest "
+            "into expiry and while dealers stay net long gamma there.\n"
+            "- **⚡ Accelerators** — negative-gamma peaks: hedging pushes "
+            "price away, so moves through them tend to extend.\n"
+            "- Diamonds on the strike chart mark these levels; hover for "
+            "pull strength."
+        )
 
 
 def gex_curve_chart(a: Analysis) -> None:
@@ -428,13 +473,15 @@ def main() -> None:
     verdict_banner(a)
     metrics_row(a)
 
-    gex_by_strike_chart(a)
+    magnets = magnet_levels(a)
+    gex_by_strike_chart(a, magnets)
     col1, col2 = st.columns(2)
     with col1:
         gex_curve_chart(a)
     with col2:
         oi_chart(a)
 
+    magnet_section(a, magnets)
     playbook_section(a)
     tables(a)
     report_section(a, ticker)

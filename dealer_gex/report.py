@@ -6,7 +6,7 @@ import html
 
 import pandas as pd
 
-from dealer_gex.analytics import Analysis, fmt_dollars
+from dealer_gex.analytics import Analysis, fmt_dollars, magnet_levels
 
 _REGIME_TEXT = {
     "long_gamma": (
@@ -99,6 +99,23 @@ def build_playbook(a: Analysis) -> list[str]:
             "inside the expected move is likely to be tested; outside, likely to hold."
         )
 
+    magnets = magnet_levels(a)
+    pins = magnets[magnets["kind"] == "magnet"]
+    below = pins[pins["level"] < a.spot]
+    above = pins[pins["level"] >= a.spot]
+    if not below.empty or not above.empty:
+        parts = []
+        if not below.empty:
+            r = below.loc[below["level"].idxmax()]
+            parts.append(f"{r['level']:,.2f} (pull {r['strength']:.0f}) below")
+        if not above.empty:
+            r = above.loc[above["level"].idxmin()]
+            parts.append(f"{r['level']:,.2f} (pull {r['strength']:.0f}) above")
+        lines.append(
+            f"**Nearest magnets: {' / '.join(parts)}.** In a quiet "
+            f"{'long-gamma tape price drifts toward the stronger pull' if long_g else 'tape magnets bind less while dealers are net short gamma — respect accelerators instead'}."
+        )
+
     lines.append(
         f"**Passive flows:** IV down 1pt forces {_fmt_flow(a.vanna_flow)} (vanna); "
         f"each day of decay forces {_fmt_flow(a.charm_flow)} (charm). In a quiet "
@@ -166,6 +183,22 @@ def build_markdown(a: Analysis, ticker: str = "") -> str:
     ]
     for _, r in ladder.iterrows():
         lines.append(f"| {r['Level']} | {r['Price']:,.2f} | {r['Reading']} |")
+
+    magnets = magnet_levels(a)
+    if not magnets.empty:
+        lines += [
+            "",
+            "## Magnet levels",
+            "",
+            "| Level | Kind | Pull (0-100) | Distance | Anchor strike |",
+            "|---|---|---|---|---|",
+        ]
+        for _, r in magnets.iterrows():
+            kind = "Magnet (pull/pin)" if r["kind"] == "magnet" else "Accelerator (repel)"
+            lines.append(
+                f"| {r['level']:,.2f} | {kind} | {r['strength']:.0f} "
+                f"| {r['distance_pct']:+.1f}% | {r['anchor_strike']:,.0f} |"
+            )
 
     lines += [
         "",

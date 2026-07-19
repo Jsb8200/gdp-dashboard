@@ -268,6 +268,52 @@ def test_flow_mode_requires_flow_data():
         analyze(chain, spot, ASOF, weight="flow")
 
 
+def test_magnet_levels_sample_chain():
+    from dealer_gex.analytics import magnet_levels
+
+    chain, spot = read_chain((REPO / "data" / "sample_option_chain.csv").read_bytes())
+    a = analyze(chain, spot, ASOF)
+    m = magnet_levels(a)
+    assert not m.empty
+    # strengths sorted desc, normalized to 100
+    assert list(m["strength"]) == sorted(m["strength"], reverse=True)
+    assert m["strength"].iloc[0] == 100
+    # the call cluster at 650 and ATM cluster near 625-630 produce magnets
+    mags = m[m["kind"] == "magnet"]["level"]
+    assert any(abs(x - 650) < 5 for x in mags)
+    # the put cluster at 600 is an accelerator (negative dealer gamma)
+    accs = m[m["kind"] == "accelerator"]["level"]
+    assert any(abs(x - 600) < 5 for x in accs)
+    # every level sits within one strike spacing of its anchor
+    assert (abs(m["level"] - m["anchor_strike"]) <= 5.0).all()
+
+
+def test_magnets_in_flow_mode():
+    from dealer_gex.parsing import parse_file
+    from dealer_gex.analytics import magnet_levels
+
+    pf = parse_file(QUANTDATA_CSV)
+    qqq = pf.chain[pf.chain["ticker"] == "QQQ"]
+    a = analyze(qqq, pf.spots["QQQ"], pf.asof, weight="flow")
+    m = magnet_levels(a)
+    # customers bought the 720 calls (dealer short there) => accelerator at 720
+    accs = m[m["kind"] == "accelerator"]["level"]
+    assert any(abs(x - 720) < 5 for x in accs)
+    # customers net-sold the 700 puts (dealer long) => magnet at 700
+    mags = m[m["kind"] == "magnet"]["level"]
+    assert any(abs(x - 700) < 5 for x in mags)
+
+
+def test_report_includes_magnets():
+    from dealer_gex.report import build_markdown
+
+    chain, spot = read_chain((REPO / "data" / "sample_option_chain.csv").read_bytes())
+    a = analyze(chain, spot, ASOF)
+    md = build_markdown(a, ticker="SPY")
+    assert "## Magnet levels" in md
+    assert "Nearest magnets" in md
+
+
 def test_fmt_dollars():
     assert fmt_dollars(1_460_000_000) == "$1.46B"
     assert fmt_dollars(-441_430_000) == "-$441.43M"

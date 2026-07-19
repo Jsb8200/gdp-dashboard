@@ -223,6 +223,25 @@ def side_gamma_density(by_strike: pd.DataFrame, x, side: str, bandwidth: float) 
     return float(np.sum(w * np.exp(-0.5 * ((x - k) / bandwidth) ** 2)))
 
 
+def _golden_max(f, lo: float, hi: float, tol: float = 0.005) -> float:
+    """Golden-section search for the maximum of a unimodal f on [lo, hi]."""
+    inv_phi = (np.sqrt(5.0) - 1.0) / 2.0
+    a, b = lo, hi
+    c = b - inv_phi * (b - a)
+    d = a + inv_phi * (b - a)
+    f_c, f_d = f(c), f(d)
+    while b - a > tol:
+        if f_c > f_d:
+            b, d, f_d = d, c, f_c
+            c = b - inv_phi * (b - a)
+            f_c = f(c)
+        else:
+            a, c, f_c = c, d, f_d
+            d = a + inv_phi * (b - a)
+            f_d = f(d)
+    return float((a + b) / 2)
+
+
 def wall_level(by_strike: pd.DataFrame, seed_strike: float, spacing: float,
                side: str, tol: float = 0.005) -> float:
     """Pinpoint wall: the price level where that side's smoothed gamma
@@ -230,22 +249,61 @@ def wall_level(by_strike: pd.DataFrame, seed_strike: float, spacing: float,
 
     Neighboring strikes pull the peak off the grid, so the wall lands
     between strikes when the concentration is lopsided."""
-    inv_phi = (np.sqrt(5.0) - 1.0) / 2.0
-    a, b = seed_strike - spacing, seed_strike + spacing
-    c = b - inv_phi * (b - a)
-    d = a + inv_phi * (b - a)
-    f_c = side_gamma_density(by_strike, c, side, spacing)
-    f_d = side_gamma_density(by_strike, d, side, spacing)
-    while b - a > tol:
-        if f_c > f_d:
-            b, d, f_d = d, c, f_c
-            c = b - inv_phi * (b - a)
-            f_c = side_gamma_density(by_strike, c, side, spacing)
-        else:
-            a, c, f_c = c, d, f_d
-            d = a + inv_phi * (b - a)
-            f_d = side_gamma_density(by_strike, d, side, spacing)
-    return float((a + b) / 2)
+    return _golden_max(
+        lambda x: side_gamma_density(by_strike, x, side, spacing),
+        seed_strike - spacing, seed_strike + spacing, tol,
+    )
+
+
+def magnet_levels(a: "Analysis", top_n: int = 5) -> pd.DataFrame:
+    """Ranked magnet map: every local peak of dealer gamma concentration
+    within ±10% of spot, pinpointed and scored.
+
+    * ``magnet`` — a positive net-gamma peak: dealer hedging fades moves
+      around it, pulling price toward it (pinning), strongest near expiry.
+    * ``accelerator`` — a negative net-gamma peak: hedging pushes price
+      away from it, so moves through it tend to extend.
+
+    Strength is 0-100, normalized to the strongest level found, comparable
+    across the two kinds. Columns: level, kind, strength, distance_pct,
+    anchor_strike.
+    """
+    ks = a.by_strike["strike"].to_numpy()
+    if len(ks) < 2:
+        return pd.DataFrame(columns=["level", "kind", "strength", "distance_pct", "anchor_strike"])
+    spacing = float(np.median(np.diff(np.sort(np.unique(ks)))))
+    lo, hi = a.spot * 0.90, a.spot * 1.10
+    grid = np.arange(lo, hi, spacing / 10.0)
+
+    rows = []
+    for kind, side in (("magnet", "POS"), ("accelerator", "NEG")):
+        dens = np.array([side_gamma_density(a.by_strike, x, side, spacing) for x in grid])
+        if dens.max() <= 0:
+            continue
+        floor = 0.05 * dens.max()
+        for i in range(1, len(grid) - 1):
+            if dens[i] > floor and dens[i] > dens[i - 1] and dens[i] >= dens[i + 1]:
+                level = _golden_max(
+                    lambda x: side_gamma_density(a.by_strike, x, side, spacing),
+                    grid[i] - spacing, grid[i] + spacing,
+                )
+                strength = side_gamma_density(a.by_strike, level, side, spacing)
+                anchor = float(ks[np.argmin(np.abs(ks - level))])
+                rows.append((level, kind, strength, (level / a.spot - 1) * 100, anchor))
+
+    if not rows:
+        return pd.DataFrame(columns=["level", "kind", "strength", "distance_pct", "anchor_strike"])
+    df = pd.DataFrame(rows, columns=["level", "kind", "strength", "distance_pct", "anchor_strike"])
+    # golden-section refinement can converge to the same peak from adjacent
+    # grid maxima — keep the strongest within half a strike spacing
+    df = df.sort_values("strength", ascending=False)
+    kept: list[int] = []
+    for idx, row in df.iterrows():
+        if all(abs(row["level"] - df.loc[k, "level"]) > spacing / 2 for k in kept):
+            kept.append(idx)
+    df = df.loc[kept].head(top_n).reset_index(drop=True)
+    df["strength"] = (100 * df["strength"] / df["strength"].max()).round(0)
+    return df
 
 
 def hedge_flows(df: pd.DataFrame, spot: float, rate: float,
