@@ -112,6 +112,15 @@ def build_playbook(a: Analysis) -> list[str]:
             "flow rather than standing open interest; best for 0DTE reads, "
             "noisier for multi-day positioning."
         )
+    elif a.weight_mode == "flow":
+        lines.append(
+            "**Signed order-flow view** — dealer positioning is inferred from "
+            "actual trade direction (ask-side = customer bought, dealer short; "
+            "bid-side = customer sold, dealer long), not the standard OI "
+            "convention. Walls here are the peaks of positive (pin) and "
+            "negative (acceleration) net dealer gamma from the captured flow; "
+            "mid-market prints carry no direction and are excluded."
+        )
     return lines
 
 
@@ -195,6 +204,9 @@ def build_markdown(a: Analysis, ticker: str = "") -> str:
         f"risk-free rate {a.rate:.2%}; contract multiplier {a.multiplier:g}; "
         "weighting: "
         + ("today's traded volume (intraday/0DTE view)." if a.weight_mode == "volume"
+           else "signed order flow — dealer positions inferred from actual trade "
+                "direction via ask/bid side codes, not the OI convention."
+           if a.weight_mode == "flow"
            else "open interest (standing positioning)."),
         "- Vanna/charm flows are Black-Scholes estimates of dealer re-hedging "
         "from IV and time changes; the expected move is the 1-sigma straddle "

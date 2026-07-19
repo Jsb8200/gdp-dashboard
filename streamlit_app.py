@@ -13,7 +13,7 @@ import plotly.graph_objects as go
 import streamlit as st
 
 from dealer_gex.analytics import Analysis, analyze, fmt_dollars
-from dealer_gex.parsing import ChainParseError, normalize_chain, read_chain
+from dealer_gex.parsing import ChainParseError, normalize_chain, parse_file
 from dealer_gex.report import (
     build_markdown, build_playbook, key_ladder, markdown_to_html, regime_text,
 )
@@ -71,8 +71,8 @@ def _style(fig: go.Figure, height: int = 380) -> go.Figure:
 # --- data loading ------------------------------------------------------------
 
 @st.cache_data
-def _parse(file_bytes: bytes) -> tuple[pd.DataFrame, float | None]:
-    return read_chain(file_bytes)
+def _parse(file_bytes: bytes):
+    return parse_file(file_bytes)
 
 
 def _manual_mapping_ui(name: str, file_bytes: bytes) -> pd.DataFrame | None:
@@ -101,19 +101,20 @@ def _manual_mapping_ui(name: str, file_bytes: bytes) -> pd.DataFrame | None:
         return None
 
 
-def load_data() -> tuple[pd.DataFrame | None, float | None, str, date]:
-    """Sidebar data controls. Returns (chain, inferred_spot, ticker, default_asof)."""
+def load_data() -> tuple[pd.DataFrame | None, dict, str, date]:
+    """Sidebar data controls. Returns (chain, spots_by_ticker, ticker_label,
+    default_asof). Spots dict may use "" for files with no ticker column."""
     st.sidebar.header("Data")
     source = st.sidebar.radio(
         "Option-chain source",
         ["Sample data (synthetic SPY-like)", "Upload CSV"],
-        help="Upload broker or CBOE option-chain exports. Calls and puts may be "
-             "in separate rows (long format) or side-by-side per strike (CBOE).",
+        help="Chain snapshots (broker long format, CBOE side-by-side) and "
+             "trade-level order-flow exports (QuantData) are auto-detected.",
     )
 
     if source.startswith("Sample"):
-        chain, spot = _parse(SAMPLE_PATH.read_bytes())
-        return chain, spot, "SPY (sample)", SAMPLE_ASOF
+        pf = _parse(SAMPLE_PATH.read_bytes())
+        return pf.chain, pf.spots, "SPY (sample)", SAMPLE_ASOF
 
     files = st.sidebar.file_uploader(
         "Option chain CSV(s)", type=["csv", "dat", "txt"], accept_multiple_files=True,
@@ -121,21 +122,24 @@ def load_data() -> tuple[pd.DataFrame | None, float | None, str, date]:
     )
     if not files:
         st.sidebar.info("Upload at least one chain CSV, or switch to sample data.")
-        return None, None, "", date.today()
+        return None, {}, "", date.today()
 
-    chains, spot = [], None
+    chains, spots, asof = [], {}, None
     for f in files:
         data = f.getvalue()
         try:
-            chain, inferred = _parse(data)
+            pf = _parse(data)
+            chains.append(pf.chain)
+            spots.update(pf.spots)
+            if pf.asof is not None and (asof is None or pf.asof > asof):
+                asof = pf.asof
         except ChainParseError:
-            chain, inferred = _manual_mapping_ui(f.name, data), None
-        if chain is not None:
-            chains.append(chain)
-            spot = spot or inferred
+            mapped = _manual_mapping_ui(f.name, data)
+            if mapped is not None:
+                chains.append(mapped)
     if not chains:
-        return None, None, "", date.today()
-    return pd.concat(chains, ignore_index=True), spot, "", date.today()
+        return None, {}, "", date.today()
+    return pd.concat(chains, ignore_index=True), spots, "", asof or date.today()
 
 
 # --- UI sections -------------------------------------------------------------
@@ -196,10 +200,12 @@ def metrics_row(a: Analysis) -> None:
     cols[3].metric("Charm flow / day", flow(a.charm_flow),
                    "buying" if a.charm_flow >= 0 else "selling", delta_color="off",
                    help="Forced dealer re-hedging per calendar day from delta decay.")
-    cols[4].metric("Weighting", "Volume" if a.weight_mode == "volume" else "OI",
-                   "intraday flow" if a.weight_mode == "volume" else "positioning",
-                   delta_color="off",
+    mode_val = {"volume": "Volume", "flow": "Flow"}.get(a.weight_mode, "OI")
+    mode_note = {"volume": "intraday flow", "flow": "signed order flow"}.get(
+        a.weight_mode, "positioning")
+    cols[4].metric("Weighting", mode_val, mode_note, delta_color="off",
                    help="Volume mode reads today's traded flow (intraday/0DTE); "
+                        "Flow mode signs positions from ask/bid side codes; "
                         "OI mode reads standing positioning.")
 
 
@@ -231,10 +237,13 @@ def gex_by_strike_chart(a: Analysis) -> None:
                       annotation_text="±1σ expected move",
                       annotation_position="bottom right",
                       annotation_font_color=C["muted"])
-    fig.add_bar(x=df["strike"], y=df["call_gex"] / 1e6, name="Calls (dealers long)",
+    flow = a.weight_mode == "flow"
+    fig.add_bar(x=df["strike"], y=df["call_gex"] / 1e6,
+                name="Calls (net dealer)" if flow else "Calls (dealers long)",
                 marker_color=C["call"],
                 hovertemplate="strike %{x}<br>call GEX $%{y:,.0f}M<extra></extra>")
-    fig.add_bar(x=df["strike"], y=df["put_gex"] / 1e6, name="Puts (dealers short)",
+    fig.add_bar(x=df["strike"], y=df["put_gex"] / 1e6,
+                name="Puts (net dealer)" if flow else "Puts (dealers short)",
                 marker_color=C["put"],
                 hovertemplate="strike %{x}<br>put GEX $%{y:,.0f}M<extra></extra>")
     fig.update_layout(barmode="relative", title="Dealer gamma by strike",
@@ -336,21 +345,36 @@ def main() -> None:
         "exposure (GEX), forced-hedging direction, and the levels where it flips."
     )
 
-    chain, inferred_spot, default_ticker, default_asof = load_data()
+    chain, spots, default_ticker, default_asof = load_data()
     if chain is None:
         st.info("⬅️ Choose a data source in the sidebar to begin.")
         return
 
     st.sidebar.header("Parameters")
-    ticker = st.sidebar.text_input("Ticker (label only)", value=default_ticker)
+    file_tickers = []
+    if "ticker" in chain.columns:
+        file_tickers = [t for t in chain["ticker"].value_counts().index if str(t)]
+    if len(file_tickers) > 1:
+        ticker = st.sidebar.selectbox(
+            "Ticker (from file)", file_tickers,
+            help="This file contains several tickers; each is analyzed separately.",
+        )
+        chain = chain[chain["ticker"] == ticker]
+    elif len(file_tickers) == 1:
+        ticker = st.sidebar.text_input("Ticker", value=str(file_tickers[0]))
+    else:
+        ticker = st.sidebar.text_input("Ticker (label only)", value=default_ticker)
+
+    inferred_spot = spots.get(ticker, spots.get("", None))
     spot = st.sidebar.number_input(
         "Spot price", min_value=0.01, value=float(inferred_spot or 100.0),
-        format="%.2f",
-        help="Auto-filled when the file includes an underlying price.",
+        format="%.2f", key=f"spot_{ticker}_{inferred_spot}",
+        help="Auto-filled from the file (underlying/reference price) when present.",
     )
     asof = st.sidebar.date_input(
-        "Analysis as-of date", value=default_asof,
-        help="Time-to-expiry is measured from this date. Use the chain's quote date.",
+        "Analysis as-of date", value=default_asof, key=f"asof_{default_asof}",
+        help="Time-to-expiry is measured from this date. For flow exports this "
+             "defaults to the file's last trade date.",
     )
     rate = st.sidebar.number_input("Risk-free rate (%)", 0.0, 15.0, 4.5, 0.25) / 100
     multiplier = st.sidebar.number_input(
@@ -359,14 +383,23 @@ def main() -> None:
              "ES = 50, NQ = 20, CL = 1000. Only dollar figures scale with this; "
              "levels are unaffected.",
     )
+
+    has_flow = ("net_customer_size" in chain.columns
+                and chain["net_customer_size"].abs().sum() > 0)
+    weight_options = ["Open interest (positioning)", "Volume (intraday / 0DTE flow)"]
+    if has_flow:
+        weight_options.append("Signed order flow (side codes)")
     weight = st.sidebar.radio(
-        "Weighting",
-        ["Open interest (positioning)", "Volume (intraday / 0DTE flow)"],
+        "Weighting", weight_options,
         help="Open interest reads the standing dealer book (updates overnight). "
-             "Volume weights by today's traded contracts — better for intraday "
-             "and 0DTE reads, where OI misses most of the action.",
+             "Volume weights by today's traded contracts (intraday/0DTE). "
+             "Signed order flow infers dealer positioning from actual trade "
+             "direction — ask-side prints = customer bought (dealer short), "
+             "bid-side = customer sold (dealer long); mid prints carry no "
+             "direction.",
     )
-    weight = "volume" if weight.startswith("Volume") else "open_interest"
+    weight = ("volume" if weight.startswith("Volume")
+              else "flow" if weight.startswith("Signed") else "open_interest")
 
     all_exp = sorted(d for d in chain["expiry"].dt.date.dropna().unique())
     picked = st.sidebar.multiselect(

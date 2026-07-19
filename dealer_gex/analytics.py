@@ -104,8 +104,19 @@ def _fill_gamma(chain: pd.DataFrame, spot: float, asof: date, rate: float,
     df["t"] = _years_to_expiry(df["expiry"], asof)
     computed = bs_gamma(spot, df["strike"], df["t"], df["iv"].fillna(0.0), rate)
     df["gamma"] = df["gamma"].where(df["gamma"].notna() & (df["gamma"] >= 0), computed)
-    df["weight"] = df[weight_col].clip(lower=0).fillna(0.0)
+    if weight_col == "net_customer_size":
+        # signed-flow mode: dealers hold the other side of customer flow, so
+        # the weight itself carries the dealer's sign — no C/P convention.
+        df["weight"] = -df[weight_col].fillna(0.0)
+        df["gsign"] = 1.0
+    else:
+        df["weight"] = df[weight_col].clip(lower=0).fillna(0.0)
+        df["gsign"] = np.where(df["type"] == "C", 1.0, -1.0)
     return df
+
+
+def _gsign(df: pd.DataFrame):
+    return df["gsign"] if "gsign" in df.columns else np.where(df["type"] == "C", 1.0, -1.0)
 
 
 def _dollar_gex(gamma, qty, spot: float, multiplier: float = DEFAULT_MULTIPLIER):
@@ -118,14 +129,16 @@ def _weights(df: pd.DataFrame) -> pd.Series:
 
 def gex_by_strike(df: pd.DataFrame, spot: float,
                   multiplier: float = DEFAULT_MULTIPLIER) -> pd.DataFrame:
-    df = df.assign(gex=_dollar_gex(df["gamma"], _weights(df), spot, multiplier))
+    # dealer-signed gex: in convention modes gsign is +C/−P (puts come out
+    # negative as before); in flow mode the sign lives in the weight itself
+    df = df.assign(gex=_gsign(df) * _dollar_gex(df["gamma"], _weights(df), spot, multiplier))
     grouped = df.pivot_table(
         index="strike", columns="type", values=["gex", "open_interest"],
-        aggfunc="sum", fill_value=0.0,
-    )
+        aggfunc="sum",
+    ).astype(float).fillna(0.0)
     out = pd.DataFrame(index=grouped.index)
     out["call_gex"] = grouped.get(("gex", "C"), 0.0)
-    out["put_gex"] = -grouped.get(("gex", "P"), 0.0)  # dealer-short puts: negative
+    out["put_gex"] = grouped.get(("gex", "P"), 0.0)
     out["net_gex"] = out["call_gex"] + out["put_gex"]
     out["call_oi"] = grouped.get(("open_interest", "C"), 0.0)
     out["put_oi"] = grouped.get(("open_interest", "P"), 0.0)
@@ -141,8 +154,7 @@ def total_gex_at(df: pd.DataFrame, spot_level: float, rate: float,
     sticky-strike simplification.
     """
     gamma = bs_gamma(spot_level, df["strike"], df["t"], df["iv"].fillna(0.0), rate)
-    signed = np.where(df["type"] == "C", 1.0, -1.0)
-    return float(np.sum(signed * _dollar_gex(gamma, _weights(df), spot_level, multiplier)))
+    return float(np.sum(_gsign(df) * _dollar_gex(gamma, _weights(df), spot_level, multiplier)))
 
 
 def gex_curve(df: pd.DataFrame, spot: float, rate: float,
@@ -195,9 +207,18 @@ def refine_flip(df: pd.DataFrame, curve: pd.DataFrame, spot: float,
 def side_gamma_density(by_strike: pd.DataFrame, x, side: str, bandwidth: float) -> float:
     """Kernel-smoothed dealer gamma concentration for one side as a
     continuous function of price level (Gaussian kernel per strike,
-    weighted by that strike's dollar gamma at the current spot)."""
-    col = "call_gex" if side == "C" else "put_gex"
-    w = by_strike[col].abs().to_numpy()
+    weighted by that strike's dollar gamma at the current spot).
+
+    Sides: "C"/"P" (convention modes) or "POS"/"NEG" — the positive/negative
+    parts of signed net GEX (flow mode)."""
+    if side == "C":
+        w = by_strike["call_gex"].abs().to_numpy()
+    elif side == "P":
+        w = by_strike["put_gex"].abs().to_numpy()
+    elif side == "POS":
+        w = by_strike["net_gex"].clip(lower=0).to_numpy()
+    else:
+        w = (-by_strike["net_gex"]).clip(lower=0).to_numpy()
     k = by_strike["strike"].to_numpy()
     return float(np.sum(w * np.exp(-0.5 * ((x - k) / bandwidth) ** 2)))
 
@@ -254,12 +275,13 @@ def hedge_flows(df: pd.DataFrame, spot: float, rate: float,
     d1, d2 = _d1_d2(spot, k_, t_, iv_, rate)
     pdf = np.exp(-0.5 * d1**2) / np.sqrt(2.0 * np.pi)
 
-    # dealer-held per-contract greeks: +call greek, -put greek
+    # dealer-held per-contract greeks: +call greek, -put greek (convention
+    # modes); in flow mode gsign is 1 and the weight carries the sign
     delta = np.where(is_call, _norm_cdf(d1), _norm_cdf(d1) - 1.0)
     vanna = -pdf * d2 / iv_                       # dVega/dSpot = dDelta/dVol
     charm = -pdf * (2.0 * rate * t_ - d2 * iv_ * np.sqrt(t_)) / (2.0 * t_ * iv_ * np.sqrt(t_))
 
-    sign = np.where(is_call, 1.0, -1.0)
+    sign = np.asarray(_gsign(df), dtype=float)
     scale = np.where(valid, w, 0.0) * multiplier * spot
     dex = float(np.sum(sign * delta * scale))
     vanna_total = float(np.sum(sign * vanna * scale))   # per 1.00 change in vol
@@ -332,7 +354,16 @@ def analyze(chain: pd.DataFrame, spot: float, asof: date,
     chain = chain[~expired]
     if chain.empty:
         raise ValueError("All contracts are expired as of the analysis date.")
-    df = _fill_gamma(chain, spot, asof, rate, weight_col=weight)
+    if weight == "flow":
+        if "net_customer_size" not in chain.columns:
+            raise ValueError(
+                "Signed-flow weighting needs trade-level data with side codes "
+                "(e.g. a QuantData order-flow export)."
+            )
+        weight_col = "net_customer_size"
+    else:
+        weight_col = weight
+    df = _fill_gamma(chain, spot, asof, rate, weight_col=weight_col)
 
     strikes = gex_by_strike(df, spot, multiplier)
     curve = gex_curve(df, spot, rate, multiplier=multiplier)
@@ -342,18 +373,27 @@ def analyze(chain: pd.DataFrame, spot: float, asof: date,
     uniq = np.sort(strikes["strike"].unique())
     spacing = float(np.median(np.diff(uniq))) if len(uniq) > 1 else spot * 0.01
 
-    pos = strikes[strikes["call_gex"] > 0]
-    neg = strikes[strikes["put_gex"] < 0]
-    call_seed = float(pos.loc[pos["call_gex"].idxmax(), "strike"]) if not pos.empty else spot
-    put_seed = float(neg.loc[neg["put_gex"].idxmin(), "strike"]) if not neg.empty else spot
-    call_wall = wall_level(strikes, call_seed, spacing, "C") if not pos.empty else spot
-    put_wall = wall_level(strikes, put_seed, spacing, "P") if not neg.empty else spot
+    if weight == "flow":
+        # signed flow has no fixed call/put polarity: walls are the peaks of
+        # positive (pin/resistance) and negative (acceleration) net dealer gamma
+        pos = strikes[strikes["net_gex"] > 0]
+        neg = strikes[strikes["net_gex"] < 0]
+        call_seed = float(pos.loc[pos["net_gex"].idxmax(), "strike"]) if not pos.empty else spot
+        put_seed = float(neg.loc[neg["net_gex"].idxmin(), "strike"]) if not neg.empty else spot
+        call_wall = wall_level(strikes, call_seed, spacing, "POS") if not pos.empty else spot
+        put_wall = wall_level(strikes, put_seed, spacing, "NEG") if not neg.empty else spot
+    else:
+        pos = strikes[strikes["call_gex"] > 0]
+        neg = strikes[strikes["put_gex"] < 0]
+        call_seed = float(pos.loc[pos["call_gex"].idxmax(), "strike"]) if not pos.empty else spot
+        put_seed = float(neg.loc[neg["put_gex"].idxmin(), "strike"]) if not neg.empty else spot
+        call_wall = wall_level(strikes, call_seed, spacing, "C") if not pos.empty else spot
+        put_wall = wall_level(strikes, put_seed, spacing, "P") if not neg.empty else spot
 
     dex, vanna_flow, charm_flow = hedge_flows(df, spot, rate, multiplier)
     em, nearest = expected_move(df, spot)
 
-    signed = np.where(df["type"] == "C", 1.0, -1.0)
-    df = df.assign(net_gex=signed * _dollar_gex(df["gamma"], _weights(df), spot, multiplier))
+    df = df.assign(net_gex=_gsign(df) * _dollar_gex(df["gamma"], _weights(df), spot, multiplier))
     by_exp = (
         df.groupby(df["expiry"].dt.date)
         .agg(

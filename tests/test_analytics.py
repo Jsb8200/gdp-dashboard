@@ -209,6 +209,65 @@ def test_multiplier_scales_dollars_not_levels():
     assert a50.regime == a100.regime
 
 
+QUANTDATA_CSV = """Trade ID,Trade Time,Ticker,Expiration Date,Strike Price,Contract Type,Reference Price,Size,Volume,Open Interest,Side Code,Implied Volatility,Gamma
+1,2026-07-14T13:30:00.100Z,QQQ,2026-08-21,$720.00,CALL,$719.50,100,"1,000","5,000",A,18.5%,0.012
+2,2026-07-14T14:00:00.200Z,QQQ,2026-08-21,$720.00,CALL,$720.10,50,"1,500","5,000",AA,18.7%,0.012
+3,2026-07-14T14:30:00.300Z,QQQ,2026-08-21,$720.00,CALL,$720.30,30,"1,800","5,000",B,18.6%,0.012
+4,2026-07-14T15:00:00Z,QQQ,2026-08-21,$720.00,CALL,$720.40,20,"2,000","5,000",M,18.4%,0.012
+5,2026-07-14T15:10:00.500Z,QQQ,2026-08-21,$700.00,PUT,$720.60,80,900,"8,000",BB,22.1%,0.010
+6,2026-07-14T17:42:16.130Z,QQQ,2026-08-21,$700.00,PUT,$721.10,40,950,"8,000",A,22.3%,0.010
+7,2026-07-13T14:00:00.100Z,GLD,2026-08-21,$370.00,CALL,$372.64,10,200,"1,200",A,15.0%,0.020
+"""
+
+
+def test_quantdata_trade_flow_parsing():
+    from dealer_gex.parsing import parse_file
+
+    pf = parse_file(QUANTDATA_CSV)
+    assert pf.tickers == ["QQQ", "GLD"]
+    assert pf.asof == date(2026, 7, 14)
+    # spot = ref price of the LAST trade per ticker (incl. mixed-format timestamps)
+    assert pf.spots["QQQ"] == pytest.approx(721.10)
+    assert pf.spots["GLD"] == pytest.approx(372.64)
+
+    chain = pf.chain
+    assert len(chain) == 3  # prints collapsed per contract
+    c720 = chain[(chain["strike"] == 720) & (chain["type"] == "C")].iloc[0]
+    # OI is a contract property: max, never summed across prints
+    assert c720["open_interest"] == 5000
+    # volume = max of the cumulative column, not a sum
+    assert c720["volume"] == 2000
+    # signed customer flow: +100 (A) +50 (AA) -30 (B) + 0 (M) = +120
+    assert c720["net_customer_size"] == 120
+    p700 = chain[(chain["strike"] == 700) & (chain["type"] == "P")].iloc[0]
+    assert p700["net_customer_size"] == -80 + 40
+    assert 0.1 < c720["iv"] < 0.3  # percent normalized to decimal
+
+
+def test_flow_mode_signs_from_side_codes():
+    from dealer_gex.parsing import parse_file
+
+    pf = parse_file(QUANTDATA_CSV)
+    qqq = pf.chain[pf.chain["ticker"] == "QQQ"]
+    # customers net-bought both the calls (+120) and puts (-40 => net sold);
+    # dealer gamma = -(customer): short 120 calls, long 40 puts
+    a = analyze(qqq, pf.spots["QQQ"], pf.asof, weight="flow")
+    # dealer: -120 call gamma + 40 put gamma, call gamma dominates => short
+    assert a.total_gex < 0
+    assert a.regime == "short_gamma"
+    assert a.weight_mode == "flow"
+
+    # convention (OI) mode on the same chain is unaffected by side codes
+    a_oi = analyze(qqq, pf.spots["QQQ"], pf.asof)
+    assert a_oi.total_gex != a.total_gex
+
+
+def test_flow_mode_requires_flow_data():
+    chain, spot = read_chain(LONG_CSV)
+    with pytest.raises(ValueError):
+        analyze(chain, spot, ASOF, weight="flow")
+
+
 def test_fmt_dollars():
     assert fmt_dollars(1_460_000_000) == "$1.46B"
     assert fmt_dollars(-441_430_000) == "-$441.43M"
