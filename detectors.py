@@ -139,8 +139,9 @@ def unusual_activity(chain, min_volume=100, ratio_thr=2.0, premium_floor=100_000
     else:
         df['flagged'] = df['premium'] >= premium_floor
 
-    keep = [c for c in ['type', 'strike', 'expiration', 'dte', 'mid', 'volume',
-                        'open_interest', 'vol_oi', 'premium', 'score', 'flagged']
+    keep = [c for c in ['type', 'strike', 'expiration', 'dte', 'timestamp',
+                        'underlying_price', 'mid', 'volume', 'open_interest',
+                        'vol_oi', 'premium', 'score', 'flagged']
             if c in df]
     return df[keep].sort_values('score', ascending=False).reset_index(drop=True)
 
@@ -158,6 +159,7 @@ def big_price_moves(prices, window=20, z_thr=2.5, burst_ratio=1.5):
     if len(df) < window + 5:
         return pd.DataFrame()
 
+    df['prev_close'] = df['close'].shift(1)
     df['log_ret'] = np.log(df['close']).diff()
     df['sigma'] = df['log_ret'].rolling(window).std().shift(1)
     df['z'] = df['log_ret'] / df['sigma']
@@ -242,6 +244,7 @@ def iv_time_series_spikes(iv_series, z_thr=2.5, abs_thr=0.05):
     if len(df) < 10:
         return pd.DataFrame()
 
+    df['iv_prev'] = df['iv'].shift(1)
     df['iv_change'] = df['iv'].diff()
     win = min(20, len(df) // 2)
     df['z'] = df['iv_change'] / df['iv_change'].rolling(win).std().shift(1)

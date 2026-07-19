@@ -334,6 +334,10 @@ with tab_flow:
                     'strike': st.column_config.NumberColumn('Strike', format='%.1f'),
                     'expiration': st.column_config.DateColumn('Expiration'),
                     'dte': 'DTE',
+                    'timestamp': st.column_config.DatetimeColumn(
+                        'Trade date', format='YYYY-MM-DD HH:mm'),
+                    'underlying_price': st.column_config.NumberColumn(
+                        'Underlying before move', format='%.2f'),
                     'mid': st.column_config.NumberColumn('Mid', format='%.2f'),
                     'volume': st.column_config.NumberColumn('Volume', format='%d'),
                     'open_interest': st.column_config.NumberColumn('OI', format='%d'),
@@ -396,10 +400,14 @@ with tab_price:
             st.caption(f'Volatility bursts (5-{bar_word[:-1]} vol ≥ 1.5× {window}-{bar_word[:-1]} vol): '
                        f'{burst_days} {bar_word[:-1]}(s).')
             st.dataframe(
-                flagged[['date', 'close', 'log_ret', 'z']],
+                flagged[['date', 'prev_close', 'close', 'log_ret', 'z']],
                 hide_index=True, width='stretch',
                 column_config={
-                    'date': st.column_config.DateColumn('Date'),
+                    'date': st.column_config.DatetimeColumn(
+                        'Date', format='YYYY-MM-DD HH:mm' if price_is_intraday
+                        else 'YYYY-MM-DD'),
+                    'prev_close': st.column_config.NumberColumn(
+                        'Close before', format='%.2f'),
                     'close': st.column_config.NumberColumn('Close', format='%.2f'),
                     'log_ret': st.column_config.NumberColumn('Log return', format='%.2%'),
                     'z': st.column_config.NumberColumn('Z-score', format='%.2f'),
@@ -513,11 +521,13 @@ with tab_iv:
                         width='stretch')
         if not spikes.empty:
             st.dataframe(
-                spikes[['date', 'iv', 'iv_change', 'z']],
+                spikes[['date', 'iv_prev', 'iv', 'iv_change', 'z']],
                 hide_index=True, width='stretch',
                 column_config={
-                    'date': st.column_config.DateColumn('Date'),
+                    'date': st.column_config.DatetimeColumn(
+                        'Date', format='YYYY-MM-DD HH:mm'),
+                    'iv_prev': st.column_config.NumberColumn('IV before', format='%.1%'),
                     'iv': st.column_config.NumberColumn('IV', format='%.1%'),
-                    'iv_change': st.column_config.NumberColumn('1-day change', format='%.1%'),
+                    'iv_change': st.column_config.NumberColumn('Change', format='%.1%'),
                     'z': st.column_config.NumberColumn('Z-score', format='%.2f'),
                 })
