@@ -108,20 +108,55 @@ with st.sidebar:
     for note in info['notes']:
         st.info(note)
 
+    trades = info.get('trades')
+
+    if 'symbol' in chain and chain['symbol'].nunique() > 1:
+        by_volume = (chain.groupby('symbol')['volume'].sum().sort_values(ascending=False)
+                     if 'volume' in chain else chain['symbol'].value_counts())
+        tickers = list(by_volume.index)
+        ticker = st.selectbox('Ticker', tickers)
+        attrs = dict(chain.attrs)
+        chain = chain[chain['symbol'] == ticker]
+        chain.attrs.update(attrs)
+        if trades is not None and 'symbol' in trades:
+            trades = trades[trades['symbol'] == ticker]
+        others = ', '.join(t for t in tickers if t != ticker)
+        st.caption(f'Also in this file: {others}')
+
     if 'expiration' in chain and chain['expiration'].notna().any():
         expiries = sorted(chain['expiration'].dropna().unique())
         labels = [pd.Timestamp(e).date().isoformat() for e in expiries]
         picked = st.multiselect('Expirations', labels, default=labels)
         keep = [e for e, lab in zip(expiries, labels) if lab in picked]
-        attrs = chain.attrs
+        attrs = dict(chain.attrs)
         chain = chain[chain['expiration'].isin(keep)]
         chain.attrs.update(attrs)
 
-# Price-history source: uploaded file, else derived from a multi-date chain,
-# else the bundled sample (only when the chain is the sample too).
+def intraday_close_series(trades_df, freq='5min'):
+    """Resample trade-level underlying prices to a close series per bar."""
+    if (trades_df is None or 'timestamp' not in trades_df
+            or 'underlying_price' not in trades_df):
+        return pd.DataFrame()
+    ok = trades_df.dropna(subset=['timestamp', 'underlying_price'])
+    if ok['timestamp'].nunique() < 25:
+        return pd.DataFrame()
+    return (ok.set_index('timestamp')['underlying_price']
+            .resample(freq).median().dropna()
+            .rename('close').reset_index().rename(columns={'timestamp': 'date'}))
+
+
+# Price-history source: uploaded file, else intraday bars derived from
+# trade-level rows, else derived from a multi-date chain, else the bundled
+# sample (only when the chain is the sample too).
+price_is_intraday = False
+intraday = intraday_close_series(trades)
 if price_file is not None:
     prices = normalize_price_history(read_csv_bytes(price_file.getvalue()))
     price_source = price_file.name
+elif not intraday.empty:
+    prices = intraday
+    price_source = 'derived intraday from trade timestamps (5-min bars)'
+    price_is_intraday = True
 elif ('timestamp' in chain and 'underlying_price' in chain
       and chain['timestamp'].nunique() >= 25):
     prices = (chain.groupby('timestamp')['underlying_price'].median()
@@ -319,8 +354,9 @@ with tab_price:
                 '`close` columns in the sidebar, or provide an options CSV '
                 'with many timestamps and an underlying-price column.')
     else:
+        bar_word = 'bars' if price_is_intraday else 'days'
         c1, c2 = st.columns(2)
-        window = c1.slider('Volatility window (days)', 5, 60, 20)
+        window = c1.slider(f'Volatility window ({bar_word})', 5, 60, 20)
         z_thr = c2.slider('Z-score threshold', 1.5, 4.0, 2.5, step=0.25)
         pm = det.big_price_moves(prices, window, z_thr)
         if pm.empty:
@@ -342,8 +378,8 @@ with tab_price:
             )
             st.altair_chart((line + marks).properties(height=300),
                             width='stretch')
-            st.caption(f'Red dots: days where |z| ≥ {z_thr:g} vs the trailing '
-                       f'{window}-day volatility.')
+            st.caption(f'Red dots: {bar_word} where |z| ≥ {z_thr:g} vs the trailing '
+                       f'{window}-{bar_word[:-1]} volatility.')
 
             zline = alt.Chart(pm.dropna(subset=['z'])).mark_line(
                 color=CALL_COLOR, strokeWidth=2).encode(
@@ -357,8 +393,8 @@ with tab_price:
                             width='stretch')
 
             burst_days = int(pm['vol_burst'].sum())
-            st.caption(f'Volatility bursts (5-day vol ≥ 1.5× {window}-day vol): '
-                       f'{burst_days} day(s).')
+            st.caption(f'Volatility bursts (5-{bar_word[:-1]} vol ≥ 1.5× {window}-{bar_word[:-1]} vol): '
+                       f'{burst_days} {bar_word[:-1]}(s).')
             st.dataframe(
                 flagged[['date', 'close', 'log_ret', 'z']],
                 hide_index=True, width='stretch',
@@ -447,8 +483,11 @@ with tab_iv:
         iv_series = prices[['date', 'iv']]
         iv_source = price_source
     else:
-        iv_series = det.iv_series_from_chain(chain)
-        iv_source = 'near-ATM mean IV per timestamp in the options CSV'
+        source_frame = trades if trades is not None else chain
+        iv_series = det.iv_series_from_chain(source_frame)
+        iv_source = ('near-ATM mean IV per 5-min bar from the trade rows'
+                     if trades is not None else
+                     'near-ATM mean IV per timestamp in the options CSV')
     ts = det.iv_time_series_spikes(iv_series)
     if ts.empty:
         st.info('No IV history available — a single-snapshot chain has no IV '

@@ -67,6 +67,8 @@ def implied_move(chain, spot):
 
     rows = []
     for expiration, grp in sides.groupby('expiration'):
+        if expiration < as_of:  # already expired at the data's as-of date
+            continue
         atm = grp.loc[(grp['strike'] - spot).abs().idxmin()]
         straddle = atm['call_mid'] + atm['put_mid']
         dte = max((expiration - as_of).days, 1)
@@ -247,17 +249,26 @@ def iv_time_series_spikes(iv_series, z_thr=2.5, abs_thr=0.05):
     return df.reset_index(drop=True)
 
 
-def iv_series_from_chain(chain, moneyness=0.05):
+def iv_series_from_chain(chain, moneyness=0.05, intraday_freq='5min'):
     """Build a near-ATM mean-IV time series from a multi-date chain.
 
     Needs timestamp, underlying_price and implied_volatility; returns a
-    DataFrame with 'date' and 'iv' (empty if fewer than 10 timestamps).
+    DataFrame with 'date' and 'iv' (empty if fewer than 10 points).
+    Dense trade-level timestamps (order-flow data) are resampled to
+    intraday_freq bars instead of one point per raw timestamp.
     """
     needed = ['timestamp', 'underlying_price', 'implied_volatility']
     if any(c not in chain or chain[c].isna().all() for c in needed):
         return pd.DataFrame()
     df = chain.dropna(subset=needed).copy()
     df = df[(df['strike'] / df['underlying_price'] - 1).abs() <= moneyness]
-    out = (df.groupby('timestamp')['implied_volatility'].mean()
-           .rename('iv').reset_index().rename(columns={'timestamp': 'date'}))
+    if df.empty:
+        return pd.DataFrame()
+    if df['timestamp'].nunique() > 50:
+        out = (df.set_index('timestamp')['implied_volatility']
+               .resample(intraday_freq).mean().dropna()
+               .rename('iv').reset_index().rename(columns={'timestamp': 'date'}))
+    else:
+        out = (df.groupby('timestamp')['implied_volatility'].mean()
+               .rename('iv').reset_index().rename(columns={'timestamp': 'date'}))
     return out if len(out) >= 10 else pd.DataFrame()

@@ -12,22 +12,24 @@ import pandas as pd
 # Canonical column -> accepted aliases (compared after normalize_header()).
 # The canonical name itself is always accepted.
 ALIASES = {
+    'symbol': ['ticker', 'underlyingsymbol', 'root', 'symb'],
     'type': ['cpflag', 'cp', 'callput', 'optiontype', 'putcall', 'right',
-             'side', 'kind'],
+             'side', 'kind', 'contracttype'],
     'strike': ['strikeprice', 'k', 'exerciseprice'],
     'expiration': ['expirationdate', 'exp', 'expdate', 'expiry', 'expirydate',
                    'maturity', 'maturitydate'],
     'bid': ['bidprice'],
     'ask': ['askprice', 'offer'],
-    'last': ['lastprice', 'lasttrade', 'close', 'price', 'mark', 'mid'],
+    'last': ['lastprice', 'lasttrade', 'close', 'price', 'mark', 'mid',
+             'optionprice', 'tradeprice', 'fillprice'],
     'volume': ['vol', 'totalvolume', 'tradevolume'],
     'open_interest': ['openinterest', 'oi', 'openint', 'opint'],
     'implied_volatility': ['impliedvolatility', 'iv', 'impliedvol', 'impvol',
                            'sigma', 'midiv'],
     'underlying_price': ['underlyingprice', 'underlying', 'underlyinglast',
-                         'spot', 'spotprice', 'stockprice'],
+                         'spot', 'spotprice', 'stockprice', 'referenceprice'],
     'timestamp': ['date', 'quotedate', 'datadate', 'snapshottime', 'asofdate',
-                  'tradedate'],
+                  'tradedate', 'tradetime', 'time', 'datetime'],
 }
 
 REQUIRED = ['type', 'strike', 'expiration']
@@ -87,7 +89,8 @@ def coerce_types(df):
 
     for col in DATE_COLS:
         if col in df:
-            df[col] = pd.to_datetime(df[col], errors='coerce')
+            df[col] = pd.to_datetime(df[col], errors='coerce', utc=True)
+            df[col] = df[col].dt.tz_localize(None)
 
     for col in NUMERIC_COLS:
         if col in df and not pd.api.types.is_numeric_dtype(df[col]):
@@ -128,14 +131,51 @@ def add_derived(df):
     return df
 
 
-def load_chain(raw_df, overrides=None):
-    """Full pipeline: map, coerce, derive.
+def contract_keys(df):
+    """Columns identifying one contract, for the columns present in df."""
+    return [c for c in ('symbol', 'type', 'strike', 'expiration') if c in df]
 
-    Returns (df, info) where info carries the mapping details and notes
-    for display in the UI.
+
+def collapse_trades(df):
+    """Aggregate per-trade rows (order-flow exports) to one row per contract.
+
+    Takes the latest quote fields per contract and the max of the running
+    totals. Returns (collapsed, n_trades); n_trades is 0 when the frame
+    already has one row per contract (no collapsing happened).
+    """
+    keys = contract_keys(df)
+    if not keys or not df.duplicated(keys).any():
+        return df, 0
+
+    out = df.copy()
+    if 'timestamp' in out:
+        out = out.sort_values('timestamp')
+    agg = {}
+    for col in ('bid', 'ask', 'last', 'implied_volatility', 'underlying_price'):
+        if col in out:
+            agg[col] = 'last'
+    for col in ('volume', 'open_interest', 'timestamp'):
+        if col in out:
+            agg[col] = 'max'
+    collapsed = out.groupby(keys, as_index=False, dropna=False).agg(agg)
+    return collapsed, len(df)
+
+
+def load_chain(raw_df, overrides=None):
+    """Full pipeline: map, coerce, collapse trade rows, derive.
+
+    Returns (df, info) where info carries the mapping details, notes for
+    display in the UI, and `trades` — the pre-collapse frame when the CSV
+    was per-trade order-flow data (None otherwise).
     """
     df, mapping, unmapped, ignored = map_columns(raw_df, overrides)
-    df, notes = coerce_types(df)
+    coerced, notes = coerce_types(df)
+    df, n_trades = collapse_trades(coerced)
+    trades = None
+    if n_trades:
+        trades = coerced
+        notes.append(f'Detected order-flow data: aggregated {n_trades:,} '
+                     f'trades into {len(df):,} contracts.')
     df = add_derived(df)
     info = {
         'mapping': mapping,
@@ -143,6 +183,7 @@ def load_chain(raw_df, overrides=None):
         'ignored': ignored,
         'notes': notes,
         'as_of': df.attrs.get('as_of'),
+        'trades': trades,
     }
     return df, info
 

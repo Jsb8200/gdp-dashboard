@@ -42,13 +42,20 @@ Canonical columns and accepted aliases for the options-chain CSV:
 | volume | volume, vol, total_volume |
 | open_interest | open_interest, oi, open_int |
 | implied_volatility | implied_volatility, iv, imp_vol, sigma |
-| underlying_price (optional) | underlying_price, spot, stock_price |
-| timestamp (optional) | timestamp, date, quote_date, as_of_date |
+| underlying_price (optional) | underlying_price, spot, stock_price, reference_price |
+| timestamp (optional) | timestamp, date, quote_date, trade_time |
+| symbol (optional) | symbol, ticker, root |
 
 IV given in percent (e.g. `32.5`) is detected and rescaled to decimals.
 If the spot price is missing, it is inferred from put–call parity. Columns
 that can't be auto-matched can be assigned manually in the sidebar, and each
 detector explains what it needs if something is missing.
+
+**Order-flow exports** (per-trade rows, e.g. QuantData) are detected
+automatically: trades are aggregated to one row per contract, a ticker
+picker appears when the file covers several underlyings, and the trade
+timestamps are resampled into an intraday 5-minute price/IV series that
+powers the price-moves and IV-spikes detectors.
 
 The optional price-history CSV needs `date` and `close`, plus an optional
 `iv` column to enable IV-spike detection over time.

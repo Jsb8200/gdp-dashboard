@@ -117,6 +117,50 @@ def generate_price_history(rng):
     })
 
 
+def generate_order_flow(rng):
+    """Per-trade rows in a QuantData-like export format ($, commas, %).
+
+    Two tickers, several trades per contract, intraday timestamps — used by
+    the sanity suite to exercise the order-flow path (symbol filtering,
+    trade collapsing, tz-aware timestamps, intraday series derivation).
+    """
+    rows = []
+    for ticker, spot0, n_trades in (('DEMO', 187.50, 260), ('AUX', 52.00, 40)):
+        expiries = [QUOTE_DATE + pd.Timedelta(days=d) for d in (7, 30)]
+        strikes = np.round(np.arange(0.9, 1.11, 0.025) * spot0 / 2.5) * 2.5
+        start = QUOTE_DATE - pd.Timedelta(days=1) + pd.Timedelta(hours=13, minutes=30)
+        seconds = np.sort(rng.uniform(0, 2 * 24 * 3600, n_trades))
+        drift = np.cumsum(rng.normal(0, spot0 * 0.0004, n_trades))
+        for i in range(n_trades):
+            ts = start + pd.Timedelta(seconds=float(seconds[i]))
+            spot = spot0 + drift[i]
+            strike = float(rng.choice(strikes))
+            expiry = expiries[int(rng.integers(0, 2))]
+            cp = 'CALL' if rng.random() < 0.5 else 'PUT'
+            iv = max(0.18 + 0.2 * abs(np.log(strike / spot)) + rng.normal(0, 0.01), 0.05)
+            price = max(0.05, abs(spot - strike) * 0.4 + spot * iv * 0.05
+                        + rng.normal(0, 0.05))
+            size = int(rng.integers(1, 400))
+            volume = int(rng.integers(200, 12000))
+            oi = int(rng.integers(100, 8000))
+            rows.append({
+                'Trade Time': ts.strftime('%Y-%m-%dT%H:%M:%S.000Z'),
+                'Ticker': ticker,
+                'Expiration Date': expiry.date().isoformat(),
+                'Strike Price': f'${strike:.2f}',
+                'Contract Type': cp,
+                'Reference Price': f'${spot:.2f}',
+                'Size': size,
+                'Option Price': f'${price:.2f}',
+                'Bid Price': f'${max(price - 0.05, 0):.2f}',
+                'Ask Price': f'${price + 0.05:.2f}',
+                'Volume': f'{volume:,}',
+                'Open Interest': f'{oi:,}',
+                'Implied Volatility': f'{iv * 100:.2f}%',
+            })
+    return pd.DataFrame(rows)
+
+
 def main():
     rng = np.random.default_rng(42)
     DATA_DIR.mkdir(exist_ok=True)
@@ -128,6 +172,10 @@ def main():
     prices = generate_price_history(rng)
     prices.to_csv(DATA_DIR / 'sample_price_history.csv', index=False)
     print(f'wrote sample_price_history.csv ({len(prices)} rows)')
+
+    flow = generate_order_flow(rng)
+    flow.to_csv(DATA_DIR / 'sample_order_flow.csv', index=False)
+    print(f'wrote sample_order_flow.csv ({len(flow)} rows)')
 
 
 if __name__ == '__main__':
