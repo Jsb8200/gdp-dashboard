@@ -192,7 +192,8 @@ def build_markdown(a: Analysis, ticker: str = "") -> str:
         "## Methodology & assumptions",
         "",
         f"- {a.n_contracts:,} contracts across {len(a.expiries)} expiries; "
-        f"risk-free rate {a.rate:.2%}; weighting: "
+        f"risk-free rate {a.rate:.2%}; contract multiplier {a.multiplier:g}; "
+        "weighting: "
         + ("today's traded volume (intraday/0DTE view)." if a.weight_mode == "volume"
            else "open interest (standing positioning)."),
         "- Vanna/charm flows are Black-Scholes estimates of dealer re-hedging "

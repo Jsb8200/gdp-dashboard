@@ -21,6 +21,7 @@ import pandas as pd
 
 TRADING_DAYS = 252
 MIN_T = 0.5 / TRADING_DAYS  # floor expiring contracts at half a trading day
+DEFAULT_MULTIPLIER = 100.0  # shares per contract; ES=50, NQ=20, equity/index=100
 
 
 def bs_gamma(spot, strike, t, iv, rate: float = 0.045, div_yield: float = 0.0):
@@ -81,6 +82,7 @@ class Analysis:
     n_contracts: int = 0
     expiries: list = field(default_factory=list)
     weight_mode: str = "open_interest"   # 'open_interest' | 'volume'
+    multiplier: float = DEFAULT_MULTIPLIER  # shares/units per contract
     dex: float = 0.0          # net dealer delta, $ notional (positive = long stock equiv.)
     vanna_flow: float = 0.0   # $ dealers must trade if IV drops 1 pt (positive = buy)
     charm_flow: float = 0.0   # $ dealers must trade per calendar day (positive = buy)
@@ -106,16 +108,17 @@ def _fill_gamma(chain: pd.DataFrame, spot: float, asof: date, rate: float,
     return df
 
 
-def _dollar_gex(gamma, qty, spot: float):
-    return gamma * qty * 100.0 * spot**2 * 0.01
+def _dollar_gex(gamma, qty, spot: float, multiplier: float = DEFAULT_MULTIPLIER):
+    return gamma * qty * multiplier * spot**2 * 0.01
 
 
 def _weights(df: pd.DataFrame) -> pd.Series:
     return df["weight"] if "weight" in df.columns else df["open_interest"]
 
 
-def gex_by_strike(df: pd.DataFrame, spot: float) -> pd.DataFrame:
-    df = df.assign(gex=_dollar_gex(df["gamma"], _weights(df), spot))
+def gex_by_strike(df: pd.DataFrame, spot: float,
+                  multiplier: float = DEFAULT_MULTIPLIER) -> pd.DataFrame:
+    df = df.assign(gex=_dollar_gex(df["gamma"], _weights(df), spot, multiplier))
     grouped = df.pivot_table(
         index="strike", columns="type", values=["gex", "open_interest"],
         aggfunc="sum", fill_value=0.0,
@@ -129,7 +132,8 @@ def gex_by_strike(df: pd.DataFrame, spot: float) -> pd.DataFrame:
     return out.reset_index().sort_values("strike").reset_index(drop=True)
 
 
-def total_gex_at(df: pd.DataFrame, spot_level: float, rate: float) -> float:
+def total_gex_at(df: pd.DataFrame, spot_level: float, rate: float,
+                 multiplier: float = DEFAULT_MULTIPLIER) -> float:
     """Net dealer GEX with every contract's gamma re-priced at a hypothetical spot.
 
     Always recomputed from IV (file-supplied gamma is only valid at the
@@ -138,13 +142,14 @@ def total_gex_at(df: pd.DataFrame, spot_level: float, rate: float) -> float:
     """
     gamma = bs_gamma(spot_level, df["strike"], df["t"], df["iv"].fillna(0.0), rate)
     signed = np.where(df["type"] == "C", 1.0, -1.0)
-    return float(np.sum(signed * _dollar_gex(gamma, _weights(df), spot_level)))
+    return float(np.sum(signed * _dollar_gex(gamma, _weights(df), spot_level, multiplier)))
 
 
 def gex_curve(df: pd.DataFrame, spot: float, rate: float,
-              span: float = 0.15, n: int = 121) -> pd.DataFrame:
+              span: float = 0.15, n: int = 121,
+              multiplier: float = DEFAULT_MULTIPLIER) -> pd.DataFrame:
     levels = np.linspace(spot * (1 - span), spot * (1 + span), n)
-    totals = [total_gex_at(df, s, rate) for s in levels]
+    totals = [total_gex_at(df, s, rate, multiplier) for s in levels]
     return pd.DataFrame({"spot_level": levels, "total_gex": totals})
 
 
@@ -222,7 +227,8 @@ def wall_level(by_strike: pd.DataFrame, seed_strike: float, spacing: float,
     return float((a + b) / 2)
 
 
-def hedge_flows(df: pd.DataFrame, spot: float, rate: float) -> tuple[float, float, float]:
+def hedge_flows(df: pd.DataFrame, spot: float, rate: float,
+                multiplier: float = DEFAULT_MULTIPLIER) -> tuple[float, float, float]:
     """Dealer hedge inventory and forced flows beyond gamma.
 
     Returns (dex, vanna_flow, charm_flow), all in $ notional:
@@ -254,7 +260,7 @@ def hedge_flows(df: pd.DataFrame, spot: float, rate: float) -> tuple[float, floa
     charm = -pdf * (2.0 * rate * t_ - d2 * iv_ * np.sqrt(t_)) / (2.0 * t_ * iv_ * np.sqrt(t_))
 
     sign = np.where(is_call, 1.0, -1.0)
-    scale = np.where(valid, w, 0.0) * 100.0 * spot
+    scale = np.where(valid, w, 0.0) * multiplier * spot
     dex = float(np.sum(sign * delta * scale))
     vanna_total = float(np.sum(sign * vanna * scale))   # per 1.00 change in vol
     charm_total = float(np.sum(sign * charm * scale))   # per year
@@ -318,7 +324,8 @@ def max_pain(chain: pd.DataFrame) -> float:
 
 
 def analyze(chain: pd.DataFrame, spot: float, asof: date,
-            rate: float = 0.045, weight: str = "open_interest") -> Analysis:
+            rate: float = 0.045, weight: str = "open_interest",
+            multiplier: float = DEFAULT_MULTIPLIER) -> Analysis:
     # Expired contracts carry no hedging obligation; clipping them to a tiny
     # time-to-expiry would instead explode their gamma, so drop them.
     expired = chain["expiry"].notna() & (chain["expiry"].dt.date < asof)
@@ -327,10 +334,10 @@ def analyze(chain: pd.DataFrame, spot: float, asof: date,
         raise ValueError("All contracts are expired as of the analysis date.")
     df = _fill_gamma(chain, spot, asof, rate, weight_col=weight)
 
-    strikes = gex_by_strike(df, spot)
-    curve = gex_curve(df, spot, rate)
-    total = total_gex_at(df, spot, rate)
-    flip = refine_flip(df, curve, spot, rate)
+    strikes = gex_by_strike(df, spot, multiplier)
+    curve = gex_curve(df, spot, rate, multiplier=multiplier)
+    total = total_gex_at(df, spot, rate, multiplier)
+    flip = refine_flip(df, curve, spot, rate)  # zero crossing is scale-invariant
 
     uniq = np.sort(strikes["strike"].unique())
     spacing = float(np.median(np.diff(uniq))) if len(uniq) > 1 else spot * 0.01
@@ -342,11 +349,11 @@ def analyze(chain: pd.DataFrame, spot: float, asof: date,
     call_wall = wall_level(strikes, call_seed, spacing, "C") if not pos.empty else spot
     put_wall = wall_level(strikes, put_seed, spacing, "P") if not neg.empty else spot
 
-    dex, vanna_flow, charm_flow = hedge_flows(df, spot, rate)
+    dex, vanna_flow, charm_flow = hedge_flows(df, spot, rate, multiplier)
     em, nearest = expected_move(df, spot)
 
     signed = np.where(df["type"] == "C", 1.0, -1.0)
-    df = df.assign(net_gex=signed * _dollar_gex(df["gamma"], _weights(df), spot))
+    df = df.assign(net_gex=signed * _dollar_gex(df["gamma"], _weights(df), spot, multiplier))
     by_exp = (
         df.groupby(df["expiry"].dt.date)
         .agg(
@@ -376,6 +383,7 @@ def analyze(chain: pd.DataFrame, spot: float, asof: date,
         n_contracts=len(chain),
         expiries=sorted(d for d in chain["expiry"].dt.date.dropna().unique()),
         weight_mode=weight,
+        multiplier=multiplier,
         dex=dex,
         vanna_flow=vanna_flow,
         charm_flow=charm_flow,

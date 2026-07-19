@@ -196,6 +196,19 @@ def test_playbook_and_ladder():
     assert {"Call wall", "Put wall", "Spot", "Gamma flip"} <= set(ladder["Level"])
 
 
+def test_multiplier_scales_dollars_not_levels():
+    chain, spot = read_chain((REPO / "data" / "sample_option_chain.csv").read_bytes())
+    a100 = analyze(chain, spot, ASOF)
+    a50 = analyze(chain, spot, ASOF, multiplier=50.0)
+    for field in ("total_gex", "dex", "vanna_flow", "charm_flow"):
+        assert getattr(a50, field) == pytest.approx(getattr(a100, field) / 2, rel=1e-9)
+    # levels are scale-invariant
+    assert a50.gamma_flip == pytest.approx(a100.gamma_flip, abs=0.02)
+    assert a50.call_wall == pytest.approx(a100.call_wall, abs=0.02)
+    assert a50.put_wall == pytest.approx(a100.put_wall, abs=0.02)
+    assert a50.regime == a100.regime
+
+
 def test_fmt_dollars():
     assert fmt_dollars(1_460_000_000) == "$1.46B"
     assert fmt_dollars(-441_430_000) == "-$441.43M"

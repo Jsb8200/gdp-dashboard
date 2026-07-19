@@ -353,6 +353,12 @@ def main() -> None:
         help="Time-to-expiry is measured from this date. Use the chain's quote date.",
     )
     rate = st.sidebar.number_input("Risk-free rate (%)", 0.0, 15.0, 4.5, 0.25) / 100
+    multiplier = st.sidebar.number_input(
+        "Contract multiplier", min_value=1.0, value=100.0, step=1.0,
+        help="Units of underlying per contract: stocks/ETFs/index options = 100, "
+             "ES = 50, NQ = 20, CL = 1000. Only dollar figures scale with this; "
+             "levels are unaffected.",
+    )
     weight = st.sidebar.radio(
         "Weighting",
         ["Open interest (positioning)", "Volume (intraday / 0DTE flow)"],
@@ -371,7 +377,7 @@ def main() -> None:
         chain = chain[chain["expiry"].dt.date.isin(picked)]
 
     try:
-        a = analyze(chain, spot, asof, rate, weight=weight)
+        a = analyze(chain, spot, asof, rate, weight=weight, multiplier=multiplier)
     except ValueError as exc:
         st.error(f"{exc} — check the as-of date against the chain's expiries.")
         return
@@ -407,7 +413,9 @@ def main() -> None:
   customer-bought puts** (the standard GEX convention), so call open interest
   contributes positive dealer gamma and put OI negative. Real dealer books can
   differ; treat every level as an estimate.
-- **GEX** = gamma × OI × 100 × spot² × 1% — dollar hedging demand per 1% move.
+- **GEX** = gamma × OI × multiplier × spot² × 1% — dollar hedging demand per
+  1% move (contract multiplier {a.multiplier:g}; set it in the sidebar for
+  futures options like ES=50 or NQ=20).
 - **Gamma flip** — net GEX recomputed across a ±15% spot grid (Black-Scholes
   gamma from each contract's IV, held fixed); the zero crossing nearest spot,
   bisected to cent precision.
