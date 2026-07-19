@@ -6,7 +6,7 @@ import html
 
 import pandas as pd
 
-from dealer_gex.analytics import Analysis, fmt_dollars, magnet_levels
+from dealer_gex.analytics import Analysis, fmt_dollars, magnet_levels, oi_levels
 
 _REGIME_TEXT = {
     "long_gamma": (
@@ -116,6 +116,23 @@ def build_playbook(a: Analysis) -> list[str]:
             f"{'long-gamma tape price drifts toward the stronger pull' if long_g else 'tape magnets bind less while dealers are net short gamma — respect accelerators instead'}."
         )
 
+    oi = oi_levels(a)
+    caps = oi[(oi["side"] == "call") & (oi["level"] > a.spot)]
+    floors = oi[(oi["side"] == "put") & (oi["level"] < a.spot)]
+    if not caps.empty or not floors.empty:
+        parts = []
+        if not caps.empty:
+            r = caps.loc[caps["strength"].idxmax()]
+            parts.append(f"call-OI cap at {r['level']:,.2f} (weight {r['strength']:.0f})")
+        if not floors.empty:
+            r = floors.loc[floors["strength"].idxmax()]
+            parts.append(f"put-OI floor at {r['level']:,.2f} (weight {r['strength']:.0f})")
+        lines.append(
+            f"**Raw OI structure: {' and '.join(parts)}.** These are where "
+            "positions actually sit — classic resistance/support and the pin "
+            "candidates into expiry, regardless of today's gamma."
+        )
+
     lines.append(
         f"**Passive flows:** IV down 1pt forces {_fmt_flow(a.vanna_flow)} (vanna); "
         f"each day of decay forces {_fmt_flow(a.charm_flow)} (charm). In a quiet "
@@ -198,6 +215,22 @@ def build_markdown(a: Analysis, ticker: str = "") -> str:
             lines.append(
                 f"| {r['level']:,.2f} | {kind} | {r['strength']:.0f} "
                 f"| {r['distance_pct']:+.1f}% | {r['anchor_strike']:,.0f} |"
+            )
+
+    oi = oi_levels(a)
+    if not oi.empty:
+        lines += [
+            "",
+            "## OI levels (raw open interest)",
+            "",
+            "| Level | Side | Weight (0-100) | Distance | Call OI | Put OI |",
+            "|---|---|---|---|---|---|",
+        ]
+        side_label = {"call": "Call-heavy", "put": "Put-heavy", "mixed": "Mixed"}
+        for _, r in oi.iterrows():
+            lines.append(
+                f"| {r['level']:,.2f} | {side_label[r['side']]} | {r['strength']:.0f} "
+                f"| {r['distance_pct']:+.1f}% | {r['call_oi']:,.0f} | {r['put_oi']:,.0f} |"
             )
 
     lines += [

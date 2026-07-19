@@ -204,6 +204,11 @@ def refine_flip(df: pd.DataFrame, curve: pd.DataFrame, spot: float,
     return float((lo + hi) / 2)
 
 
+def _kernel_density(strikes: np.ndarray, weights: np.ndarray, x, bandwidth: float) -> float:
+    """Gaussian-kernel concentration of `weights` over the strike axis."""
+    return float(np.sum(weights * np.exp(-0.5 * ((x - strikes) / bandwidth) ** 2)))
+
+
 def side_gamma_density(by_strike: pd.DataFrame, x, side: str, bandwidth: float) -> float:
     """Kernel-smoothed dealer gamma concentration for one side as a
     continuous function of price level (Gaussian kernel per strike,
@@ -219,8 +224,7 @@ def side_gamma_density(by_strike: pd.DataFrame, x, side: str, bandwidth: float) 
         w = by_strike["net_gex"].clip(lower=0).to_numpy()
     else:
         w = (-by_strike["net_gex"]).clip(lower=0).to_numpy()
-    k = by_strike["strike"].to_numpy()
-    return float(np.sum(w * np.exp(-0.5 * ((x - k) / bandwidth) ** 2)))
+    return _kernel_density(by_strike["strike"].to_numpy(), w, x, bandwidth)
 
 
 def _golden_max(f, lo: float, hi: float, tol: float = 0.005) -> float:
@@ -296,6 +300,67 @@ def magnet_levels(a: "Analysis", top_n: int = 5) -> pd.DataFrame:
     df = pd.DataFrame(rows, columns=["level", "kind", "strength", "distance_pct", "anchor_strike"])
     # golden-section refinement can converge to the same peak from adjacent
     # grid maxima — keep the strongest within half a strike spacing
+    df = df.sort_values("strength", ascending=False)
+    kept: list[int] = []
+    for idx, row in df.iterrows():
+        if all(abs(row["level"] - df.loc[k, "level"]) > spacing / 2 for k in kept):
+            kept.append(idx)
+    df = df.loc[kept].head(top_n).reset_index(drop=True)
+    df["strength"] = (100 * df["strength"] / df["strength"].max()).round(0)
+    return df
+
+
+def oi_levels(a: "Analysis", top_n: int = 5) -> pd.DataFrame:
+    """Ranked raw open-interest concentration levels — where positions SIT,
+    independent of current gamma sensitivity.
+
+    Heavy OI is the classic support/resistance and expiry-pin marker: a
+    call-heavy cluster above spot tends to cap rallies, a put-heavy cluster
+    below tends to catch selloffs, and price gravitates to the biggest
+    clusters into expiry. Complements :func:`magnet_levels`, which weights
+    the same OI by its hedging force *today*.
+
+    Columns: level, side ('call'/'put'/'mixed'), strength (0-100),
+    distance_pct, anchor_strike, call_oi, put_oi.
+    """
+    bs = a.by_strike
+    ks = bs["strike"].to_numpy()
+    if len(ks) < 2:
+        return pd.DataFrame(columns=["level", "side", "strength", "distance_pct",
+                                     "anchor_strike", "call_oi", "put_oi"])
+    spacing = float(np.median(np.diff(np.sort(np.unique(ks)))))
+    call_w = bs["call_oi"].to_numpy(dtype=float)
+    put_w = bs["put_oi"].to_numpy(dtype=float)
+    total_w = call_w + put_w
+
+    lo, hi = a.spot * 0.90, a.spot * 1.10
+    grid = np.arange(lo, hi, spacing / 10.0)
+    dens = np.array([_kernel_density(ks, total_w, x, spacing) for x in grid])
+    if dens.max() <= 0:
+        return pd.DataFrame(columns=["level", "side", "strength", "distance_pct",
+                                     "anchor_strike", "call_oi", "put_oi"])
+
+    floor = 0.05 * dens.max()
+    rows = []
+    for i in range(1, len(grid) - 1):
+        if dens[i] > floor and dens[i] > dens[i - 1] and dens[i] >= dens[i + 1]:
+            level = _golden_max(
+                lambda x: _kernel_density(ks, total_w, x, spacing),
+                grid[i] - spacing, grid[i] + spacing,
+            )
+            strength = _kernel_density(ks, total_w, level, spacing)
+            c_d = _kernel_density(ks, call_w, level, spacing)
+            p_d = _kernel_density(ks, put_w, level, spacing)
+            side = "call" if c_d > 1.5 * p_d else "put" if p_d > 1.5 * c_d else "mixed"
+            j = int(np.argmin(np.abs(ks - level)))
+            rows.append((level, side, strength, (level / a.spot - 1) * 100,
+                         float(ks[j]), float(call_w[j]), float(put_w[j])))
+
+    if not rows:
+        return pd.DataFrame(columns=["level", "side", "strength", "distance_pct",
+                                     "anchor_strike", "call_oi", "put_oi"])
+    df = pd.DataFrame(rows, columns=["level", "side", "strength", "distance_pct",
+                                     "anchor_strike", "call_oi", "put_oi"])
     df = df.sort_values("strength", ascending=False)
     kept: list[int] = []
     for idx, row in df.iterrows():

@@ -12,7 +12,7 @@ import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
 
-from dealer_gex.analytics import Analysis, analyze, fmt_dollars, magnet_levels
+from dealer_gex.analytics import Analysis, analyze, fmt_dollars, magnet_levels, oi_levels
 from dealer_gex.parsing import ChainParseError, normalize_chain, parse_file
 from dealer_gex.report import (
     build_markdown, build_playbook, key_ladder, markdown_to_html, regime_text,
@@ -322,7 +322,7 @@ def gex_curve_chart(a: Analysis) -> None:
     st.plotly_chart(_style(fig), use_container_width=True)
 
 
-def oi_chart(a: Analysis) -> None:
+def oi_chart(a: Analysis, levels: pd.DataFrame | None = None) -> None:
     lo, hi = a.spot * 0.88, a.spot * 1.12
     df = a.by_strike.query("@lo <= strike <= @hi")
     fig = go.Figure()
@@ -331,10 +331,54 @@ def oi_chart(a: Analysis) -> None:
     fig.add_bar(x=df["strike"], y=-df["put_oi"], name="Put OI", marker_color=C["put"],
                 hovertemplate="strike %{x}<br>put OI %{customdata:,.0f}<extra></extra>",
                 customdata=df["put_oi"])
+    if levels is not None and not levels.empty:
+        fig.add_scatter(
+            x=levels["level"], y=[0] * len(levels), mode="markers",
+            name="OI level",
+            marker=dict(color=C["ink"], symbol="diamond", size=11,
+                        line=dict(width=1, color=C["muted"])),
+            customdata=levels["strength"],
+            hovertemplate="%{x:,.2f} · OI weight %{customdata:.0f}<extra></extra>",
+        )
     fig.update_layout(barmode="relative", title="Open interest by strike (puts shown downward)",
                       yaxis_title="Contracts")
     _level_lines(fig, a)
     st.plotly_chart(_style(fig), use_container_width=True)
+
+
+def oi_levels_section(a: Analysis, levels: pd.DataFrame) -> None:
+    st.subheader("📊 OI levels (raw open interest)")
+    if levels.empty:
+        st.info("No open-interest concentration peaks found within ±10% of spot.")
+        return
+    left, right = st.columns([3, 2])
+    with left:
+        view = levels.copy()
+        view["Side"] = view["side"].map(
+            {"call": "📈 Call-heavy", "put": "📉 Put-heavy", "mixed": "⚖️ Mixed"})
+        view["Level"] = view["level"].map(lambda x: f"{x:,.2f}")
+        view["Distance"] = view["distance_pct"].map(lambda x: f"{x:+.1f}%")
+        view["Call OI"] = view["call_oi"].map(lambda x: f"{x:,.0f}")
+        view["Put OI"] = view["put_oi"].map(lambda x: f"{x:,.0f}")
+        st.dataframe(
+            view[["Level", "Side", "strength", "Distance", "Call OI", "Put OI"]]
+            .rename(columns={"strength": "Weight"}),
+            use_container_width=True, hide_index=True,
+            column_config={"Weight": st.column_config.ProgressColumn(
+                "Weight", min_value=0, max_value=100, format="%.0f")},
+        )
+    with right:
+        st.markdown(
+            "- **Raw OI marks where positions sit** — independent of today's "
+            "gamma. These are the classic support/resistance and expiry-pin "
+            "levels.\n"
+            "- **📈 Call-heavy above spot** tends to cap rallies; **📉 "
+            "put-heavy below** tends to catch selloffs; big clusters attract "
+            "price into expiry.\n"
+            "- The 🧲 magnet table weights this same OI by its hedging force "
+            "*today*; this table is the raw standing size. Levels on both "
+            "lists are the highest-conviction ones."
+        )
 
 
 def playbook_section(a: Analysis) -> None:
@@ -474,14 +518,16 @@ def main() -> None:
     metrics_row(a)
 
     magnets = magnet_levels(a)
+    oi_lvls = oi_levels(a)
     gex_by_strike_chart(a, magnets)
     col1, col2 = st.columns(2)
     with col1:
         gex_curve_chart(a)
     with col2:
-        oi_chart(a)
+        oi_chart(a, oi_lvls)
 
     magnet_section(a, magnets)
+    oi_levels_section(a, oi_lvls)
     playbook_section(a)
     tables(a)
     report_section(a, ticker)

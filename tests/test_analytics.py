@@ -314,6 +314,35 @@ def test_report_includes_magnets():
     assert "Nearest magnets" in md
 
 
+def test_oi_levels_sample_chain():
+    from dealer_gex.analytics import oi_levels
+
+    chain, spot = read_chain((REPO / "data" / "sample_option_chain.csv").read_bytes())
+    a = analyze(chain, spot, ASOF)
+    lv = oi_levels(a)
+    assert not lv.empty
+    assert list(lv["strength"]) == sorted(lv["strength"], reverse=True)
+    assert lv["strength"].iloc[0] == 100
+    # put cluster at 600 below spot, call cluster at 650 above
+    floors = lv[(lv["side"] == "put") & (lv["level"] < spot)]
+    caps = lv[(lv["side"] == "call") & (lv["level"] > spot)]
+    assert any(abs(x - 600) < 5 for x in floors["level"])
+    assert any(abs(x - 650) < 5 for x in caps["level"])
+    # side labels reflect the dominant OI at the anchor
+    r600 = floors.loc[floors["level"].sub(600).abs().idxmin()]
+    assert r600["put_oi"] > r600["call_oi"]
+
+
+def test_report_includes_oi_levels():
+    from dealer_gex.report import build_markdown
+
+    chain, spot = read_chain((REPO / "data" / "sample_option_chain.csv").read_bytes())
+    a = analyze(chain, spot, ASOF)
+    md = build_markdown(a, ticker="SPY")
+    assert "## OI levels (raw open interest)" in md
+    assert "Raw OI structure" in md
+
+
 def test_fmt_dollars():
     assert fmt_dollars(1_460_000_000) == "$1.46B"
     assert fmt_dollars(-441_430_000) == "-$441.43M"
