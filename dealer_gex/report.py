@@ -6,7 +6,7 @@ import html
 
 import pandas as pd
 
-from dealer_gex.analytics import Analysis, fmt_dollars, magnet_levels, oi_levels
+from dealer_gex.analytics import Analysis, fmt_dollars, magnet_levels, oi_levels, oi_walls
 
 _REGIME_TEXT = {
     "long_gamma": (
@@ -38,6 +38,13 @@ def key_ladder(a: Analysis) -> pd.DataFrame:
         ("Max pain", a.max_pain, "Expiry gravitation level"),
         ("Put wall", a.put_wall, "Support in long-gamma regime; acceleration marker below the flip"),
     ]
+    cw, pw = oi_walls(a)
+    if cw is not None:
+        rows.append(("Call OI wall", cw,
+                     "Largest raw call open interest — classic cap / pin strike"))
+    if pw is not None:
+        rows.append(("Put OI wall", pw,
+                     "Largest raw put open interest — classic support marker"))
     if a.gamma_flip is not None:
         rows.append(("Gamma flip", a.gamma_flip,
                      "Regime switch: stabilizing above, destabilizing below"))
@@ -176,9 +183,18 @@ def build_markdown(a: Analysis, ticker: str = "") -> str:
         "|---|---|---|",
         f"| Spot (as of analysis) | {a.spot:,.2f} | Reference price for all calculations |",
         f"| Gamma flip (zero-gamma) | {flip} | Below: dealers short gamma (destabilizing); above: long gamma (stabilizing) |",
-        f"| Call wall | {a.call_wall:,.2f} (strike {a.call_wall_strike:,.0f}) | Peak aggregate dealer call gamma — rallies tend to stall/pin here |",
-        f"| Put wall | {a.put_wall:,.2f} (strike {a.put_wall_strike:,.0f}) | Peak aggregate dealer put gamma — selloffs tend to accelerate below, or find support at, this level |",
+        f"| Call wall (gamma) | {a.call_wall:,.2f} (strike {a.call_wall_strike:,.0f}) | Peak aggregate dealer call gamma — rallies tend to stall/pin here |",
+        f"| Put wall (gamma) | {a.put_wall:,.2f} (strike {a.put_wall_strike:,.0f}) | Peak aggregate dealer put gamma — selloffs tend to accelerate below, or find support at, this level |",
         f"| Max pain | {a.max_pain:,.2f} | Level minimizing option-holder payout at expiry |",
+    ]
+    cw, pw = oi_walls(a)
+    if cw is not None:
+        lines.append(
+            f"| Call OI wall | {cw:,.2f} | Largest raw call open interest — classic cap / pin strike |")
+    if pw is not None:
+        lines.append(
+            f"| Put OI wall | {pw:,.2f} | Largest raw put open interest — classic support marker |")
+    lines += [
         f"| Net GEX | {fmt_dollars(a.total_gex)} / 1% move | Total dealer hedging demand per 1% move in spot |",
         f"| Net DEX | {fmt_dollars(a.dex)} | Net dealer delta inventory (convention-based) |",
         f"| Vanna flow | {_fmt_flow(a.vanna_flow)} per -1 IV pt | Forced re-hedging if implied vol drops one point |",

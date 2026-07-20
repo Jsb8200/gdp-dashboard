@@ -343,6 +343,21 @@ def test_report_includes_oi_levels():
     assert "Raw OI structure" in md
 
 
+def test_oi_walls():
+    from dealer_gex.analytics import oi_walls
+    from dealer_gex.report import build_markdown, key_ladder
+
+    chain, spot = read_chain((REPO / "data" / "sample_option_chain.csv").read_bytes())
+    a = analyze(chain, spot, ASOF)
+    cw, pw = oi_walls(a)
+    assert cw == 650.0  # 3x call-OI spike in the sample generator
+    assert pw == 600.0  # 3.5x put-OI spike
+    ladder = key_ladder(a)
+    assert {"Call OI wall", "Put OI wall"} <= set(ladder["Level"])
+    md = build_markdown(a, ticker="SPY")
+    assert "Call OI wall" in md and "Put OI wall" in md
+
+
 def test_fmt_dollars():
     assert fmt_dollars(1_460_000_000) == "$1.46B"
     assert fmt_dollars(-441_430_000) == "-$441.43M"

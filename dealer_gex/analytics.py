@@ -310,6 +310,21 @@ def magnet_levels(a: "Analysis", top_n: int = 5) -> pd.DataFrame:
     return df
 
 
+def oi_walls(a: "Analysis") -> tuple[float | None, float | None]:
+    """The classic OI walls: (call_oi_wall, put_oi_wall) — the single strikes
+    holding the largest raw call and put open interest. Distinct from the
+    gamma-weighted walls on the Analysis itself: these mark sheer position
+    size, regardless of today's hedging sensitivity."""
+    bs = a.by_strike
+    call_wall = (
+        float(bs.loc[bs["call_oi"].idxmax(), "strike"]) if bs["call_oi"].max() > 0 else None
+    )
+    put_wall = (
+        float(bs.loc[bs["put_oi"].idxmax(), "strike"]) if bs["put_oi"].max() > 0 else None
+    )
+    return call_wall, put_wall
+
+
 def oi_levels(a: "Analysis", top_n: int = 5) -> pd.DataFrame:
     """Ranked raw open-interest concentration levels — where positions SIT,
     independent of current gamma sensitivity.

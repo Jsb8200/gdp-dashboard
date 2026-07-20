@@ -12,7 +12,9 @@ import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
 
-from dealer_gex.analytics import Analysis, analyze, fmt_dollars, magnet_levels, oi_levels
+from dealer_gex.analytics import (
+    Analysis, analyze, fmt_dollars, magnet_levels, oi_levels, oi_walls,
+)
 from dealer_gex.parsing import ChainParseError, normalize_chain, parse_file
 from dealer_gex.report import (
     build_markdown, build_playbook, key_ladder, markdown_to_html, regime_text,
@@ -340,6 +342,15 @@ def oi_chart(a: Analysis, levels: pd.DataFrame | None = None) -> None:
             customdata=levels["strength"],
             hovertemplate="%{x:,.2f} · OI weight %{customdata:.0f}<extra></extra>",
         )
+    cw, pw = oi_walls(a)
+    if cw is not None and lo <= cw <= hi:
+        fig.add_vline(x=cw, line_dash="dashdot", line_color=C["call"], line_width=1,
+                      annotation_text="call OI wall", annotation_position="top right",
+                      annotation_font_color=C["call"])
+    if pw is not None and lo <= pw <= hi:
+        fig.add_vline(x=pw, line_dash="dashdot", line_color=C["put"], line_width=1,
+                      annotation_text="put OI wall", annotation_position="bottom left",
+                      annotation_font_color=C["put"])
     fig.update_layout(barmode="relative", title="Open interest by strike (puts shown downward)",
                       yaxis_title="Contracts")
     _level_lines(fig, a)
@@ -348,6 +359,21 @@ def oi_chart(a: Analysis, levels: pd.DataFrame | None = None) -> None:
 
 def oi_levels_section(a: Analysis, levels: pd.DataFrame) -> None:
     st.subheader("📊 OI levels (raw open interest)")
+    cw, pw = oi_walls(a)
+    wcols = st.columns(4)
+    bs = a.by_strike
+    if cw is not None:
+        wcols[0].metric("Call OI wall", f"{cw:,.0f}",
+                        f"{bs.loc[bs['strike'] == cw, 'call_oi'].iloc[0]:,.0f} contracts",
+                        delta_color="off",
+                        help="Strike holding the largest raw call open interest — "
+                             "the classic rally cap / pin strike.")
+    if pw is not None:
+        wcols[1].metric("Put OI wall", f"{pw:,.0f}",
+                        f"{bs.loc[bs['strike'] == pw, 'put_oi'].iloc[0]:,.0f} contracts",
+                        delta_color="off",
+                        help="Strike holding the largest raw put open interest — "
+                             "the classic support / capitulation marker.")
     if levels.empty:
         st.info("No open-interest concentration peaks found within ±10% of spot.")
         return
