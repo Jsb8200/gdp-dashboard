@@ -170,7 +170,69 @@ def verdict_banner(a: Analysis) -> None:
     )
 
 
-def metrics_row(a: Analysis) -> None:
+TRADING_HOURS = 6.5
+
+
+def scenario_section(a: Analysis, chain: pd.DataFrame, asof, rate: float,
+                     weight: str, multiplier: float) -> None:
+    st.subheader("🎛️ Scenario simulator")
+    st.caption(
+        "Re-price the whole book at a hypothetical spot and IV — see the "
+        "regime, flip, and forced hedge flow *before* the market goes there. "
+        "Sticky-strike IV, open interest held fixed."
+    )
+    c1, c2 = st.columns(2)
+    spot_h = c1.slider(
+        "Hypothetical spot", min_value=round(a.spot * 0.90, 2),
+        max_value=round(a.spot * 1.10, 2), value=round(a.spot, 2),
+        step=0.01, format="%.2f",
+    )
+    iv_shift = c2.slider(
+        "IV shift (vol points)", -10.0, 10.0, 0.0, 0.5,
+        help="Applied to every contract's IV. Vol crush = negative.",
+    )
+
+    ch = chain
+    if iv_shift:
+        ch = chain.assign(iv=(chain["iv"] + iv_shift / 100.0).clip(lower=0.005))
+    try:
+        s = analyze(ch, spot_h, asof, rate, weight=weight, multiplier=multiplier)
+    except ValueError as exc:
+        st.error(str(exc))
+        return
+
+    hedge = -(s.dex - a.dex)  # dealers trade against their delta change
+    flips = s.regime != a.regime
+    cols = st.columns(4)
+    cols[0].metric(
+        "Regime at that spot",
+        "LONG gamma" if s.regime == "long_gamma" else "SHORT gamma",
+        "REGIME FLIPS" if flips else "unchanged", delta_color="off",
+    )
+    cols[1].metric("Net GEX there", fmt_dollars(s.total_gex),
+                   f"{fmt_dollars(s.total_gex - a.total_gex)} vs now", delta_color="off")
+    cols[2].metric("Gamma flip there",
+                   f"{s.gamma_flip:,.2f}" if s.gamma_flip is not None else "—",
+                   help="The flip itself moves when IV shifts.")
+    cols[3].metric(
+        "Hedge flow on the way",
+        f"{'+' if hedge >= 0 else '-'}{fmt_dollars(abs(hedge))}",
+        "dealers buy" if hedge >= 0 else "dealers sell", delta_color="off",
+        help="Dealer delta change from current spot/IV to the scenario, "
+             "hedged by trading the opposite — the mechanical flow released "
+             "if price/IV actually go there.",
+    )
+    if flips:
+        st.warning(
+            f"At {spot_h:,.2f}{f' with IV {iv_shift:+.1f}pt' if iv_shift else ''} "
+            f"the regime flips to **{s.regime.replace('_', ' ')}** — dealer "
+            "hedging changes character there "
+            f"({'amplifying moves' if s.regime == 'short_gamma' else 'dampening moves'}).",
+            icon="🔄",
+        )
+
+
+def metrics_row(a: Analysis, zero_dte: bool = False) -> None:
     cols = st.columns(5)
     flip_val = f"{a.gamma_flip:,.2f}" if a.gamma_flip is not None else "—"
     flip_delta = (
@@ -189,17 +251,26 @@ def metrics_row(a: Analysis) -> None:
 
     cols = st.columns(5)
     em_val = f"±{a.expected_move:,.2f}" if a.expected_move is not None else "—"
-    em_note = f"into {a.nearest_expiry}" if a.expected_move is not None else None
-    cols[0].metric("Expected move (1σ)", em_val, em_note, delta_color="off",
+    if zero_dte:
+        em_label, em_note = "Expected move (to close)", "by today's close"
+        charm_label, charm_val = "Charm flow / hour", flow(a.charm_flow / TRADING_HOURS)
+        charm_help = ("Forced dealer re-hedging per trading hour from delta "
+                      "decay — 0DTE decay is realized within the session.")
+    else:
+        em_label = "Expected move (1σ)"
+        em_note = f"into {a.nearest_expiry}" if a.expected_move is not None else None
+        charm_label, charm_val = "Charm flow / day", flow(a.charm_flow)
+        charm_help = "Forced dealer re-hedging per calendar day from delta decay."
+    cols[0].metric(em_label, em_val, em_note, delta_color="off",
                    help="Straddle approximation from near-the-money IV at the nearest expiry.")
     cols[1].metric("Net DEX", fmt_dollars(a.dex),
                    help="Net dealer delta inventory under the standard convention.")
     cols[2].metric("Vanna flow / -1 IV pt", flow(a.vanna_flow),
                    "buying" if a.vanna_flow >= 0 else "selling", delta_color="off",
                    help="Forced dealer re-hedging if implied vol drops one point.")
-    cols[3].metric("Charm flow / day", flow(a.charm_flow),
+    cols[3].metric(charm_label, charm_val,
                    "buying" if a.charm_flow >= 0 else "selling", delta_color="off",
-                   help="Forced dealer re-hedging per calendar day from delta decay.")
+                   help=charm_help)
     mode_val = {"volume": "Volume", "flow": "Flow"}.get(a.weight_mode, "OI")
     mode_note = {"volume": "intraday flow", "flow": "signed order flow"}.get(
         a.weight_mode, "positioning")
@@ -652,14 +723,25 @@ def main() -> None:
     weight = ("volume" if weight.startswith("Volume")
               else "flow" if weight.startswith("Signed") else "open_interest")
 
+    zero_dte = False
     if not history:
         all_exp = sorted(d for d in chain["expiry"].dt.date.dropna().unique())
-        picked = st.sidebar.multiselect(
-            "Expiries", all_exp, default=all_exp,
-            help="Near-dated expiries dominate dealer hedging obligations.",
-        )
-        if picked and len(picked) < len(all_exp):
-            chain = chain[chain["expiry"].dt.date.isin(picked)]
+        if asof in all_exp:
+            zero_dte = st.sidebar.toggle(
+                f"0DTE mode — {asof} expiry only",
+                help="Analyze only contracts expiring on the as-of date: the "
+                     "gamma that actually binds today. Charm switches to "
+                     "per-hour and the expected move is to the close.",
+            )
+        if zero_dte:
+            chain = chain[chain["expiry"].dt.date == asof]
+        else:
+            picked = st.sidebar.multiselect(
+                "Expiries", all_exp, default=all_exp,
+                help="Near-dated expiries dominate dealer hedging obligations.",
+            )
+            if picked and len(picked) < len(all_exp):
+                chain = chain[chain["expiry"].dt.date.isin(picked)]
 
     hist = None
     if history:
@@ -712,7 +794,10 @@ def main() -> None:
         )
 
     verdict_banner(a)
-    metrics_row(a)
+    if zero_dte:
+        st.caption(f"⏱️ 0DTE mode: {a.n_contracts:,} contracts expiring {a.asof} — "
+                   "this is the gamma that binds into today's close.")
+    metrics_row(a, zero_dte)
 
     if hist is not None and len(hist) >= 2:
         history_section(hist)
@@ -728,6 +813,9 @@ def main() -> None:
 
     magnet_section(a, magnets)
     oi_levels_section(a, oi_lvls)
+
+    if not history:
+        scenario_section(a, chain, asof, rate, weight, multiplier)
 
     if all_prints:
         merged_prints = pd.concat(all_prints, ignore_index=True)

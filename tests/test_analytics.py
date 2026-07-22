@@ -414,6 +414,39 @@ def test_report_level_migration_section():
     assert "## Level migration" not in build_markdown(a, ticker="SPY")
 
 
+def test_scenario_repricing_premises():
+    """The scenario simulator's core claims: regime flips below the flip
+    level, IV shifts move the numbers, and hedge flow is the dex delta."""
+    chain, spot = read_chain((REPO / "data" / "sample_option_chain.csv").read_bytes())
+    a = analyze(chain, spot, ASOF)
+    assert a.regime == "long_gamma"
+
+    below = analyze(chain, a.gamma_flip - 8.0, ASOF)
+    assert below.regime == "short_gamma"
+
+    crushed = analyze(chain.assign(iv=(chain["iv"] - 0.05).clip(lower=0.005)), spot, ASOF)
+    assert crushed.total_gex != a.total_gex
+    assert crushed.dex != a.dex  # hedge flow = -(dex' - dex) is nonzero
+
+
+def test_zero_dte_analysis():
+    rows = []
+    for strike, typ, oi in [(98, "P", 5000), (100, "C", 4000), (100, "P", 4000),
+                            (102, "C", 5000)]:
+        rows.append({"expiry": pd.Timestamp(ASOF), "strike": float(strike),
+                     "type": typ, "open_interest": float(oi), "volume": 100.0,
+                     "iv": 0.30, "gamma": np.nan})
+    a = analyze(pd.DataFrame(rows), spot=100.0, asof=ASOF)
+    # 0DTE contracts get the intraday time floor, not dropped and not exploded
+    assert a.n_contracts == 4
+    assert np.isfinite(a.total_gex) and a.total_gex != 0
+    # expected move ~ spot * iv * sqrt(MIN_T): a fraction of a full day's move
+    from dealer_gex.analytics import MIN_T
+    approx = 100.0 * 0.30 * np.sqrt(MIN_T)
+    assert a.expected_move == pytest.approx(approx, rel=0.01)
+    assert 0 < a.expected_move < 100.0 * 0.30 * np.sqrt(1 / 252)
+
+
 def test_fmt_dollars():
     assert fmt_dollars(1_460_000_000) == "$1.46B"
     assert fmt_dollars(-441_430_000) == "-$441.43M"
