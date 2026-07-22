@@ -165,7 +165,8 @@ def build_playbook(a: Analysis) -> list[str]:
     return lines
 
 
-def build_markdown(a: Analysis, ticker: str = "") -> str:
+def build_markdown(a: Analysis, ticker: str = "",
+                   history: pd.DataFrame | None = None) -> str:
     title, body = regime_text(a.regime)
     label = f"{ticker.upper()} " if ticker else ""
     flip = f"{a.gamma_flip:,.2f}" if a.gamma_flip is not None else "no crossing in ±15% range"
@@ -231,6 +232,24 @@ def build_markdown(a: Analysis, ticker: str = "") -> str:
             lines.append(
                 f"| {r['level']:,.2f} | {kind} | {r['strength']:.0f} "
                 f"| {r['distance_pct']:+.1f}% | {r['anchor_strike']:,.0f} |"
+            )
+
+    if history is not None and len(history) >= 2:
+        lines += [
+            "",
+            "## Level migration",
+            "",
+            "| Date | Spot | Flip | Call wall | Put wall | Call OI wall | Put OI wall | Max pain | Net GEX | Regime |",
+            "|---|---|---|---|---|---|---|---|---|---|",
+        ]
+        for _, r in history.iterrows():
+            def _n(v):
+                return f"{v:,.2f}" if pd.notna(v) else "—"
+            lines.append(
+                f"| {r['date']} | {_n(r['spot'])} | {_n(r['flip'])} | {_n(r['call_wall'])} "
+                f"| {_n(r['put_wall'])} | {_n(r['call_oi_wall'])} | {_n(r['put_oi_wall'])} "
+                f"| {_n(r['max_pain'])} | {fmt_dollars(r['net_gex'])} "
+                f"| {str(r['regime']).replace('_', ' ')} |"
             )
 
     oi = oi_levels(a)

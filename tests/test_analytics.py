@@ -209,14 +209,14 @@ def test_multiplier_scales_dollars_not_levels():
     assert a50.regime == a100.regime
 
 
-QUANTDATA_CSV = """Trade ID,Trade Time,Ticker,Expiration Date,Strike Price,Contract Type,Reference Price,Size,Volume,Open Interest,Side Code,Implied Volatility,Gamma
-1,2026-07-14T13:30:00.100Z,QQQ,2026-08-21,$720.00,CALL,$719.50,100,"1,000","5,000",A,18.5%,0.012
-2,2026-07-14T14:00:00.200Z,QQQ,2026-08-21,$720.00,CALL,$720.10,50,"1,500","5,000",AA,18.7%,0.012
-3,2026-07-14T14:30:00.300Z,QQQ,2026-08-21,$720.00,CALL,$720.30,30,"1,800","5,000",B,18.6%,0.012
-4,2026-07-14T15:00:00Z,QQQ,2026-08-21,$720.00,CALL,$720.40,20,"2,000","5,000",M,18.4%,0.012
-5,2026-07-14T15:10:00.500Z,QQQ,2026-08-21,$700.00,PUT,$720.60,80,900,"8,000",BB,22.1%,0.010
-6,2026-07-14T17:42:16.130Z,QQQ,2026-08-21,$700.00,PUT,$721.10,40,950,"8,000",A,22.3%,0.010
-7,2026-07-13T14:00:00.100Z,GLD,2026-08-21,$370.00,CALL,$372.64,10,200,"1,200",A,15.0%,0.020
+QUANTDATA_CSV = """Trade ID,Trade Time,Ticker,Expiration Date,Strike Price,Contract Type,Reference Price,Size,Volume,Open Interest,Side Code,Implied Volatility,Gamma,Premium Price,Consolidation Type,Is Golden Sweep,Is Unusual,Is Opening Position
+1,2026-07-14T13:30:00.100Z,QQQ,2026-08-21,$720.00,CALL,$719.50,100,"1,000","5,000",A,18.5%,0.012,"$50,000.00",SWEEP,No,No,Yes
+2,2026-07-14T14:00:00.200Z,QQQ,2026-08-21,$720.00,CALL,$720.10,50,"1,500","5,000",AA,18.7%,0.012,"$25,000.00",BLOCK,Yes,No,No
+3,2026-07-14T14:30:00.300Z,QQQ,2026-08-21,$720.00,CALL,$720.30,30,"1,800","5,000",B,18.6%,0.012,"$15,000.00",AUTO,No,Yes,No
+4,2026-07-14T15:00:00Z,QQQ,2026-08-21,$720.00,CALL,$720.40,20,"2,000","5,000",M,18.4%,0.012,"$10,000.00",AUTO,No,No,No
+5,2026-07-14T15:10:00.500Z,QQQ,2026-08-21,$700.00,PUT,$720.60,80,900,"8,000",BB,22.1%,0.010,"$80,000.00",SWEEP,No,No,No
+6,2026-07-14T17:42:16.130Z,QQQ,2026-08-21,$700.00,PUT,$721.10,40,950,"8,000",A,22.3%,0.010,"$40,000.00",AUTO,No,No,No
+7,2026-07-13T14:00:00.100Z,GLD,2026-08-21,$370.00,CALL,$372.64,10,200,"1,200",A,15.0%,0.020,"$5,000.00",AUTO,No,No,No
 """
 
 
@@ -356,6 +356,52 @@ def test_oi_walls():
     assert {"Call OI wall", "Put OI wall"} <= set(ladder["Level"])
     md = build_markdown(a, ticker="SPY")
     assert "Call OI wall" in md and "Put OI wall" in md
+
+
+def test_prints_retained_with_flags_and_premium():
+    from dealer_gex.parsing import parse_file
+
+    pf = parse_file(QUANTDATA_CSV)
+    p = pf.prints
+    assert p is not None and len(p) == 7
+    assert p["is_sweep"].sum() == 2          # rows 1 and 5 (Consolidation SWEEP)
+    assert p["is_golden"].sum() == 1
+    assert p["is_unusual"].sum() == 1
+    assert p["is_opening"].sum() == 1
+    assert p["premium"].max() == 80000.0     # $-and-comma formatted
+
+
+def test_conviction_aggregation():
+    from dealer_gex.parsing import parse_file, aggregate_prints
+
+    pf = parse_file(QUANTDATA_CSV)
+    p = pf.prints
+    conv = aggregate_prints(p[p["is_sweep"]])
+    # sweep prints only: the 720C (100 @ ask) and 700P (80 @ bid)
+    assert len(conv) == 2
+    c720 = conv[(conv["strike"] == 720) & (conv["type"] == "C")].iloc[0]
+    assert c720["net_customer_size"] == 100  # only the ask-side sweep remains
+    assert c720["open_interest"] == 5000     # OI still a contract property
+
+
+def test_report_level_migration_section():
+    from dealer_gex.report import build_markdown
+
+    chain, spot = read_chain((REPO / "data" / "sample_option_chain.csv").read_bytes())
+    a = analyze(chain, spot, ASOF)
+    hist = pd.DataFrame([
+        {"date": date(2026, 7, 16), "spot": 625.0, "flip": 614.2, "call_wall": 648.0,
+         "put_wall": 599.5, "call_oi_wall": 650.0, "put_oi_wall": 600.0,
+         "max_pain": 622.0, "net_gex": 1.2e9, "regime": "long_gamma"},
+        {"date": date(2026, 7, 17), "spot": 628.5, "flip": 616.5, "call_wall": 648.7,
+         "put_wall": 600.6, "call_oi_wall": 650.0, "put_oi_wall": 600.0,
+         "max_pain": 623.7, "net_gex": 1.8e9, "regime": "long_gamma"},
+    ])
+    md = build_markdown(a, ticker="SPY", history=hist)
+    assert "## Level migration" in md
+    assert "2026-07-16" in md and "2026-07-17" in md
+    # without history the section is absent
+    assert "## Level migration" not in build_markdown(a, ticker="SPY")
 
 
 def test_fmt_dollars():

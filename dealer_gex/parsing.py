@@ -64,7 +64,16 @@ SYNONYMS = {
     "side": ["sidecode", "side", "tradeside"],
     "trade_time": ["tradetime", "timestamp", "datetime", "time"],
     "trade_id": ["tradeid"],
+    "premium": ["premiumprice", "premium", "totalpremium"],
+    "consolidation": ["consolidationtype", "consolidation"],
+    "is_golden": ["isgoldensweep", "goldensweep"],
+    "is_unusual": ["isunusual", "unusual"],
+    "is_opening": ["isopeningposition", "openingposition", "isopening"],
 }
+
+
+def _yes(s: pd.Series) -> pd.Series:
+    return s.astype(str).str.strip().str.upper().isin(["YES", "TRUE", "Y", "1"])
 
 _REQUIRED = ["expiry", "strike", "type", "open_interest", "iv"]
 
@@ -76,6 +85,7 @@ class ParsedFile:
     spots: dict[str, float] = field(default_factory=dict)  # ticker -> spot ("" = unknown ticker)
     asof: date | None = None          # last trade date for flow files
     tickers: list[str] = field(default_factory=list)  # by activity, descending
+    prints: pd.DataFrame | None = None  # normalized per-print rows (flow files only)
 
 
 def _norm(name: str) -> str:
@@ -185,13 +195,26 @@ def _parse_trade_flow(raw: pd.DataFrame) -> ParsedFile:
         "iv": _to_num(raw[cols["iv"]]) if "iv" in cols else float("nan"),
         "gamma": _to_num(raw[cols["gamma"]]) if "gamma" in cols else float("nan"),
         "ref_price": _to_num(raw[cols["underlying_price"]]) if "underlying_price" in cols else float("nan"),
+        "premium": _to_num(raw[cols["premium"]]).fillna(0) if "premium" in cols else 0.0,
     })
     if "side" in cols:
         side = raw[cols["side"]].astype(str).str.strip().str.upper()
         sign = side.map({"A": 1.0, "AA": 1.0, "B": -1.0, "BB": -1.0}).fillna(0.0)
+        df["side"] = side
     else:
         sign = pd.Series(0.0, index=df.index)
+        df["side"] = ""
     df["signed_size"] = sign * df["size"]
+
+    # conviction flags: sweeps come from the consolidation type, the rest
+    # from QuantData's Yes/No columns
+    if "consolidation" in cols:
+        df["is_sweep"] = (raw[cols["consolidation"]].astype(str)
+                          .str.upper().str.contains("SWEEP", na=False))
+    else:
+        df["is_sweep"] = False
+    for flag in ("is_golden", "is_unusual", "is_opening"):
+        df[flag] = _yes(raw[cols[flag]]) if flag in cols else False
 
     # format="ISO8601" handles mixed with/without-milliseconds timestamps;
     # NaT rows sort first so the per-ticker "last" pick is a real trade.
@@ -199,10 +222,31 @@ def _parse_trade_flow(raw: pd.DataFrame) -> ParsedFile:
                             utc=True, format="ISO8601")
              if "trade_time" in cols else pd.Series(pd.NaT, index=df.index))
     df["trade_time"] = ttime
-    df = df.sort_values("trade_time", na_position="first")
+    df = df.sort_values("trade_time", na_position="first").reset_index(drop=True)
 
+    chain = aggregate_prints(df)
+
+    # last observed reference price per ticker = spot; last trade date = as-of
+    spots: dict[str, float] = {}
+    with_ref = df[df["ref_price"].notna()]
+    for tkr, sub in with_ref.groupby("ticker"):
+        spots[str(tkr)] = float(sub["ref_price"].iloc[-1])
+    asof = None
+    if df["trade_time"].notna().any():
+        asof = df["trade_time"].max().date()
+    tickers = list(df["ticker"].value_counts().index.astype(str))
+    return ParsedFile(chain=chain, spots=spots, asof=asof, tickers=tickers, prints=df)
+
+
+def aggregate_prints(prints: pd.DataFrame) -> pd.DataFrame:
+    """Collapse normalized per-print rows into a per-contract chain.
+
+    Callers may pre-filter `prints` (e.g. sweeps/golden/opening only) to
+    build a conviction-weighted book; OI and cumulative volume stay
+    contract-level properties (max), while flow and signed flow sum over
+    whatever prints remain."""
     grouped = (
-        df.groupby(["ticker", "expiry", "strike", "type"], dropna=False)
+        prints.groupby(["ticker", "expiry", "strike", "type"], dropna=False)
         .agg(
             open_interest=("open_interest", "max"),
             volume=("volume", "max"),          # cumulative day volume: max ≈ total
@@ -214,18 +258,7 @@ def _parse_trade_flow(raw: pd.DataFrame) -> ParsedFile:
         .reset_index()
     )
     grouped["volume"] = grouped["volume"].fillna(grouped["flow"])
-    chain = _finalize(grouped.drop(columns=["flow"]))
-
-    # last observed reference price per ticker = spot; last trade date = as-of
-    spots: dict[str, float] = {}
-    with_ref = df[df["ref_price"].notna()]
-    for tkr, sub in with_ref.groupby("ticker"):
-        spots[str(tkr)] = float(sub["ref_price"].iloc[-1])
-    asof = None
-    if ttime.notna().any():
-        asof = ttime.max().date()
-    tickers = list(df["ticker"].value_counts().index.astype(str))
-    return ParsedFile(chain=chain, spots=spots, asof=asof, tickers=tickers)
+    return _finalize(grouped.drop(columns=["flow"]))
 
 
 def _is_side_by_side(raw: pd.DataFrame) -> bool:

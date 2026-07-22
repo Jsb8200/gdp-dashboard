@@ -58,9 +58,17 @@ sidebar. Multiple files (e.g. one per expiry) can be uploaded together.
 | **Trading interpretation** | Auto-generated playbook: regime read, level-by-level meaning, and a price-sorted level ladder |
 | **Report** | Downloadable `.md` / `.html` summary of all of the above with the playbook and a per-expiry breakdown |
 
-Two weighting modes: **open interest** (standing positioning, updates
-overnight) or **volume** (today's traded flow — better for intraday/0DTE
-reads; zero-OI strikes that traded today are included).
+Three weighting modes: **open interest** (standing positioning, updates
+overnight), **volume** (today's traded flow — better for intraday/0DTE
+reads; zero-OI strikes that traded today are included), and — for
+trade-level order-flow exports — **signed order flow** (dealer positioning
+inferred from actual ask/bid trade direction).
+
+Order-flow extras (QuantData-style exports): a **conviction filter**
+(rebuild all levels from sweeps / golden sweeps / unusual / opening prints
+only), a **notable flow** table (largest premium prints with flags), and
+**level history** — upload several days of exports and see how the flip,
+walls, and regime migrated day over day.
 
 ## Assumptions & caveats
 

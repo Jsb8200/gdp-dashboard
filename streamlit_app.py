@@ -15,7 +15,9 @@ import streamlit as st
 from dealer_gex.analytics import (
     Analysis, analyze, fmt_dollars, magnet_levels, oi_levels, oi_walls,
 )
-from dealer_gex.parsing import ChainParseError, normalize_chain, parse_file
+from dealer_gex.parsing import (
+    ChainParseError, ParsedFile, aggregate_prints, normalize_chain, parse_file,
+)
 from dealer_gex.report import (
     build_markdown, build_playbook, key_ladder, markdown_to_html, regime_text,
 )
@@ -103,9 +105,8 @@ def _manual_mapping_ui(name: str, file_bytes: bytes) -> pd.DataFrame | None:
         return None
 
 
-def load_data() -> tuple[pd.DataFrame | None, dict, str, date]:
-    """Sidebar data controls. Returns (chain, spots_by_ticker, ticker_label,
-    default_asof). Spots dict may use "" for files with no ticker column."""
+def load_data() -> tuple[list, str]:
+    """Sidebar data controls. Returns (parsed_files, ticker_label)."""
     st.sidebar.header("Data")
     source = st.sidebar.radio(
         "Option-chain source",
@@ -116,32 +117,29 @@ def load_data() -> tuple[pd.DataFrame | None, dict, str, date]:
 
     if source.startswith("Sample"):
         pf = _parse(SAMPLE_PATH.read_bytes())
-        return pf.chain, pf.spots, "SPY (sample)", SAMPLE_ASOF
+        pf = ParsedFile(chain=pf.chain, spots=pf.spots, asof=SAMPLE_ASOF,
+                        tickers=pf.tickers, prints=pf.prints)
+        return [pf], "SPY (sample)"
 
     files = st.sidebar.file_uploader(
         "Option chain CSV(s)", type=["csv", "dat", "txt"], accept_multiple_files=True,
-        help="Multiple files are combined (e.g. one file per expiry).",
+        help="Multiple files combine into one book — or, when they cover "
+             "different days, can be compared as level history.",
     )
     if not files:
         st.sidebar.info("Upload at least one chain CSV, or switch to sample data.")
-        return None, {}, "", date.today()
+        return [], ""
 
-    chains, spots, asof = [], {}, None
+    pfs = []
     for f in files:
         data = f.getvalue()
         try:
-            pf = _parse(data)
-            chains.append(pf.chain)
-            spots.update(pf.spots)
-            if pf.asof is not None and (asof is None or pf.asof > asof):
-                asof = pf.asof
+            pfs.append(_parse(data))
         except ChainParseError:
             mapped = _manual_mapping_ui(f.name, data)
             if mapped is not None:
-                chains.append(mapped)
-    if not chains:
-        return None, {}, "", date.today()
-    return pd.concat(chains, ignore_index=True), spots, "", asof or date.today()
+                pfs.append(ParsedFile(chain=mapped))
+    return pfs, ""
 
 
 # --- UI sections -------------------------------------------------------------
@@ -407,6 +405,72 @@ def oi_levels_section(a: Analysis, levels: pd.DataFrame) -> None:
         )
 
 
+def history_section(hist: pd.DataFrame) -> None:
+    st.subheader("🗓️ Level migration")
+    series = [
+        ("spot", "Spot", C["ink"], "solid"),
+        ("flip", "Gamma flip", C["muted"], "dash"),
+        ("call_wall", "Call wall (gamma)", C["call"], "solid"),
+        ("put_wall", "Put wall (gamma)", C["put"], "solid"),
+        ("call_oi_wall", "Call OI wall", C["call"], "dot"),
+        ("put_oi_wall", "Put OI wall", C["put"], "dot"),
+    ]
+    fig = go.Figure()
+    for col, name, color, dash in series:
+        if hist[col].notna().any():
+            fig.add_scatter(
+                x=hist["date"], y=hist[col], mode="lines+markers", name=name,
+                line=dict(color=color, width=2, dash=dash), marker=dict(size=8),
+                hovertemplate=name + " %{y:,.2f}<extra></extra>",
+            )
+    fig.update_layout(title="Key levels by day", yaxis_title="Price")
+    fig.update_xaxes(type="category")
+    st.plotly_chart(_style(fig), use_container_width=True)
+
+    if len(hist) >= 2:
+        prev, last = hist.iloc[-2], hist.iloc[-1]
+        st.markdown(f"**Change {prev['date']} → {last['date']}:**")
+        cols = st.columns(6)
+        for i, (col, name, *_rest) in enumerate(series):
+            if pd.notna(last[col]) and pd.notna(prev[col]):
+                cols[i].metric(name, f"{last[col]:,.2f}",
+                               f"{last[col] - prev[col]:+,.2f}", delta_color="off")
+        if prev["regime"] != last["regime"]:
+            st.warning(
+                f"Regime flipped between days: {prev['regime'].replace('_', ' ')} "
+                f"→ {last['regime'].replace('_', ' ')}.", icon="🔄",
+            )
+
+
+def notable_flow_section(prints: pd.DataFrame, spot: float) -> None:
+    st.subheader("🐋 Notable flow (biggest premium prints)")
+    top = prints.reindex(prints["premium"].sort_values(ascending=False).index).head(10)
+    if top["premium"].max() <= 0:
+        st.info("No premium data in this file.")
+        return
+    view = pd.DataFrame({
+        "Time": top["trade_time"].dt.strftime("%m-%d %H:%M").fillna("—"),
+        "Expiry": pd.to_datetime(top["expiry"], errors="coerce", format="mixed").dt.strftime("%Y-%m-%d"),
+        "Strike": top["strike"].map(lambda x: f"{x:,.0f}"),
+        "C/P": top["type"].astype(str).str.upper().str[0],
+        "Side": top["side"].map(lambda s: "Buy (ask)" if s in ("A", "AA")
+                                else "Sell (bid)" if s in ("B", "BB") else "Mid"),
+        "Size": top["size"].map(lambda x: f"{x:,.0f}"),
+        "Premium": top["premium"].map(fmt_dollars),
+        "Flags": top.apply(lambda r: " ".join(filter(None, [
+            "🟡 golden" if r["is_golden"] else ("🌊 sweep" if r["is_sweep"] else ""),
+            "🚨 unusual" if r["is_unusual"] else "",
+            "🆕 opening" if r["is_opening"] else "",
+        ])) or "—", axis=1),
+    })
+    st.dataframe(view, use_container_width=True, hide_index=True)
+    st.caption(
+        "Largest single prints by dollar premium — conviction flow worth "
+        "cross-checking against the levels above. Ask-side call buying near a "
+        "wall is an attack on it; put buying near the put wall reinforces it."
+    )
+
+
 def playbook_section(a: Analysis) -> None:
     st.subheader("Trading interpretation")
     left, right = st.columns([3, 2])
@@ -438,9 +502,9 @@ def tables(a: Analysis) -> None:
         st.dataframe(top, use_container_width=True, hide_index=True)
 
 
-def report_section(a: Analysis, ticker: str) -> None:
+def report_section(a: Analysis, ticker: str, hist: pd.DataFrame | None = None) -> None:
     st.subheader("Report")
-    md = build_markdown(a, ticker=ticker)
+    md = build_markdown(a, ticker=ticker, history=hist)
     stem = f"dealer-positioning-{a.asof:%Y%m%d}"
     c1, c2, _ = st.columns([1, 1, 3])
     c1.download_button("Download report (.md)", md, file_name=f"{stem}.md",
@@ -460,10 +524,29 @@ def main() -> None:
         "exposure (GEX), forced-hedging direction, and the levels where it flips."
     )
 
-    chain, spots, default_ticker, default_asof = load_data()
-    if chain is None:
+    pfs, default_ticker = load_data()
+    if not pfs:
         st.info("⬅️ Choose a data source in the sidebar to begin.")
         return
+
+    # multiple files covering different days can be compared as history
+    dated = sorted({pf.asof for pf in pfs if pf.asof is not None})
+    history = False
+    if len(pfs) > 1 and len(dated) > 1:
+        mode = st.sidebar.radio(
+            f"Multiple days detected ({len(dated)})",
+            ["Compare days (level history)", "Combine into one book"],
+            help="History mode analyzes each file on its own date and shows "
+                 "how the levels migrated. Combining files from different "
+                 "days would double-count open interest.",
+        )
+        history = mode.startswith("Compare")
+
+    chain = pd.concat([pf.chain for pf in pfs], ignore_index=True)
+    spots: dict = {}
+    for pf in pfs:
+        spots.update(pf.spots)
+    default_asof = max(dated) if dated else date.today()
 
     st.sidebar.header("Parameters")
     file_tickers = []
@@ -480,17 +563,66 @@ def main() -> None:
     else:
         ticker = st.sidebar.text_input("Ticker (label only)", value=default_ticker)
 
+    # conviction filter: rebuild the book from flagged prints only
+    all_prints = [pf.prints for pf in pfs if pf.prints is not None]
+    conv_picked: list[str] = []
+    if all_prints:
+        conv_picked = st.sidebar.multiselect(
+            "Conviction filter (flow files)",
+            ["Sweeps", "Golden sweeps", "Unusual", "Opening positions"],
+            help="Rebuild every level from flagged prints only — aggressive, "
+                 "urgent flow instead of the full tape. Empty = all prints.",
+        )
+
+    def _conv_mask(p: pd.DataFrame) -> pd.Series:
+        m = pd.Series(False, index=p.index)
+        if "Sweeps" in conv_picked:
+            m |= p["is_sweep"]
+        if "Golden sweeps" in conv_picked:
+            m |= p["is_golden"]
+        if "Unusual" in conv_picked:
+            m |= p["is_unusual"]
+        if "Opening positions" in conv_picked:
+            m |= p["is_opening"]
+        return m
+
+    def _build_chain(pf: ParsedFile) -> pd.DataFrame | None:
+        ch = pf.chain
+        if conv_picked and pf.prints is not None:
+            picked_prints = pf.prints[_conv_mask(pf.prints)]
+            if picked_prints.empty:
+                return None
+            ch = aggregate_prints(picked_prints)
+        if file_tickers and "ticker" in ch.columns:
+            ch = ch[ch["ticker"] == ticker] if len(file_tickers) > 1 else ch
+        return None if ch.empty else ch
+
+    if conv_picked and all_prints:
+        conv_chains = [c for c in (_build_chain(pf) for pf in pfs) if c is not None]
+        if conv_chains:
+            chain = pd.concat(conv_chains, ignore_index=True)
+            n_conv = sum(int(_conv_mask(p).sum()) for p in all_prints)
+            st.sidebar.caption(f"Conviction book: {n_conv:,} prints → {len(chain):,} contracts.")
+        else:
+            st.sidebar.warning("No prints match the conviction filter — using all prints.")
+            conv_picked = []
+
     inferred_spot = spots.get(ticker, spots.get("", None))
-    spot = st.sidebar.number_input(
-        "Spot price", min_value=0.01, value=float(inferred_spot or 100.0),
-        format="%.2f", key=f"spot_{ticker}_{inferred_spot}",
-        help="Auto-filled from the file (underlying/reference price) when present.",
-    )
-    asof = st.sidebar.date_input(
-        "Analysis as-of date", value=default_asof, key=f"asof_{default_asof}",
-        help="Time-to-expiry is measured from this date. For flow exports this "
-             "defaults to the file's last trade date.",
-    )
+    if history:
+        spot, asof = float(inferred_spot or 100.0), default_asof
+        st.sidebar.caption("History mode: each day uses its own file's spot "
+                           "and trade date; expiry filter is disabled.")
+    else:
+        spot = st.sidebar.number_input(
+            "Spot price", min_value=0.01, value=float(inferred_spot or 100.0),
+            format="%.2f", key=f"spot_{ticker}_{inferred_spot}",
+            help="Auto-filled from the file (underlying/reference price) when present.",
+        )
+        asof = st.sidebar.date_input(
+            "Analysis as-of date", value=default_asof, key=f"asof_{default_asof}",
+            help="Time-to-expiry is measured from this date. For flow exports this "
+                 "defaults to the file's last trade date.",
+        )
     rate = st.sidebar.number_input("Risk-free rate (%)", 0.0, 15.0, 4.5, 0.25) / 100
     multiplier = st.sidebar.number_input(
         "Contract multiplier", min_value=1.0, value=100.0, step=1.0,
@@ -516,19 +648,53 @@ def main() -> None:
     weight = ("volume" if weight.startswith("Volume")
               else "flow" if weight.startswith("Signed") else "open_interest")
 
-    all_exp = sorted(d for d in chain["expiry"].dt.date.dropna().unique())
-    picked = st.sidebar.multiselect(
-        "Expiries", all_exp, default=all_exp,
-        help="Near-dated expiries dominate dealer hedging obligations.",
-    )
-    if picked and len(picked) < len(all_exp):
-        chain = chain[chain["expiry"].dt.date.isin(picked)]
+    if not history:
+        all_exp = sorted(d for d in chain["expiry"].dt.date.dropna().unique())
+        picked = st.sidebar.multiselect(
+            "Expiries", all_exp, default=all_exp,
+            help="Near-dated expiries dominate dealer hedging obligations.",
+        )
+        if picked and len(picked) < len(all_exp):
+            chain = chain[chain["expiry"].dt.date.isin(picked)]
 
-    try:
-        a = analyze(chain, spot, asof, rate, weight=weight, multiplier=multiplier)
-    except ValueError as exc:
-        st.error(f"{exc} — check the as-of date against the chain's expiries.")
-        return
+    hist = None
+    if history:
+        from dealer_gex.analytics import oi_walls as _oiw
+
+        rows, analyses = [], []
+        for pf in sorted([p for p in pfs if p.asof], key=lambda p: p.asof):
+            ch = _build_chain(pf)
+            sp = pf.spots.get(ticker, pf.spots.get("", None))
+            if ch is None or sp is None:
+                continue
+            try:
+                ai = analyze(ch, sp, pf.asof, rate, weight=weight, multiplier=multiplier)
+            except ValueError:
+                continue
+            cw_oi, pw_oi = _oiw(ai)
+            rows.append({
+                "date": pf.asof, "spot": sp, "flip": ai.gamma_flip,
+                "call_wall": ai.call_wall, "put_wall": ai.put_wall,
+                "call_oi_wall": cw_oi, "put_oi_wall": pw_oi,
+                "max_pain": ai.max_pain, "net_gex": ai.total_gex,
+                "regime": ai.regime,
+            })
+            analyses.append(ai)
+        if not analyses:
+            st.error("No day could be analyzed — check that each file carries "
+                     "a spot price and unexpired contracts.")
+            return
+        a = analyses[-1]
+        hist = pd.DataFrame(rows)
+        st.info(f"History mode: levels below are for the latest day "
+                f"(**{a.asof}**); the migration view covers {len(hist)} days.",
+                icon="🗓️")
+    else:
+        try:
+            a = analyze(chain, spot, asof, rate, weight=weight, multiplier=multiplier)
+        except ValueError as exc:
+            st.error(f"{exc} — check the as-of date against the chain's expiries.")
+            return
 
     if weight == "volume" and chain["volume"].sum() == 0:
         st.warning("This file has no volume data — volume weighting shows nothing. "
@@ -543,6 +709,9 @@ def main() -> None:
     verdict_banner(a)
     metrics_row(a)
 
+    if hist is not None and len(hist) >= 2:
+        history_section(hist)
+
     magnets = magnet_levels(a)
     oi_lvls = oi_levels(a)
     gex_by_strike_chart(a, magnets)
@@ -554,9 +723,17 @@ def main() -> None:
 
     magnet_section(a, magnets)
     oi_levels_section(a, oi_lvls)
+
+    if all_prints:
+        merged_prints = pd.concat(all_prints, ignore_index=True)
+        if file_tickers and len(file_tickers) > 1:
+            merged_prints = merged_prints[merged_prints["ticker"] == ticker]
+        if not merged_prints.empty:
+            notable_flow_section(merged_prints, a.spot)
+
     playbook_section(a)
     tables(a)
-    report_section(a, ticker)
+    report_section(a, ticker, hist)
 
     with st.expander("Methodology & assumptions"):
         st.markdown(
