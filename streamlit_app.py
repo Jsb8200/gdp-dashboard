@@ -13,7 +13,8 @@ import plotly.graph_objects as go
 import streamlit as st
 
 from dealer_gex.analytics import (
-    Analysis, analyze, fmt_dollars, magnet_levels, oi_levels, oi_walls,
+    Analysis, analyze, block_levels, flow_books, fmt_dollars, magnet_levels,
+    oi_levels, oi_walls,
 )
 from dealer_gex.parsing import (
     ChainParseError, ParsedFile, aggregate_prints, normalize_chain, parse_file,
@@ -517,6 +518,80 @@ def history_section(hist: pd.DataFrame) -> None:
             )
 
 
+def block_section(a: Analysis, prints: pd.DataFrame, books: dict,
+                  lvls: pd.DataFrame) -> None:
+    st.subheader("🧱 Block intelligence (smart vs fast money)")
+
+    if books:
+        rows = []
+        for name, label, mask in (("blocks", "🧱 Blocks (institutional)", prints["is_block"]),
+                                  ("sweeps", "🌊 Sweeps (urgent)", prints["is_sweep"])):
+            if name not in books:
+                continue
+            bk = books[name]
+            rows.append({
+                "Book": label,
+                "Prints": f"{int(mask.sum()):,}",
+                "Premium": fmt_dollars(prints.loc[mask, "premium"].sum()),
+                "Customer delta": fmt_dollars(-bk.dex),
+                "Net GEX": fmt_dollars(bk.total_gex),
+                "Regime": bk.regime.replace("_", " "),
+                "Flip": f"{bk.gamma_flip:,.2f}" if bk.gamma_flip is not None else "—",
+                "Put wall": f"{bk.put_wall:,.2f}",
+                "Call wall": f"{bk.call_wall:,.2f}",
+            })
+        st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+
+        if "blocks" in books and "sweeps" in books:
+            b, s = books["blocks"], books["sweeps"]
+            b_dir, s_dir = -b.dex, -s.dex
+            aligned = (b.regime == s.regime) and (b_dir >= 0) == (s_dir >= 0)
+            if aligned:
+                st.success(
+                    f"**Aligned** — institutional blocks and the urgent tape lean the "
+                    f"same way ({'long' if b_dir >= 0 else 'short'}, both "
+                    f"{b.regime.replace('_', ' ')}). Higher-conviction read.",
+                    icon="✅",
+                )
+            else:
+                msg = (
+                    f"**Divergent** — blocks lean **{'long' if b_dir >= 0 else 'short'}** "
+                    f"({fmt_dollars(abs(b_dir))} stock-equiv., {b.regime.replace('_', ' ')}) "
+                    f"while sweeps lean **{'long' if s_dir >= 0 else 'short'}** "
+                    f"({fmt_dollars(abs(s_dir))}, {s.regime.replace('_', ' ')}). "
+                    "Patient money vs urgent money disagree: favor blocks on swing "
+                    "horizon, sweeps intraday."
+                )
+                # escape $ so paired amounts aren't parsed as LaTeX math
+                st.warning(msg.replace("$", "\\$"), icon="⚔️")
+
+    if not lvls.empty:
+        st.markdown("**Block commitment levels** — where negotiated size actually traded:")
+        view = lvls.copy()
+        view["Level"] = view["level"].map(lambda x: f"{x:,.2f}")
+        view["Side"] = view["side"].map({"call": "📈 Calls", "put": "📉 Puts", "mixed": "⚖️ Mixed"})
+        view["Direction"] = view["direction"].map(
+            {"buy": "🟢 Net bought", "sell": "🔴 Net sold", "mixed": "⚪ Two-way"})
+        view["Premium"] = view["premium"].map(fmt_dollars)
+        view["Distance"] = view["distance_pct"].map(lambda x: f"{x:+.1f}%")
+        st.dataframe(
+            view[["Level", "Side", "Direction", "strength", "Premium", "Distance"]]
+            .rename(columns={"strength": "Weight"}),
+            use_container_width=True, hide_index=True,
+            column_config={"Weight": st.column_config.ProgressColumn(
+                "Weight", min_value=0, max_value=100, format="%.0f")},
+        )
+        st.caption(
+            "Read the pair: side says *what* traded, direction says *which way*. "
+            "Puts net **sold** at a level = institutions comfortable owning risk "
+            "there (bullish commitment); puts net **bought** = paid-for protection. "
+            "Cross-check against the walls: block-confirmed levels are the "
+            "committed ones."
+        )
+    elif not books:
+        st.info("No block prints in this file.")
+
+
 def notable_flow_section(prints: pd.DataFrame, spot: float) -> None:
     st.subheader("🐋 Notable flow (biggest premium prints)")
     top = prints.reindex(prints["premium"].sort_values(ascending=False).index).head(10)
@@ -578,9 +653,12 @@ def tables(a: Analysis) -> None:
         st.dataframe(top, use_container_width=True, hide_index=True)
 
 
-def report_section(a: Analysis, ticker: str, hist: pd.DataFrame | None = None) -> None:
+def report_section(a: Analysis, ticker: str, hist: pd.DataFrame | None = None,
+                   blk_books: dict | None = None,
+                   blk_lvls: pd.DataFrame | None = None) -> None:
     st.subheader("Report")
-    md = build_markdown(a, ticker=ticker, history=hist)
+    md = build_markdown(a, ticker=ticker, history=hist,
+                        block_books=blk_books, block_lvls=blk_lvls)
     stem = f"dealer-positioning-{a.asof:%Y%m%d}"
     c1, c2, _ = st.columns([1, 1, 3])
     c1.download_button("Download report (.md)", md, file_name=f"{stem}.md",
@@ -818,19 +896,29 @@ def main() -> None:
     magnet_section(a, magnets)
     oi_levels_section(a, oi_lvls)
 
-    if not history:
-        scenario_section(a, chain, asof, rate, weight, multiplier)
-
+    merged_prints = None
     if all_prints:
         merged_prints = pd.concat(all_prints, ignore_index=True)
         if file_tickers and len(file_tickers) > 1:
             merged_prints = merged_prints[merged_prints["ticker"] == ticker]
-        if not merged_prints.empty:
-            notable_flow_section(merged_prints, a.spot)
+        if merged_prints.empty:
+            merged_prints = None
+
+    blk_books, blk_lvls = {}, pd.DataFrame()
+    if merged_prints is not None and merged_prints["is_block"].any():
+        blk_books = flow_books(merged_prints, a.spot, a.asof, rate, multiplier=multiplier)
+        blk_lvls = block_levels(merged_prints, a.spot)
+        block_section(a, merged_prints, blk_books, blk_lvls)
+
+    if not history:
+        scenario_section(a, chain, asof, rate, weight, multiplier)
+
+    if merged_prints is not None:
+        notable_flow_section(merged_prints, a.spot)
 
     playbook_section(a)
     tables(a)
-    report_section(a, ticker, hist)
+    report_section(a, ticker, hist, blk_books, blk_lvls)
 
     with st.expander("Methodology & assumptions"):
         st.markdown(

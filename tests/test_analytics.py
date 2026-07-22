@@ -448,6 +448,49 @@ def test_zero_dte_analysis():
     assert 0 < a.expected_move < 100.0 * 0.30 * np.sqrt(1 / 252)
 
 
+def test_block_levels_and_flow_books():
+    from dealer_gex.parsing import parse_file
+    from dealer_gex.analytics import block_levels, flow_books
+
+    pf = parse_file(QUANTDATA_CSV)
+    qqq = pf.prints[pf.prints["ticker"] == "QQQ"]
+
+    lvls = block_levels(qqq, pf.spots["QQQ"])
+    # the single block print: 50x 720C @ ask, $25k premium
+    assert len(lvls) == 1
+    assert abs(lvls.iloc[0]["level"] - 720) < 5
+    assert lvls.iloc[0]["side"] == "call"
+    assert lvls.iloc[0]["direction"] == "buy"
+    assert lvls.iloc[0]["strength"] == 100
+    assert lvls.iloc[0]["premium"] == 25000.0
+
+    books = flow_books(qqq, pf.spots["QQQ"], pf.asof)
+    assert set(books) == {"blocks", "sweeps"}
+    # block book: customer bought 50 calls at ask -> dealer short gamma,
+    # customer delta positive
+    assert books["blocks"].total_gex < 0
+    assert -books["blocks"].dex > 0
+    # sweep book: +100 calls bought, -80 puts sold -> customer long delta too
+    assert -books["sweeps"].dex > 0
+
+
+def test_report_block_intelligence():
+    from dealer_gex.parsing import parse_file
+    from dealer_gex.analytics import block_levels, flow_books
+    from dealer_gex.report import build_markdown
+
+    pf = parse_file(QUANTDATA_CSV)
+    qqq_prints = pf.prints[pf.prints["ticker"] == "QQQ"]
+    qqq_chain = pf.chain[pf.chain["ticker"] == "QQQ"]
+    a = analyze(qqq_chain, pf.spots["QQQ"], pf.asof)
+    books = flow_books(qqq_prints, pf.spots["QQQ"], pf.asof)
+    lvls = block_levels(qqq_prints, pf.spots["QQQ"])
+    md = build_markdown(a, ticker="QQQ", block_books=books, block_lvls=lvls)
+    assert "## Block intelligence" in md
+    assert "## Block commitment levels" in md
+    assert "Blocks (institutional)" in md and "Sweeps (urgent)" in md
+
+
 def test_fmt_dollars():
     assert fmt_dollars(1_460_000_000) == "$1.46B"
     assert fmt_dollars(-441_430_000) == "-$441.43M"

@@ -166,7 +166,9 @@ def build_playbook(a: Analysis) -> list[str]:
 
 
 def build_markdown(a: Analysis, ticker: str = "",
-                   history: pd.DataFrame | None = None) -> str:
+                   history: pd.DataFrame | None = None,
+                   block_books: dict | None = None,
+                   block_lvls: pd.DataFrame | None = None) -> str:
     title, body = regime_text(a.regime)
     label = f"{ticker.upper()} " if ticker else ""
     flip = f"{a.gamma_flip:,.2f}" if a.gamma_flip is not None else "no crossing in ±15% range"
@@ -252,6 +254,50 @@ def build_markdown(a: Analysis, ticker: str = "",
                 f"| {_n(r['put_wall'])} | {_n(r['call_oi_wall'])} | {_n(r['put_oi_wall'])} "
                 f"| {_n(r['max_pain'])} | {fmt_dollars(r['net_gex'])} "
                 f"| {str(r['regime']).replace('_', ' ')} |"
+            )
+
+    if block_books:
+        lines += [
+            "",
+            "## Block intelligence (smart vs fast money)",
+            "",
+            "| Book | Customer delta | Net GEX | Regime | Flip | Put wall | Call wall |",
+            "|---|---|---|---|---|---|---|",
+        ]
+        for name, label in (("blocks", "Blocks (institutional)"),
+                            ("sweeps", "Sweeps (urgent)")):
+            if name in block_books:
+                bk = block_books[name]
+                flip_v = f"{bk.gamma_flip:,.2f}" if bk.gamma_flip is not None else "—"
+                lines.append(
+                    f"| {label} | {fmt_dollars(-bk.dex)} | {fmt_dollars(bk.total_gex)} "
+                    f"| {bk.regime.replace('_', ' ')} | {flip_v} "
+                    f"| {bk.put_wall:,.2f} | {bk.call_wall:,.2f} |"
+                )
+        if "blocks" in block_books and "sweeps" in block_books:
+            b, s = block_books["blocks"], block_books["sweeps"]
+            aligned = (b.regime == s.regime) and ((-b.dex >= 0) == (-s.dex >= 0))
+            lines.append("")
+            lines.append(
+                "Books are **aligned** — higher-conviction read." if aligned else
+                "Books are **divergent** — patient block money and the urgent tape "
+                "disagree; favor blocks on swing horizon, sweeps intraday."
+            )
+
+    if block_lvls is not None and not block_lvls.empty:
+        lines += [
+            "",
+            "## Block commitment levels",
+            "",
+            "| Level | Side | Direction | Weight | Premium | Distance |",
+            "|---|---|---|---|---|---|",
+        ]
+        dir_label = {"buy": "Net bought", "sell": "Net sold", "mixed": "Two-way"}
+        side_label = {"call": "Calls", "put": "Puts", "mixed": "Mixed"}
+        for _, r in block_lvls.iterrows():
+            lines.append(
+                f"| {r['level']:,.2f} | {side_label[r['side']]} | {dir_label[r['direction']]} "
+                f"| {r['strength']:.0f} | {fmt_dollars(r['premium'])} | {r['distance_pct']:+.1f}% |"
             )
 
     oi = oi_levels(a)

@@ -475,6 +475,95 @@ def expected_move(df: pd.DataFrame, spot: float) -> tuple[float | None, date | N
     return spot * iv_atm * np.sqrt(t), nearest.date()
 
 
+def block_levels(prints: pd.DataFrame, spot: float, top_n: int = 5) -> pd.DataFrame:
+    """Block commitment levels: price levels where negotiated institutional
+    (block) premium concentrated, from kernel-smoothed block-premium density
+    over strikes. These mark where big money committed size — entry zones to
+    cross-check against the walls and magnets.
+
+    Columns: level, side ('call'/'put'/'mixed'), direction ('buy'/'sell'/
+    'mixed' from signed block flow near the level), strength (0-100),
+    premium ($ within one bandwidth), distance_pct, anchor_strike.
+    """
+    empty = pd.DataFrame(columns=["level", "side", "direction", "strength",
+                                  "premium", "distance_pct", "anchor_strike"])
+    b = prints[prints["is_block"] & prints["strike"].notna()].copy()
+    b = b[b["strike"].between(spot * 0.90, spot * 1.10) & (b["premium"] > 0)]
+    if b.empty:
+        return empty
+    b["cp"] = b["type"].astype(str).str.strip().str.upper().str[0]
+
+    ks_all = np.sort(prints["strike"].dropna().unique())
+    spacing = float(np.median(np.diff(ks_all))) if len(ks_all) > 1 else spot * 0.005
+
+    per = b.groupby("strike").agg(
+        premium=("premium", "sum"),
+        call_prem=("premium", lambda s: s[b.loc[s.index, "cp"] == "C"].sum()),
+        put_prem=("premium", lambda s: s[b.loc[s.index, "cp"] == "P"].sum()),
+        net_signed=("signed_size", "sum"),
+    ).reset_index()
+    ks = per["strike"].to_numpy()
+    w = per["premium"].to_numpy(dtype=float)
+
+    lo, hi = spot * 0.90, spot * 1.10
+    grid = np.arange(lo, hi, spacing / 10.0)
+    dens = np.array([_kernel_density(ks, w, x, spacing) for x in grid])
+    if dens.max() <= 0:
+        return empty
+
+    floor = 0.05 * dens.max()
+    rows = []
+    for i in range(1, len(grid) - 1):
+        if dens[i] > floor and dens[i] > dens[i - 1] and dens[i] >= dens[i + 1]:
+            level = _golden_max(
+                lambda x: _kernel_density(ks, w, x, spacing),
+                grid[i] - spacing, grid[i] + spacing,
+            )
+            strength = _kernel_density(ks, w, level, spacing)
+            near = per[np.abs(per["strike"] - level) <= spacing]
+            c_p, p_p = near["call_prem"].sum(), near["put_prem"].sum()
+            side = "call" if c_p > 1.5 * p_p else "put" if p_p > 1.5 * c_p else "mixed"
+            signed = near["net_signed"].sum()
+            traded = b[np.abs(b["strike"] - level) <= spacing]["size"].sum()
+            direction = ("buy" if signed > 0.1 * traded
+                         else "sell" if signed < -0.1 * traded else "mixed")
+            j = int(np.argmin(np.abs(ks - level)))
+            rows.append((level, side, direction, strength,
+                         float(near["premium"].sum()),
+                         (level / spot - 1) * 100, float(ks[j])))
+    if not rows:
+        return empty
+    df = pd.DataFrame(rows, columns=["level", "side", "direction", "strength",
+                                     "premium", "distance_pct", "anchor_strike"])
+    df = df.sort_values("strength", ascending=False)
+    kept: list[int] = []
+    for idx, row in df.iterrows():
+        if all(abs(row["level"] - df.loc[k, "level"]) > spacing / 2 for k in kept):
+            kept.append(idx)
+    df = df.loc[kept].head(top_n).reset_index(drop=True)
+    df["strength"] = (100 * df["strength"] / df["strength"].max()).round(0)
+    return df
+
+
+def flow_books(prints: pd.DataFrame, spot: float, asof: date, rate: float = 0.045,
+               multiplier: float = DEFAULT_MULTIPLIER) -> dict[str, "Analysis"]:
+    """Analyze the blocks-only and sweeps-only books separately (signed-flow
+    weighting) — patient institutional size vs urgent aggressive flow."""
+    from dealer_gex.parsing import ChainParseError, aggregate_prints
+
+    books: dict[str, Analysis] = {}
+    for name, mask in (("blocks", prints["is_block"]), ("sweeps", prints["is_sweep"])):
+        sub = prints[mask]
+        if sub.empty or sub["signed_size"].abs().sum() == 0:
+            continue
+        try:
+            books[name] = analyze(aggregate_prints(sub), spot, asof, rate,
+                                  weight="flow", multiplier=multiplier)
+        except (ValueError, ChainParseError):  # nothing analyzable in this slice
+            continue
+    return books
+
+
 def max_pain(chain: pd.DataFrame) -> float:
     """Level minimizing the total intrinsic payout to option holders.
 
