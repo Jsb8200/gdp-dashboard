@@ -40,7 +40,7 @@ PLOTLY_LAYOUT = dict(
                automargin=True, showspikes=True, spikemode='across',
                spikethickness=1, spikecolor=C['axis'], spikedash='dot'),
     yaxis=dict(gridcolor=C['grid'], linecolor=C['axis'], zeroline=False,
-               automargin=True, tickformat=',.0f'),
+               automargin=True),
     legend=dict(orientation='h', yanchor='bottom', y=1.02, x=0),
 )
 
@@ -75,15 +75,15 @@ def make_sample_market(n_bars: int = 1500, seed: int = 7, start_price: float = 4
     return pd.DataFrame({'Date': dates, 'Close': close})
 
 
-def load_uploaded_csv(file) -> pd.DataFrame | None:
-    try:
-        df = pd.read_csv(file)
-    except Exception as e:
-        st.sidebar.error(f'Could not read CSV: {e}')
-        return None
+def _num(s: pd.Series) -> pd.Series:
+    """Parse '$47,600.00' / '22.84%' / '3,671' style strings to floats."""
+    return pd.to_numeric(s.astype(str).str.replace(r'[$,%]', '', regex=True),
+                         errors='coerce')
+
+
+def parse_simple_close(df: pd.DataFrame) -> pd.DataFrame | None:
     cols = {c.lower().strip(): c for c in df.columns}
     if 'close' not in cols:
-        st.sidebar.error('CSV needs a "Close" column (and ideally a "Date" column).')
         return None
     out = pd.DataFrame()
     if 'date' in cols:
@@ -91,16 +91,60 @@ def load_uploaded_csv(file) -> pd.DataFrame | None:
     else:
         out['Date'] = pd.RangeIndex(len(df))
     out['Close'] = pd.to_numeric(df[cols['close']], errors='coerce')
-    out = out.dropna().sort_values('Date').reset_index(drop=True)
-    if len(out) < 300:
-        st.sidebar.error(f'Need at least 300 rows to train; got {len(out)}.')
-        return None
-    return out
+    return out.dropna().sort_values('Date').reset_index(drop=True)
+
+
+FLOW_REQUIRED = {'Trade Time', 'Reference Price', 'Premium Price',
+                 'Contract Type', 'Side Code'}
+
+
+def parse_order_flow(dfs: list, bar_minutes: int) -> pd.DataFrame:
+    """Turn per-trade options order flow (QuantData export) into underlying
+    price bars plus order-flow features. Bullish premium = calls bought at
+    the ask + puts sold at the bid; bearish = the reverse. Delta flow is
+    size x delta x 100, signed by aggressor side."""
+    raw = pd.concat(dfs, ignore_index=True)
+    t = pd.to_datetime(raw['Trade Time'], errors='coerce', utc=True)
+    prem = _num(raw['Premium Price'])
+    side = raw['Side Code'].astype(str).str[0]      # A=ask, B=bid, M=mid
+    is_call = raw['Contract Type'].astype(str).str.upper().eq('CALL')
+    at_ask, at_bid = side.eq('A'), side.eq('B')
+    delta = pd.to_numeric(raw.get('Delta'), errors='coerce').fillna(0.0)
+    size = _num(raw.get('Size', pd.Series(1, index=raw.index))).fillna(0.0)
+
+    trades = pd.DataFrame({
+        'bar': t.dt.floor(f'{bar_minutes}min'),
+        'ref': _num(raw['Reference Price']),
+        'bull': prem.where((is_call & at_ask) | (~is_call & at_bid), 0.0),
+        'bear': prem.where((~is_call & at_ask) | (is_call & at_bid), 0.0),
+        'dflow': size * delta * 100 * np.where(at_ask, 1, np.where(at_bid, -1, 0)),
+        'call_prem': prem.where(is_call, 0.0),
+        'put_prem': prem.where(~is_call, 0.0),
+    }).dropna(subset=['bar', 'ref'])
+
+    g = trades.groupby('bar').agg(
+        Close=('ref', 'last'), bull=('bull', 'sum'), bear=('bear', 'sum'),
+        dflow=('dflow', 'sum'), call_prem=('call_prem', 'sum'),
+        put_prem=('put_prem', 'sum')).sort_index()
+
+    for w in (5, 15, 30):
+        b = g['bull'].rolling(w, min_periods=1).sum()
+        r = g['bear'].rolling(w, min_periods=1).sum()
+        g[f'of_imb_{w}'] = (b - r) / (b + r + 1)
+        d = g['dflow'].rolling(w, min_periods=1).sum()
+        g[f'of_dflow_{w}'] = d / (g['dflow'].abs().rolling(w, min_periods=1).sum() + 1)
+        g[f'of_pcr_{w}'] = (np.log1p(g['put_prem'].rolling(w, min_periods=1).sum())
+                            - np.log1p(g['call_prem'].rolling(w, min_periods=1).sum()))
+
+    out = g.reset_index().rename(columns={'bar': 'Date'})
+    out['Date'] = out['Date'].dt.tz_localize(None)
+    return out[['Date', 'Close'] + [c for c in out.columns if c.startswith('of_')]]
 
 # -----------------------------------------------------------------------------
 # Features & models
 
-def build_features(close: pd.Series) -> pd.DataFrame:
+def build_features(bars: pd.DataFrame) -> pd.DataFrame:
+    close = bars['Close']
     f = pd.DataFrame(index=close.index)
     ret = close.pct_change()
     for lag in (1, 2, 3, 5, 10):
@@ -121,6 +165,12 @@ def build_features(close: pd.Series) -> pd.DataFrame:
     f['macd_hist'] = (macd - macd.ewm(span=9, adjust=False).mean()) / close
 
     f['mom_20'] = close.pct_change(20)
+
+    # Order-flow features (present when the data came from an options
+    # order-flow export) enter the model as-is
+    for c in bars.columns:
+        if c.startswith('of_'):
+            f[c] = bars[c]
     return f
 
 
@@ -131,13 +181,13 @@ LGB_PARAMS = dict(
 )
 
 
-@st.cache_resource(show_spinner=False)
-def train_horizon(close_values: tuple, horizon: int):
+@st.cache_data(show_spinner=False)
+def train_horizon(bars: pd.DataFrame, horizon: int):
     """Train quantile regressors (q10/q50/q90, target = forward move in points)
-    and a direction classifier for one horizon. Returns models + honest
-    validation metrics from a chronological 80/20 split."""
-    close = pd.Series(close_values)
-    X = build_features(close)
+    and a direction classifier for one horizon. Returns honest validation
+    metrics from a chronological 80/20 split."""
+    close = bars['Close'].reset_index(drop=True)
+    X = build_features(bars.reset_index(drop=True))
     y = close.shift(-horizon) - close  # forward move in points
 
     valid = X.notna().all(axis=1)
@@ -166,6 +216,7 @@ def train_horizon(close_values: tuple, horizon: int):
     }
     backtest = pd.DataFrame({
         'idx': X_va.index, 'actual': y_va.to_numpy(), 'predicted': pred_va,
+        'prob_up': clf.predict_proba(X_va)[:, 1],
     })
 
     # Forecast from the most recent fully-featured bar
@@ -181,14 +232,14 @@ def train_horizon(close_values: tuple, horizon: int):
     return forecast, metrics, backtest, importance
 
 
-@st.cache_resource(show_spinner=False)
-def train_path_medians(close_values: tuple, max_h: int):
+@st.cache_data(show_spinner=False)
+def train_path_medians(bars: pd.DataFrame, max_h: int):
     """Median forecast for EVERY bar 1..max_h, giving a per-bar predicted
     path used to locate where the move likely starts and ends. Uses the
     same hyperparameters as the headline models, so at a shared horizon
     the path value is identical to the KPI forecast."""
-    close = pd.Series(close_values)
-    X = build_features(close)
+    close = bars['Close'].reset_index(drop=True)
+    X = build_features(bars.reset_index(drop=True))
     valid = X.notna().all(axis=1)
     X_now = X[valid].iloc[[-1]]
     moves = {}
@@ -237,14 +288,46 @@ def locate_move(path_moves: dict, noise_pts: float):
 
 st.sidebar.header('Data')
 source = st.sidebar.radio('Source', ['Sample market (synthetic)', 'Upload CSV'],
-                          help='The sample series is generated with geometric Brownian '
-                               'motion + regime shifts. Upload any CSV with Date and Close '
-                               'columns to forecast real data.')
-df = None
+                          help='Upload either a simple Date+Close CSV, or an options '
+                               'order-flow export (QuantData style, one or more files) — '
+                               'the app builds intraday bars from the trades and feeds '
+                               'the order flow to the model as features.')
+df, bar_label = None, 'bars'
 if source == 'Upload CSV':
-    up = st.sidebar.file_uploader('CSV with Date + Close columns', type='csv')
-    if up is not None:
-        df = load_uploaded_csv(up)
+    ups = st.sidebar.file_uploader(
+        'Date+Close CSV or options order-flow CSV(s)', type='csv',
+        accept_multiple_files=True)
+    if ups:
+        try:
+            raw_dfs = [pd.read_csv(u) for u in ups]
+        except Exception as e:
+            raw_dfs = []
+            st.sidebar.error(f'Could not read CSV: {e}')
+        if raw_dfs and all(FLOW_REQUIRED <= set(d.columns) for d in raw_dfs):
+            bar_minutes = st.sidebar.select_slider(
+                'Bar size (minutes)', [1, 2, 5], value=1,
+                help='Trades are bucketed into bars of this size; horizons are '
+                     'in these bars.')
+            df = parse_order_flow(raw_dfs, bar_minutes)
+            bar_label = f'{bar_minutes}-min bars'
+            n_trades = sum(len(d) for d in raw_dfs)
+            st.sidebar.success(f'{n_trades:,} trades → {len(df):,} {bar_label} '
+                               'with order-flow features')
+            if len(df) < 250:
+                st.sidebar.warning(
+                    f'Only {len(df):,} bars — enough to run, but expect noisy '
+                    'results. Upload more days of flow for a sturdier model.')
+        elif len(raw_dfs) == 1:
+            df = parse_simple_close(raw_dfs[0])
+            if df is None:
+                st.sidebar.error('CSV needs Date + Close columns, or the full '
+                                 'order-flow column set.')
+            elif len(df) < 300:
+                st.sidebar.error(f'Need at least 300 rows to train; got {len(df)}.')
+                df = None
+        elif raw_dfs:
+            st.sidebar.error('Multiple files are only supported for order-flow '
+                             'CSVs (they get concatenated).')
     if df is None:
         st.sidebar.info('Using the sample market until a valid CSV is uploaded.')
 if df is None:
@@ -257,6 +340,11 @@ horizons = st.sidebar.multiselect('Horizons (bars ahead)', [1, 3, 5, 10, 15, 20,
                                   default=[5, 10, 15])
 horizons = sorted(horizons) or [5, 10, 15]
 lookback = st.sidebar.slider('Chart lookback (bars)', 60, 500, 180, step=20)
+min_conf = st.sidebar.slider(
+    'Minimum signal confidence', 50, 95, 65, step=5, format='%d%%',
+    help='The signal filter only fires when the direction model is at least '
+         'this confident. Higher = fewer signals with a better historical hit '
+         'rate — the honest lever, since no real model hits 99% on every bar.') / 100
 
 # -----------------------------------------------------------------------------
 # Header
@@ -275,9 +363,9 @@ last_date = dates.iloc[-1]
 results = {}
 with st.spinner('Training LightGBM models…'):
     for h in horizons:
-        results[h] = train_horizon(tuple(close.to_numpy()), h)
+        results[h] = train_horizon(df, h)
     max_h = horizons[-1]
-    path_moves = train_path_medians(tuple(close.to_numpy()), max_h)
+    path_moves = train_path_medians(df, max_h)
 
 # Path models share hyperparameters and training slice with the headline
 # models, so shared horizons are identical by construction. Smooth the path
@@ -308,14 +396,61 @@ for col, h in zip(cols[1:], horizons):
         )
 
 # -----------------------------------------------------------------------------
+# Confidence-filtered signals
+
+
+def signal_stats(backtest: pd.DataFrame, conf: float):
+    """Hit rate of the direction model on validation bars where its
+    confidence cleared `conf`."""
+    p = backtest['prob_up']
+    mask = np.maximum(p, 1 - p) >= conf
+    if mask.sum() == 0:
+        return 0, np.nan
+    hits = ((p[mask] >= 0.5) == (backtest['actual'][mask] > 0))
+    return int(mask.sum()), float(hits.mean())
+
+
+st.subheader(f'Signal filter — fire only above {min_conf:.0%} confidence',
+             divider='gray')
+st.caption('No real model calls every bar right — a 99% hit rate on all bars is '
+           'a red flag for leakage, not skill. The honest lever is selectivity: '
+           'act only when the model is unusually confident, and judge that rule '
+           'by its **measured** out-of-sample hit rate below. Raise the '
+           'confidence slider in the sidebar to trade less and hit more.')
+
+sig_cols = st.columns(len(horizons))
+for col, h in zip(sig_cols, horizons):
+    fc, _, bt, _ = results[h]
+    p = fc['prob_up']
+    conf = max(p, 1 - p)
+    n_sig, hit = signal_stats(bt, min_conf)
+    with col:
+        if conf >= min_conf:
+            direction = 'LONG ▲' if p >= 0.5 else 'SHORT ▼'
+            st.metric(f'Next {h} bars — signal', direction,
+                      f'confidence {conf:.0%}',
+                      delta_color='normal' if p >= 0.5 else 'inverse')
+        else:
+            st.metric(f'Next {h} bars — signal', 'STAND ASIDE',
+                      f'confidence {conf:.0%} < {min_conf:.0%}',
+                      delta_color='off')
+        if n_sig:
+            st.caption(f'past signals at this bar: **{hit:.0%}** hit rate '
+                       f'on **{n_sig}** validation signals')
+        else:
+            st.caption('no validation bar ever cleared this confidence — '
+                       'lower the bar or add more data')
+
+# -----------------------------------------------------------------------------
 # Future x positions: extend at the median historical bar spacing
 
 if pd.api.types.is_datetime64_any_dtype(dates):
     step = (dates.iloc[-1] - dates.iloc[-min(60, len(dates) - 1)]) / min(60, len(dates) - 1)
     fut_x = {h: last_date + step * h for h in range(1, max_h + 1)}
+    intraday = (dates.max() - dates.min()) < pd.Timedelta(days=7)
 
     def fmt_bar(h):
-        return f'{fut_x[h]:%a %b %d}'
+        return (f'{fut_x[h]:%b %d %H:%M}' if intraday else f'{fut_x[h]:%a %b %d}')
 else:
     fut_x = {h: last_date + h for h in range(1, max_h + 1)}
 
@@ -482,6 +617,22 @@ with right:
     fig_imp.update_layout(height=340, bargap=0.35, **imp_layout)
     st.plotly_chart(fig_imp, use_container_width=True)
 
+st.markdown(f'**Hit rate vs confidence bar** (next {bt_h} bars, validation) — '
+            'the selectivity trade-off:')
+conf_rows = []
+for th in (0.50, 0.55, 0.60, 0.65, 0.70, 0.75, 0.80, 0.85, 0.90):
+    n_sig, hit = signal_stats(backtest, th)
+    conf_rows.append({
+        'Min confidence': f'{th:.0%}',
+        'Signals fired': n_sig,
+        'Coverage': f'{n_sig / len(backtest):.0%}',
+        'Hit rate': f'{hit:.0%}' if n_sig else '—',
+    })
+st.dataframe(pd.DataFrame(conf_rows), hide_index=True, use_container_width=True)
+st.caption('Signals = validation bars where the direction model cleared the '
+           'confidence bar; hit rate = share of those where it called the sign '
+           'right. If a row shows very few signals, its hit rate is noise.')
+
 # -----------------------------------------------------------------------------
 
 with st.expander('How this works'):
@@ -503,6 +654,15 @@ with st.expander('How this works'):
 - **Backtest** numbers come from a strict chronological 80/20 split — the model
   never sees validation bars during training. Overlapping forward windows mean
   neighbouring validation bars are correlated, so treat accuracy as indicative.
+- **Order-flow uploads**: per-trade options flow is bucketed into intraday bars
+  (last underlying reference price = bar close) and summarized into features —
+  bullish vs bearish premium imbalance (calls at ask + puts at bid vs the
+  reverse), signed delta-weighted flow, and a put/call premium ratio, each over
+  5/15/30-bar windows.
+- **Signal filter**: the direction model's confidence is compared to your
+  minimum; below it the call is "stand aside". The hit-rate-vs-confidence table
+  shows what each bar actually earned on validation data — that is the honest
+  ceiling, not a promised win rate.
 - Markets are mostly noise: directional accuracy modestly above 50% is
   realistic; anything far higher usually means leakage. **This is an educational
   tool, not financial advice.**

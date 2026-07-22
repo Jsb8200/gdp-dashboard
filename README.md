@@ -20,7 +20,19 @@ mean absolute error, so the forecast is never presented without its honest
 track record.
 
 Data comes from a built-in synthetic market series (geometric Brownian motion
-with regime shifts), or upload your own CSV with `Date` and `Close` columns.
+with regime shifts), or upload your own data:
+
+- a simple CSV with `Date` and `Close` columns, or
+- **options order-flow exports** (QuantData style, one or more files) — trades
+  are bucketed into intraday bars and summarized into order-flow features
+  (bullish/bearish premium imbalance, delta-weighted flow, put/call premium
+  ratio) that feed the model alongside the price features, with horizons in
+  minutes.
+
+A **signal confidence filter** turns forecasts into LONG / SHORT / STAND ASIDE
+calls: it only fires when the direction model clears your chosen confidence
+bar, and reports the *measured* out-of-sample hit rate at that bar — trading
+frequency for accuracy honestly, rather than promising unrealistic win rates.
 
 > Educational demo — not financial advice.
 
