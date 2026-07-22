@@ -1,8 +1,25 @@
-# :earth_americas: GDP dashboard template
+# :chart_with_upwards_trend: Market forecast dashboard (LightGBM)
 
-A simple Streamlit app showing the GDP of different countries in the world.
+A Streamlit dashboard that forecasts **where the market is going** over the next
+5 / 10 / 15 bars (horizons are configurable): the **direction**, the **move size
+in points**, and the **from → to price range** with an 80% uncertainty fan.
 
-[![Open in Streamlit](https://static.streamlit.io/badges/streamlit_badge_black_white.svg)](https://gdp-dashboard-template.streamlit.app/)
+Under the hood, per horizon it trains four small LightGBM models on
+close-price-derived features (lagged returns, volatility, RSI, MACD, momentum):
+
+- quantile regressors (10th / 50th / 90th percentile) predicting the forward
+  move in points — the median gives the headline forecast, the outer quantiles
+  the shaded fan;
+- a classifier giving the probability the move is up.
+
+A chronological 80/20 backtest reports out-of-sample directional accuracy and
+mean absolute error, so the forecast is never presented without its honest
+track record.
+
+Data comes from a built-in synthetic market series (geometric Brownian motion
+with regime shifts), or upload your own CSV with `Date` and `Close` columns.
+
+> Educational demo — not financial advice.
 
 ### How to run it on your own machine
 
