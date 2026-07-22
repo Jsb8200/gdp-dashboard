@@ -209,10 +209,12 @@ def _parse_trade_flow(raw: pd.DataFrame) -> ParsedFile:
     # conviction flags: sweeps come from the consolidation type, the rest
     # from QuantData's Yes/No columns
     if "consolidation" in cols:
-        df["is_sweep"] = (raw[cols["consolidation"]].astype(str)
-                          .str.upper().str.contains("SWEEP", na=False))
+        ctype = raw[cols["consolidation"]].astype(str).str.upper()
+        df["is_sweep"] = ctype.str.contains("SWEEP", na=False)
+        df["is_block"] = ctype.str.contains("BLOCK", na=False)
     else:
         df["is_sweep"] = False
+        df["is_block"] = False
     for flag in ("is_golden", "is_unusual", "is_opening"):
         df[flag] = _yes(raw[cols[flag]]) if flag in cols else False
 

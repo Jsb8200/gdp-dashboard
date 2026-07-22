@@ -375,6 +375,7 @@ def test_prints_retained_with_flags_and_premium():
     p = pf.prints
     assert p is not None and len(p) == 7
     assert p["is_sweep"].sum() == 2          # rows 1 and 5 (Consolidation SWEEP)
+    assert p["is_block"].sum() == 1          # row 2 (Consolidation BLOCK)
     assert p["is_golden"].sum() == 1
     assert p["is_unusual"].sum() == 1
     assert p["is_opening"].sum() == 1

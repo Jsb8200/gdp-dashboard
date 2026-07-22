@@ -534,6 +534,7 @@ def notable_flow_section(prints: pd.DataFrame, spot: float) -> None:
         "Premium": top["premium"].map(fmt_dollars),
         "Flags": top.apply(lambda r: " ".join(filter(None, [
             "🟡 golden" if r["is_golden"] else ("🌊 sweep" if r["is_sweep"] else ""),
+            "🧱 block" if r.get("is_block", False) else "",
             "🚨 unusual" if r["is_unusual"] else "",
             "🆕 opening" if r["is_opening"] else "",
         ])) or "—", axis=1),
@@ -644,15 +645,18 @@ def main() -> None:
     if all_prints:
         conv_picked = st.sidebar.multiselect(
             "Conviction filter (flow files)",
-            ["Sweeps", "Golden sweeps", "Unusual", "Opening positions"],
-            help="Rebuild every level from flagged prints only — aggressive, "
-                 "urgent flow instead of the full tape. Empty = all prints.",
+            ["Sweeps", "Blocks", "Golden sweeps", "Unusual", "Opening positions"],
+            help="Rebuild every level from flagged prints only. Sweeps = "
+                 "urgent aggressive flow; blocks = large negotiated "
+                 "institutional trades. Empty = all prints.",
         )
 
     def _conv_mask(p: pd.DataFrame) -> pd.Series:
         m = pd.Series(False, index=p.index)
         if "Sweeps" in conv_picked:
             m |= p["is_sweep"]
+        if "Blocks" in conv_picked:
+            m |= p["is_block"]
         if "Golden sweeps" in conv_picked:
             m |= p["is_golden"]
         if "Unusual" in conv_picked:
