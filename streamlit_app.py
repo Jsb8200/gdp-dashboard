@@ -340,13 +340,13 @@ def oi_chart(a: Analysis, levels: pd.DataFrame | None = None) -> None:
             customdata=levels["strength"],
             hovertemplate="%{x:,.2f} · OI weight %{customdata:.0f}<extra></extra>",
         )
-    cw, pw = oi_walls(a)
-    if cw is not None and lo <= cw <= hi:
-        fig.add_vline(x=cw, line_dash="dashdot", line_color=C["call"], line_width=1,
+    ow = oi_walls(a)
+    if ow.call is not None and lo <= ow.call <= hi:
+        fig.add_vline(x=ow.call, line_dash="dashdot", line_color=C["call"], line_width=1,
                       annotation_text="call OI wall", annotation_position="top right",
                       annotation_font_color=C["call"])
-    if pw is not None and lo <= pw <= hi:
-        fig.add_vline(x=pw, line_dash="dashdot", line_color=C["put"], line_width=1,
+    if ow.put is not None and lo <= ow.put <= hi:
+        fig.add_vline(x=ow.put, line_dash="dashdot", line_color=C["put"], line_width=1,
                       annotation_text="put OI wall", annotation_position="bottom left",
                       annotation_font_color=C["put"])
     fig.update_layout(barmode="relative", title="Open interest by strike (puts shown downward)",
@@ -357,21 +357,25 @@ def oi_chart(a: Analysis, levels: pd.DataFrame | None = None) -> None:
 
 def oi_levels_section(a: Analysis, levels: pd.DataFrame) -> None:
     st.subheader("📊 OI levels (raw open interest)")
-    cw, pw = oi_walls(a)
+    ow = oi_walls(a)
     wcols = st.columns(4)
     bs = a.by_strike
-    if cw is not None:
-        wcols[0].metric("Call OI wall", f"{cw:,.0f}",
-                        f"{bs.loc[bs['strike'] == cw, 'call_oi'].iloc[0]:,.0f} contracts",
+    if ow.call is not None:
+        n = bs.loc[bs["strike"] == ow.call_strike, "call_oi"].iloc[0]
+        wcols[0].metric("Call OI wall", f"{ow.call:,.2f}",
+                        f"strike {ow.call_strike:,.0f} · {n:,.0f} contracts",
                         delta_color="off",
-                        help="Strike holding the largest raw call open interest — "
-                             "the classic rally cap / pin strike.")
-    if pw is not None:
-        wcols[1].metric("Put OI wall", f"{pw:,.0f}",
-                        f"{bs.loc[bs['strike'] == pw, 'put_oi'].iloc[0]:,.0f} contracts",
+                        help="Peak of smoothed call open interest — the classic "
+                             "rally cap / pin level, pinpointed off the grid; "
+                             "the anchor strike holds the largest raw call OI.")
+    if ow.put is not None:
+        n = bs.loc[bs["strike"] == ow.put_strike, "put_oi"].iloc[0]
+        wcols[1].metric("Put OI wall", f"{ow.put:,.2f}",
+                        f"strike {ow.put_strike:,.0f} · {n:,.0f} contracts",
                         delta_color="off",
-                        help="Strike holding the largest raw put open interest — "
-                             "the classic support / capitulation marker.")
+                        help="Peak of smoothed put open interest — the classic "
+                             "support / capitulation level, pinpointed off the "
+                             "grid; the anchor strike holds the largest raw put OI.")
     if levels.empty:
         st.info("No open-interest concentration peaks found within ±10% of spot.")
         return
@@ -671,7 +675,8 @@ def main() -> None:
                 ai = analyze(ch, sp, pf.asof, rate, weight=weight, multiplier=multiplier)
             except ValueError:
                 continue
-            cw_oi, pw_oi = _oiw(ai)
+            walls_oi = _oiw(ai)
+            cw_oi, pw_oi = walls_oi.call, walls_oi.put
             rows.append({
                 "date": pf.asof, "spot": sp, "flip": ai.gamma_flip,
                 "call_wall": ai.call_wall, "put_wall": ai.put_wall,

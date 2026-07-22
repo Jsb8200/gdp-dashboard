@@ -15,6 +15,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import date
+from typing import NamedTuple
 
 import numpy as np
 import pandas as pd
@@ -180,7 +181,7 @@ def gamma_flip(curve: pd.DataFrame, spot: float) -> float | None:
 
 
 def refine_flip(df: pd.DataFrame, curve: pd.DataFrame, spot: float,
-                rate: float, tol: float = 0.005) -> float | None:
+                rate: float, tol: float = 0.001) -> float | None:
     """Bisect the actual GEX function around the curve's crossing to cent
     precision (the curve alone is only as precise as its grid step)."""
     approx = gamma_flip(curve, spot)
@@ -227,7 +228,7 @@ def side_gamma_density(by_strike: pd.DataFrame, x, side: str, bandwidth: float) 
     return _kernel_density(by_strike["strike"].to_numpy(), w, x, bandwidth)
 
 
-def _golden_max(f, lo: float, hi: float, tol: float = 0.005) -> float:
+def _golden_max(f, lo: float, hi: float, tol: float = 0.001) -> float:
     """Golden-section search for the maximum of a unimodal f on [lo, hi]."""
     inv_phi = (np.sqrt(5.0) - 1.0) / 2.0
     a, b = lo, hi
@@ -247,7 +248,7 @@ def _golden_max(f, lo: float, hi: float, tol: float = 0.005) -> float:
 
 
 def wall_level(by_strike: pd.DataFrame, seed_strike: float, spacing: float,
-               side: str, tol: float = 0.005) -> float:
+               side: str, tol: float = 0.001) -> float:
     """Pinpoint wall: the price level where that side's smoothed gamma
     density peaks, searched around the heaviest strike (golden-section).
 
@@ -310,19 +311,40 @@ def magnet_levels(a: "Analysis", top_n: int = 5) -> pd.DataFrame:
     return df
 
 
-def oi_walls(a: "Analysis") -> tuple[float | None, float | None]:
-    """The classic OI walls: (call_oi_wall, put_oi_wall) — the single strikes
-    holding the largest raw call and put open interest. Distinct from the
-    gamma-weighted walls on the Analysis itself: these mark sheer position
-    size, regardless of today's hedging sensitivity."""
+class OIWalls(NamedTuple):
+    call: float | None          # pinpoint: peak of smoothed call-OI density
+    put: float | None           # pinpoint: peak of smoothed put-OI density
+    call_strike: float | None   # anchor strike (largest raw call OI)
+    put_strike: float | None    # anchor strike (largest raw put OI)
+
+
+def oi_walls(a: "Analysis") -> OIWalls:
+    """The classic OI walls — where the largest raw call/put open interest
+    sits — pinpointed like every other level: the anchor is the max-OI
+    strike, and the level is the peak of the kernel-smoothed OI density
+    around it (neighboring size pulls it off the grid). Distinct from the
+    gamma-weighted walls on the Analysis: these mark sheer position size,
+    regardless of today's hedging sensitivity."""
     bs = a.by_strike
-    call_wall = (
-        float(bs.loc[bs["call_oi"].idxmax(), "strike"]) if bs["call_oi"].max() > 0 else None
-    )
-    put_wall = (
-        float(bs.loc[bs["put_oi"].idxmax(), "strike"]) if bs["put_oi"].max() > 0 else None
-    )
-    return call_wall, put_wall
+    ks = bs["strike"].to_numpy()
+    spacing = float(np.median(np.diff(np.sort(np.unique(ks))))) if len(ks) > 1 else 0.0
+
+    def _wall(col: str) -> tuple[float | None, float | None]:
+        if bs[col].max() <= 0:
+            return None, None
+        anchor = float(bs.loc[bs[col].idxmax(), "strike"])
+        if spacing <= 0:
+            return anchor, anchor
+        w = bs[col].to_numpy(dtype=float)
+        level = _golden_max(
+            lambda x: _kernel_density(ks, w, x, spacing),
+            anchor - spacing, anchor + spacing,
+        )
+        return level, anchor
+
+    call, call_strike = _wall("call_oi")
+    put, put_strike = _wall("put_oi")
+    return OIWalls(call, put, call_strike, put_strike)
 
 
 def oi_levels(a: "Analysis", top_n: int = 5) -> pd.DataFrame:

@@ -38,12 +38,12 @@ def key_ladder(a: Analysis) -> pd.DataFrame:
         ("Max pain", a.max_pain, "Expiry gravitation level"),
         ("Put wall", a.put_wall, "Support in long-gamma regime; acceleration marker below the flip"),
     ]
-    cw, pw = oi_walls(a)
-    if cw is not None:
-        rows.append(("Call OI wall", cw,
+    ow = oi_walls(a)
+    if ow.call is not None:
+        rows.append(("Call OI wall", ow.call,
                      "Largest raw call open interest — classic cap / pin strike"))
-    if pw is not None:
-        rows.append(("Put OI wall", pw,
+    if ow.put is not None:
+        rows.append(("Put OI wall", ow.put,
                      "Largest raw put open interest — classic support marker"))
     if a.gamma_flip is not None:
         rows.append(("Gamma flip", a.gamma_flip,
@@ -188,13 +188,15 @@ def build_markdown(a: Analysis, ticker: str = "",
         f"| Put wall (gamma) | {a.put_wall:,.2f} (strike {a.put_wall_strike:,.0f}) | Peak aggregate dealer put gamma — selloffs tend to accelerate below, or find support at, this level |",
         f"| Max pain | {a.max_pain:,.2f} | Level minimizing option-holder payout at expiry |",
     ]
-    cw, pw = oi_walls(a)
-    if cw is not None:
+    ow = oi_walls(a)
+    if ow.call is not None:
         lines.append(
-            f"| Call OI wall | {cw:,.2f} | Largest raw call open interest — classic cap / pin strike |")
-    if pw is not None:
+            f"| Call OI wall | {ow.call:,.2f} (strike {ow.call_strike:,.0f}) "
+            "| Peak raw call open interest — classic cap / pin level |")
+    if ow.put is not None:
         lines.append(
-            f"| Put OI wall | {pw:,.2f} | Largest raw put open interest — classic support marker |")
+            f"| Put OI wall | {ow.put:,.2f} (strike {ow.put_strike:,.0f}) "
+            "| Peak raw put open interest — classic support marker |")
     lines += [
         f"| Net GEX | {fmt_dollars(a.total_gex)} / 1% move | Total dealer hedging demand per 1% move in spot |",
         f"| Net DEX | {fmt_dollars(a.dex)} | Net dealer delta inventory (convention-based) |",

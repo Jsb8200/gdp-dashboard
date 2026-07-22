@@ -344,14 +344,24 @@ def test_report_includes_oi_levels():
 
 
 def test_oi_walls():
-    from dealer_gex.analytics import oi_walls
+    from dealer_gex.analytics import _kernel_density, oi_walls
     from dealer_gex.report import build_markdown, key_ladder
 
     chain, spot = read_chain((REPO / "data" / "sample_option_chain.csv").read_bytes())
     a = analyze(chain, spot, ASOF)
-    cw, pw = oi_walls(a)
-    assert cw == 650.0  # 3x call-OI spike in the sample generator
-    assert pw == 600.0  # 3.5x put-OI spike
+    ow = oi_walls(a)
+    # anchors: the raw max-OI spikes from the sample generator
+    assert ow.call_strike == 650.0
+    assert ow.put_strike == 600.0
+    # levels are pinpoint: within one spacing of the anchor, and a true local
+    # max of the smoothed OI density
+    for level, strike, col in ((ow.call, 650.0, "call_oi"), (ow.put, 600.0, "put_oi")):
+        assert abs(level - strike) <= 5.0
+        ks = a.by_strike["strike"].to_numpy()
+        w = a.by_strike[col].to_numpy(dtype=float)
+        peak = _kernel_density(ks, w, level, 5.0)
+        assert peak >= _kernel_density(ks, w, level - 0.25, 5.0)
+        assert peak >= _kernel_density(ks, w, level + 0.25, 5.0)
     ladder = key_ladder(a)
     assert {"Call OI wall", "Put OI wall"} <= set(ladder["Level"])
     md = build_markdown(a, ticker="SPY")
