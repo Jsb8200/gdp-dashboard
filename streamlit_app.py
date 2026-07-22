@@ -180,6 +180,58 @@ def train_horizon(close_values: tuple, horizon: int):
                            index=X.columns).sort_values()
     return forecast, metrics, backtest, importance
 
+
+@st.cache_resource(show_spinner=False)
+def train_path_medians(close_values: tuple, max_h: int):
+    """Median forecast for EVERY bar 1..max_h, giving a per-bar predicted
+    path used to locate where the move likely starts and ends. Uses the
+    same hyperparameters as the headline models, so at a shared horizon
+    the path value is identical to the KPI forecast."""
+    close = pd.Series(close_values)
+    X = build_features(close)
+    valid = X.notna().all(axis=1)
+    X_now = X[valid].iloc[[-1]]
+    moves = {}
+    for h in range(1, max_h + 1):
+        y = close.shift(-h) - close
+        rows = valid & y.notna()
+        # Same 80% chronological slice as train_horizon, so shared horizons
+        # produce bit-identical predictions
+        split = int(rows.sum() * 0.8)
+        m = lgb.LGBMRegressor(objective='quantile', alpha=0.5, **LGB_PARAMS)
+        m.fit(X[rows].iloc[:split], y[rows].iloc[:split])
+        moves[h] = float(m.predict(X_now)[0])
+    return moves
+
+
+def smooth_moves(path_moves: dict) -> dict:
+    """3-bar centered mean over the per-bar path — adjacent horizons are
+    trained independently, so single-bar spikes are model noise, not signal."""
+    hs = sorted(path_moves)
+    sm = pd.Series([path_moves[h] for h in hs], index=hs) \
+        .rolling(3, center=True, min_periods=1).mean()
+    return dict(sm)
+
+
+def locate_move(path_moves: dict, noise_pts: float):
+    """Given per-bar predicted moves, find where the move likely starts and
+    ends. The endpoint is the bar of maximum displacement; the start is the
+    first bar that covers 20% of that move in the same direction. Returns
+    None when the whole path stays within noise (sideways market)."""
+    hs = sorted(path_moves)
+    disp = np.array([path_moves[h] for h in hs])
+    end_i = int(np.argmax(np.abs(disp)))
+    total = disp[end_i]
+    if abs(total) < noise_pts:
+        return None
+    start_i = end_i
+    for i in range(end_i + 1):
+        if np.sign(disp[i]) == np.sign(total) and abs(disp[i]) >= 0.2 * abs(total):
+            start_i = i
+            break
+    return {'start_h': hs[start_i], 'end_h': hs[end_i],
+            'start_move': disp[start_i], 'end_move': total}
+
 # -----------------------------------------------------------------------------
 # Sidebar
 
@@ -196,7 +248,7 @@ if source == 'Upload CSV':
     if df is None:
         st.sidebar.info('Using the sample market until a valid CSV is uploaded.')
 if df is None:
-    seed = st.sidebar.number_input('Sample seed', 0, 999, 7,
+    seed = st.sidebar.number_input('Sample seed', 0, 999, 42,
                                    help='Regenerates a different synthetic market.')
     df = make_sample_market(seed=int(seed))
 
@@ -212,7 +264,8 @@ lookback = st.sidebar.slider('Chart lookback (bars)', 60, 500, 180, step=20)
 st.title(':chart_with_upwards_trend: Where is the market going?')
 st.caption('LightGBM quantile models forecast the move over the next '
            f'{", ".join(str(h) for h in horizons)} bars — direction, size in points, '
-           'and the from → to price range. Educational demo, not financial advice.')
+           'the from → to price range, and where the move likely starts and ends. '
+           'Educational demo, not financial advice.')
 
 close = df['Close'].reset_index(drop=True)
 dates = df['Date'].reset_index(drop=True)
@@ -223,6 +276,17 @@ results = {}
 with st.spinner('Training LightGBM models…'):
     for h in horizons:
         results[h] = train_horizon(tuple(close.to_numpy()), h)
+    max_h = horizons[-1]
+    path_moves = train_path_medians(tuple(close.to_numpy()), max_h)
+
+# Path models share hyperparameters and training slice with the headline
+# models, so shared horizons are identical by construction. Smooth the path
+# to suppress single-bar model noise before locating the move.
+smoothed_moves = smooth_moves(path_moves)
+
+# "Within noise" = a fraction of the out-of-sample MAE at the longest horizon
+noise_pts = 0.2 * results[max_h][1]['mae_points']
+move_window = locate_move(smoothed_moves, noise_pts)
 
 # -----------------------------------------------------------------------------
 # KPI row: one tile per horizon
@@ -244,6 +308,51 @@ for col, h in zip(cols[1:], horizons):
         )
 
 # -----------------------------------------------------------------------------
+# Future x positions: extend at the median historical bar spacing
+
+if pd.api.types.is_datetime64_any_dtype(dates):
+    step = (dates.iloc[-1] - dates.iloc[-min(60, len(dates) - 1)]) / min(60, len(dates) - 1)
+    fut_x = {h: last_date + step * h for h in range(1, max_h + 1)}
+
+    def fmt_bar(h):
+        return f'{fut_x[h]:%a %b %d}'
+else:
+    fut_x = {h: last_date + h for h in range(1, max_h + 1)}
+
+    def fmt_bar(h):
+        return f'bar {fut_x[h]}'
+
+# -----------------------------------------------------------------------------
+# Where the move likely starts and ends
+
+st.subheader('Likely move window', divider='gray')
+if move_window is None:
+    st.info(f'**No clear move expected** over the next {max_h} bars — the median '
+            'forecast stays within noise of the last close (sideways drift). '
+            'The fan below still shows the uncertainty range.')
+else:
+    h_s, h_e = move_window['start_h'], move_window['end_h']
+    lvl_s = last_close + move_window['start_move']
+    lvl_e = last_close + move_window['end_move']
+    size = lvl_e - lvl_s
+    w1, w2, w3 = st.columns(3)
+    with w1:
+        st.metric('Move likely starts', f'+{h_s} bar{"s" if h_s > 1 else ""}',
+                  help='First bar where the forecast path covers 20% of the full '
+                       'predicted move — before this, the market likely drifts.')
+        st.caption(f'{fmt_bar(h_s)} · near **{lvl_s:,.1f}**')
+    with w2:
+        st.metric('Move likely ends', f'+{h_e} bar{"s" if h_e > 1 else ""}',
+                  help='Bar where the forecast path reaches its furthest point '
+                       'from the last close — the move is likely exhausted there.')
+        st.caption(f'{fmt_bar(h_e)} · near **{lvl_e:,.1f}**')
+    with w3:
+        st.metric('Likely move', f'{size:+,.1f} pts',
+                  help='From the likely start level to the likely end level.')
+        st.caption(f'**{lvl_s:,.1f} → {lvl_e:,.1f}** '
+                   f'({"▲ up" if size >= 0 else "▼ down"})')
+
+# -----------------------------------------------------------------------------
 # Main chart: recent price + forecast fan
 
 st.subheader('Price and forecast fan', divider='gray')
@@ -252,17 +361,12 @@ hist_n = min(lookback, len(close))
 hist_x = dates.iloc[-hist_n:]
 hist_y = close.iloc[-hist_n:]
 
-# Future x positions: extend at the median historical bar spacing
-if pd.api.types.is_datetime64_any_dtype(dates):
-    step = (dates.iloc[-1] - dates.iloc[-min(60, len(dates) - 1)]) / min(60, len(dates) - 1)
-    fut_x = {h: last_date + step * h for h in horizons}
-else:
-    fut_x = {h: last_date + h for h in horizons}
-
 fan_x = [last_date] + [fut_x[h] for h in horizons]
-fan_mid = [last_close] + [last_close + results[h][0]['move_q50'] for h in horizons]
 fan_lo = [last_close] + [last_close + results[h][0]['move_q10'] for h in horizons]
 fan_hi = [last_close] + [last_close + results[h][0]['move_q90'] for h in horizons]
+
+path_x = [last_date] + [fut_x[h] for h in range(1, max_h + 1)]
+path_y = [last_close] + [last_close + smoothed_moves[h] for h in range(1, max_h + 1)]
 
 fig = go.Figure()
 fig.add_trace(go.Scatter(
@@ -274,17 +378,38 @@ fig.add_trace(go.Scatter(
     fillcolor=C['band'], mode='lines', line=dict(width=0), name='80% range',
     hoverinfo='skip'))
 fig.add_trace(go.Scatter(
-    x=fan_x, y=fan_mid, name='Forecast (median)', mode='lines+markers',
+    x=path_x, y=path_y, name='Forecast path (median)', mode='lines',
     line=dict(color=C['forecast'], width=2, dash='dot'),
-    marker=dict(size=8, color=C['forecast']),
     hovertemplate='%{y:,.1f}<extra>Forecast</extra>'))
-# Direct-label only the furthest horizon; the KPI row and table carry the rest
-h_last = horizons[-1]
-y_last = last_close + results[h_last][0]['move_q50']
-fig.add_annotation(x=fut_x[h_last], y=y_last,
-                   text=f'+{h_last} bars: {y_last:,.0f}',
-                   showarrow=False, xanchor='left', xshift=10,
-                   font=dict(color=C['ink'], size=12))
+fig.add_trace(go.Scatter(
+    x=[fut_x[h] for h in horizons],
+    y=[last_close + results[h][0]['move_q50'] for h in horizons],
+    mode='markers', marker=dict(size=8, color=C['forecast']),
+    showlegend=False, hoverinfo='skip'))
+
+if move_window is not None:
+    # Start label sits left of its marker, end label right of its marker,
+    # so the two never collide
+    for key, label, anchor, xshift in (('start', 'likely start', 'right', -12),
+                                       ('end', 'likely end', 'left', 12)):
+        h_m = move_window[f'{key}_h']
+        y_m = last_close + move_window[f'{key}_move']
+        fig.add_trace(go.Scatter(
+            x=[fut_x[h_m]], y=[y_m], mode='markers', showlegend=False,
+            marker=dict(size=11, symbol='diamond', color=C['forecast'],
+                        line=dict(width=2, color=C['surface'])),
+            hovertemplate=f'{label} · %{{y:,.1f}}<extra>+{h_m} bars</extra>'))
+        fig.add_annotation(x=fut_x[h_m], y=y_m,
+                           text=f'{label} +{h_m}: {y_m:,.0f}',
+                           showarrow=False, xanchor=anchor, xshift=xshift,
+                           font=dict(color=C['ink'], size=12))
+else:
+    h_last = horizons[-1]
+    y_last = last_close + results[h_last][0]['move_q50']
+    fig.add_annotation(x=fut_x[h_last], y=y_last,
+                       text=f'+{h_last} bars: {y_last:,.0f}',
+                       showarrow=False, xanchor='left', xshift=10,
+                       font=dict(color=C['ink'], size=12))
 fig.update_layout(height=420, **PLOTLY_LAYOUT)
 st.plotly_chart(fig, use_container_width=True)
 
@@ -369,6 +494,12 @@ with st.expander('How this works'):
   *forward move in points*, plus a classifier for the probability the move is up.
 - The **median quantile** gives the headline "point size" and the from → to
   target; the 10th–90th band is the shaded fan (an ~80% range).
+- **Likely start / end**: median models are trained for *every* bar up to the
+  longest horizon, giving a full forecast path (smoothed with a 3-bar centered
+  mean, since adjacent horizons are independent models). The move "ends" at
+  the bar where that path is furthest from the last close, and "starts" at the
+  first bar covering 20% of that move. If the whole path stays within noise
+  (a fraction of the backtest error), the call is "sideways — no clear move".
 - **Backtest** numbers come from a strict chronological 80/20 split — the model
   never sees validation bars during training. Overlapping forward windows mean
   neighbouring validation bars are correlated, so treat accuracy as indicative.

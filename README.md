@@ -2,7 +2,10 @@
 
 A Streamlit dashboard that forecasts **where the market is going** over the next
 5 / 10 / 15 bars (horizons are configurable): the **direction**, the **move size
-in points**, and the **from → to price range** with an 80% uncertainty fan.
+in points**, the **from → to price range** with an 80% uncertainty fan, and
+**where the move likely starts and ends** — the bar/date and price level at
+which the move likely begins, and where it is likely exhausted (or a "sideways,
+no clear move" call when the forecast stays within noise).
 
 Under the hood, per horizon it trains four small LightGBM models on
 close-price-derived features (lagged returns, volatility, RSI, MACD, momentum):
