@@ -592,6 +592,38 @@ def block_section(a: Analysis, prints: pd.DataFrame, books: dict,
         st.info("No block prints in this file.")
 
 
+def campaign_section(day_prints: list) -> None:
+    from dealer_gex.analytics import block_campaigns
+
+    camps = block_campaigns(day_prints)
+    if camps.empty:
+        return
+    st.subheader("🎯 Block campaigns (multi-day institutional builds)")
+    view = pd.DataFrame({
+        "Contract": camps.apply(
+            lambda r: f"{r['strike']:,.0f}{r['type']} {r['expiry']:%m-%d}"
+            if pd.notna(r["expiry"]) else f"{r['strike']:,.0f}{r['type']}", axis=1),
+        "Days": camps["days"],
+        "Span": camps.apply(lambda r: f"{r['first_day']} → {r['last_day']}", axis=1),
+        "Direction": camps["direction"].map(
+            {"buy": "🟢 Building (bought)", "sell": "🔴 Building (sold)", "mixed": "⚪ Two-way"}),
+        "Net size": camps["net_size"].map(lambda x: f"{x:+,.0f}"),
+        "Premium": camps["premium"].map(fmt_dollars),
+        "By day": camps["daily"],
+    })
+    st.dataframe(
+        view, use_container_width=True, hide_index=True,
+        column_config={"By day": st.column_config.BarChartColumn(
+            "Signed size by day", help="Per-day net block flow — the build")},
+    )
+    st.caption(
+        "Contracts hit by blocks on multiple days — the same institution "
+        "adding over time, the strongest footprint in the data. A strike "
+        "**built up** day after day (consistent direction) is a conviction "
+        "position; check whether its strike lines up with your walls."
+    )
+
+
 def notable_flow_section(prints: pd.DataFrame, spot: float) -> None:
     st.subheader("🐋 Notable flow (biggest premium prints)")
     top = prints.reindex(prints["premium"].sort_values(ascending=False).index).head(10)
@@ -723,24 +755,24 @@ def main() -> None:
     if all_prints:
         conv_picked = st.sidebar.multiselect(
             "Conviction filter (flow files)",
-            ["Sweeps", "Blocks", "Golden sweeps", "Unusual", "Opening positions"],
+            ["Sweeps", "Blocks", "Splits", "Golden sweeps", "Unusual", "Opening positions"],
             help="Rebuild every level from flagged prints only. Sweeps = "
                  "urgent aggressive flow; blocks = large negotiated "
-                 "institutional trades. Empty = all prints.",
+                 "institutional trades; splits = one order worked across "
+                 "executions. Empty = all prints.",
         )
+
+    _conv_flags = {
+        "Sweeps": "is_sweep", "Blocks": "is_block", "Splits": "is_split",
+        "Golden sweeps": "is_golden", "Unusual": "is_unusual",
+        "Opening positions": "is_opening",
+    }
 
     def _conv_mask(p: pd.DataFrame) -> pd.Series:
         m = pd.Series(False, index=p.index)
-        if "Sweeps" in conv_picked:
-            m |= p["is_sweep"]
-        if "Blocks" in conv_picked:
-            m |= p["is_block"]
-        if "Golden sweeps" in conv_picked:
-            m |= p["is_golden"]
-        if "Unusual" in conv_picked:
-            m |= p["is_unusual"]
-        if "Opening positions" in conv_picked:
-            m |= p["is_opening"]
+        for label, col in _conv_flags.items():
+            if label in conv_picked and col in p.columns:
+                m |= p[col]
         return m
 
     def _build_chain(pf: ParsedFile) -> pd.DataFrame | None:
@@ -826,6 +858,7 @@ def main() -> None:
                 chain = chain[chain["expiry"].dt.date.isin(picked)]
 
     hist = None
+    campaign_days: list = []
     if history:
         from dealer_gex.analytics import oi_walls as _oiw
 
@@ -849,6 +882,11 @@ def main() -> None:
                 "regime": ai.regime,
             })
             analyses.append(ai)
+            if pf.prints is not None:
+                dp = pf.prints
+                if file_tickers and len(file_tickers) > 1:
+                    dp = dp[dp["ticker"] == ticker]
+                campaign_days.append((pf.asof, dp))
         if not analyses:
             st.error("No day could be analyzed — check that each file carries "
                      "a spot price and unexpired contracts.")
@@ -883,6 +921,8 @@ def main() -> None:
 
     if hist is not None and len(hist) >= 2:
         history_section(hist)
+        if len(campaign_days) >= 2:
+            campaign_section(campaign_days)
 
     magnets = magnet_levels(a)
     oi_lvls = oi_levels(a)

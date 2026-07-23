@@ -564,6 +564,61 @@ def flow_books(prints: pd.DataFrame, spot: float, asof: date, rate: float = 0.04
     return books
 
 
+def block_campaigns(day_prints: list[tuple[date, pd.DataFrame]],
+                    min_days: int = 2, top_n: int = 10) -> pd.DataFrame:
+    """Detect multi-day block campaigns: option contracts hit by block
+    prints on two or more distinct days — the footprint of an institution
+    building (or unwinding) a position over time, not a one-off trade.
+
+    ``day_prints`` is a list of (date, prints_df) — one entry per uploaded
+    day. Returns one row per (expiry, strike, type) touched by blocks on at
+    least ``min_days`` days, ranked by total block premium.
+
+    Columns: expiry, strike, type, days, first_day, last_day, premium,
+    net_size (signed; + = customers net bought, dealers short), direction,
+    daily (list of per-day signed sizes for a sparkline).
+    """
+    cols = ["expiry", "strike", "type", "days", "first_day", "last_day",
+            "premium", "net_size", "direction", "daily"]
+    frames = []
+    for d, p in day_prints:
+        if p is None or p.empty:
+            continue
+        b = p[p["is_block"] & p["strike"].notna()].copy()
+        if b.empty:
+            continue
+        b["day"] = d
+        b["cp"] = b["type"].astype(str).str.strip().str.upper().str[0]
+        frames.append(b)
+    if not frames:
+        return pd.DataFrame(columns=cols)
+    allb = pd.concat(frames, ignore_index=True)
+
+    rows = []
+    for (exp, strike, cp), g in allb.groupby(["expiry", "strike", "cp"], dropna=False):
+        days = sorted(g["day"].unique())
+        if len(days) < min_days:
+            continue
+        net = float(g["signed_size"].sum())
+        traded = float(g["size"].sum())
+        direction = ("buy" if net > 0.1 * traded
+                     else "sell" if net < -0.1 * traded else "mixed")
+        daily = [float(g.loc[g["day"] == d, "signed_size"].sum()) for d in days]
+        rows.append({
+            "expiry": pd.to_datetime(exp, errors="coerce"),
+            "strike": float(strike), "type": cp, "days": len(days),
+            "first_day": days[0], "last_day": days[-1],
+            "premium": float(g["premium"].sum()), "net_size": net,
+            "direction": direction, "daily": daily,
+        })
+    if not rows:
+        return pd.DataFrame(columns=cols)
+    df = pd.DataFrame(rows).sort_values(
+        ["days", "premium"], ascending=[False, False]
+    ).head(top_n).reset_index(drop=True)
+    return df
+
+
 def max_pain(chain: pd.DataFrame) -> float:
     """Level minimizing the total intrinsic payout to option holders.
 

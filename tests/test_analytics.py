@@ -491,6 +491,42 @@ def test_report_block_intelligence():
     assert "Blocks (institutional)" in md and "Sweeps (urgent)" in md
 
 
+def test_split_flag_parsed():
+    from dealer_gex.parsing import parse_file
+
+    csv = QUANTDATA_CSV.replace("4,2026-07-14T15:00:00Z,QQQ,2026-08-21,$720.00,CALL,$720.40,20,\"2,000\",\"5,000\",M,18.4%,0.012,\"$10,000.00\",AUTO,No,No,No",
+                                "4,2026-07-14T15:00:00Z,QQQ,2026-08-21,$720.00,CALL,$720.40,20,\"2,000\",\"5,000\",A,18.4%,0.012,\"$10,000.00\",SPLIT,No,No,No")
+    pf = parse_file(csv)
+    assert pf.prints["is_split"].sum() == 1
+
+
+def test_block_campaigns_multi_day():
+    from datetime import date as _date
+    from dealer_gex.parsing import parse_file
+    from dealer_gex.analytics import block_campaigns
+
+    pf = parse_file(QUANTDATA_CSV)
+    p = pf.prints[pf.prints["ticker"] == "QQQ"].copy()
+    # only one block in the fixture (720C); replay it across two days as a
+    # build, plus a second day-2-only block that must NOT qualify
+    day1 = p[p["is_block"]].copy()
+    day2 = p[p["is_block"]].copy()
+    day2b = p[p["is_block"]].copy()
+    day2b["strike"] = 730.0
+    day2 = pd.concat([day2, day2b], ignore_index=True)
+    camps = block_campaigns([(_date(2026, 7, 13), day1),
+                             (_date(2026, 7, 14), day2)])
+    # 720C hit both days -> campaign; 730C only day 2 -> excluded
+    assert len(camps) == 1
+    r = camps.iloc[0]
+    assert r["strike"] == 720.0 and r["type"] == "C"
+    assert r["days"] == 2
+    assert r["direction"] == "buy"        # ask-side both days
+    assert len(r["daily"]) == 2
+    # single-day data yields no campaigns
+    assert block_campaigns([(_date(2026, 7, 14), day1)]).empty
+
+
 def test_fmt_dollars():
     assert fmt_dollars(1_460_000_000) == "$1.46B"
     assert fmt_dollars(-441_430_000) == "-$441.43M"

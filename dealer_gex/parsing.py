@@ -212,9 +212,13 @@ def _parse_trade_flow(raw: pd.DataFrame) -> ParsedFile:
         ctype = raw[cols["consolidation"]].astype(str).str.upper()
         df["is_sweep"] = ctype.str.contains("SWEEP", na=False)
         df["is_block"] = ctype.str.contains("BLOCK", na=False)
+        # SPLIT: one order worked across executions — between a sweep and a
+        # block; large patient flow, still conviction
+        df["is_split"] = ctype.str.contains("SPLIT", na=False)
     else:
         df["is_sweep"] = False
         df["is_block"] = False
+        df["is_split"] = False
     for flag in ("is_golden", "is_unusual", "is_opening"):
         df[flag] = _yes(raw[cols[flag]]) if flag in cols else False
 
