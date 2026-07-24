@@ -15,7 +15,8 @@ import streamlit as st
 from dealer_gex.analytics import (
     Analysis, analyze, block_levels, confluence_levels, darkpool_levels,
     data_quality, directional_lean, flow_books, fmt_dollars, intraday_flow,
-    level_hit_rate, magnet_levels, oi_levels, oi_walls, tuned_layer_weights,
+    level_hit_rate, magnet_levels, oi_levels, oi_walls, scan_ticker,
+    tuned_layer_weights,
 )
 
 _CONF_ICON = {"high": "🟢", "medium": "🟡", "low": "🔴"}
@@ -89,6 +90,23 @@ def _analyze_cached(chain, spot, asof, rate, weight, multiplier):
     """Cached analyze — reused by the scenario slider and history loop so
     unchanged (spot, IV) states don't re-run the GEX grid + flip bisection."""
     return analyze(chain, spot, asof, rate, weight=weight, multiplier=multiplier)
+
+
+@st.cache_data(show_spinner=False)
+def _scan(full_chain, spots, asof, rate, weight, multiplier, prints):
+    """Compact positioning summary per ticker for the watchlist scan."""
+    tickers = [t for t in full_chain["ticker"].value_counts().index if str(t)]
+    rows = []
+    for tk in tickers:
+        ch = full_chain[full_chain["ticker"] == tk]
+        pr = prints[prints["ticker"] == tk] if prints is not None else None
+        sp = spots.get(tk)
+        if sp is None or ch.empty:
+            continue
+        r = scan_ticker(ch, sp, asof, rate, weight, multiplier, pr)
+        if r is not None:
+            rows.append({"ticker": tk, **r})
+    return pd.DataFrame(rows)
 
 
 @st.cache_data(show_spinner=False)
@@ -559,6 +577,33 @@ def lean_section(lean: dict) -> None:
     st.caption(caveat)
 
 
+def scan_section(scan: pd.DataFrame, selected: str) -> None:
+    if scan.empty or len(scan) < 2:
+        return
+    with st.expander(f"🔭 Watchlist scan — {len(scan)} tickers", expanded=True):
+        view = pd.DataFrame({
+            "Ticker": scan["ticker"].map(
+                lambda t: f"▶ {t}" if t == selected else t),
+            "Spot": scan["spot"].map(lambda x: f"{x:,.2f}"),
+            "Regime": scan["regime"].map(
+                lambda r: "🛡️ long γ" if r == "long_gamma" else "⚠️ short γ"),
+            "Flip dist": scan["flip_dist"].map(
+                lambda x: "—" if x is None or pd.isna(x) else f"{x:+.1f}%"),
+            "Net GEX": scan["net_gex"].map(fmt_dollars),
+            "Lean": scan["lean"].map(
+                lambda v: f"{'🟢' if v > 15 else '🔴' if v < -15 else '⚪'} {v:+.0f}"),
+            "Blocks vs sweeps": scan["divergence"].map(
+                lambda d: "—" if d is None else ("⚔️ divergent" if d else "✅ aligned")),
+        })
+        st.dataframe(view, use_container_width=True, hide_index=True)
+        st.caption(
+            "Every ticker in the upload at a glance — regime, distance to the "
+            "gamma flip, net GEX, positioning lean, and whether institutional "
+            "blocks disagree with the urgent tape. ▶ marks the one analyzed "
+            "in detail below; switch it in the sidebar."
+        )
+
+
 def confluence_section(a: Analysis, master: pd.DataFrame, dq: dict) -> None:
     st.subheader("🎯 Master levels (confluence)")
     if dq["level"] != "high":
@@ -970,6 +1015,7 @@ def main() -> None:
         spots.update(pf.spots)
     default_asof = max(dated) if dated else date.today()
 
+    full_chain = chain  # unfiltered — needed for the multi-ticker scan
     st.sidebar.header("Parameters")
     file_tickers = []
     if "ticker" in chain.columns:
@@ -1108,6 +1154,12 @@ def main() -> None:
         by_tk = dark_all[dark_all["ticker"] == ticker]
         dark_t = by_tk if not by_tk.empty else (dark_all if not file_tickers else None)
 
+    # watchlist scan across every ticker in the upload (not in history mode)
+    scan = pd.DataFrame()
+    if not history and len(file_tickers) > 1:
+        all_pr = pd.concat(all_prints, ignore_index=True) if all_prints else None
+        scan = _scan(full_chain, spots, asof, rate, weight, multiplier, all_pr)
+
     def _derive(a, prints, dark=None):
         """Level stack from an Analysis + prints (shared by both paths)."""
         magnets = magnet_levels(a)
@@ -1208,6 +1260,8 @@ def main() -> None:
                    "this is the gamma that binds into today's close.")
     metrics_row(a, zero_dte)
 
+    if not scan.empty:
+        scan_section(scan, ticker)
     confluence_section(a, master, dq)
     lean_section(lean)
 
