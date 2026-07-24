@@ -14,8 +14,8 @@ import streamlit as st
 
 from dealer_gex.analytics import (
     Analysis, analyze, block_levels, confluence_levels, darkpool_levels,
-    data_quality, directional_lean, flow_books, fmt_dollars, magnet_levels,
-    oi_levels, oi_walls,
+    data_quality, directional_lean, flow_books, fmt_dollars, intraday_flow,
+    level_hit_rate, magnet_levels, oi_levels, oi_walls, tuned_layer_weights,
 )
 
 _CONF_ICON = {"high": "🟢", "medium": "🟡", "low": "🔴"}
@@ -704,13 +704,8 @@ def block_section(a: Analysis, prints: pd.DataFrame, books: dict,
         st.info("No block prints in this file.")
 
 
-def hit_rate_section(hr_days: list) -> None:
-    from dealer_gex.analytics import level_hit_rate
-
-    if len(hr_days) < 2:
-        return
-    detail, s = level_hit_rate(hr_days)
-    if s["tested"] == 0:
+def hit_rate_section(detail, s, tuned: dict | None = None) -> None:
+    if detail is None or s is None or s["tested"] == 0:
         return
     st.subheader("✅ Level hit-rate (did they hold?)")
     if s["pairs"] < 3:
@@ -745,6 +740,21 @@ def hit_rate_section(hr_days: list) -> None:
         "have actually been respected on this ticker recently. Watch whether "
         "🟢 high-confidence levels hold better than 🔴 lone-layer ones."
     )
+    if tuned:
+        from dealer_gex.analytics import _FAMILY_LABEL
+        up = [f"{_FAMILY_LABEL.get(k, k)} ×{v}" for k, v in sorted(tuned.items())
+              if v > 1.0]
+        down = [f"{_FAMILY_LABEL.get(k, k)} ×{v}" for k, v in sorted(tuned.items())
+                if v < 1.0]
+        note = "🎚️ **Confluence tuned from this history** — "
+        parts = []
+        if up:
+            parts.append("up-weighted " + ", ".join(up))
+        if down:
+            parts.append("down-weighted " + ", ".join(down))
+        note += "; ".join(parts) if parts else "all families near neutral"
+        note += ". The master table above reflects what actually held here."
+        st.info(note.replace("$", "\\$"), icon="🎚️")
 
 
 def campaign_section(day_prints: list) -> None:
@@ -776,6 +786,33 @@ def campaign_section(day_prints: list) -> None:
         "adding over time, the strongest footprint in the data. A strike "
         "**built up** day after day (consistent direction) is a conviction "
         "position; check whether its strike lines up with your walls."
+    )
+
+
+def intraday_timeline_section(prints: pd.DataFrame) -> None:
+    flow = intraday_flow(prints)
+    if flow.empty or len(flow) < 3:
+        return
+    st.subheader("⏱️ Intraday flow timeline")
+    fig = go.Figure()
+    for col, name, color, dash in (
+        ("cum_all", "All flow", C["ink"], "solid"),
+        ("cum_block", "Blocks", C["call"], "dot"),
+        ("cum_sweep", "Sweeps", C["put"], "dash"),
+    ):
+        if flow[col].abs().sum() > 0:
+            fig.add_scatter(x=flow["time"], y=flow[col], mode="lines", name=name,
+                            line=dict(color=color, width=2, dash=dash),
+                            hovertemplate=name + " %{y:,.0f}<extra></extra>")
+    fig.add_hline(y=0, line_color=C["axis"], line_width=1)
+    fig.update_layout(title="Cumulative signed flow through the session",
+                      yaxis_title="Net contracts (buy + / sell −)")
+    st.plotly_chart(_style(fig), use_container_width=True)
+    st.caption(
+        "When — and who — the flow landed. Rising = net customer buying "
+        "(dealers pushed short); falling = net selling. Compare the block and "
+        "sweep lines: patient institutional size vs urgent aggressive flow, "
+        "and whether the close was one-sided."
     )
 
 
@@ -1135,6 +1172,17 @@ def main() -> None:
             a, merged_prints, dark_t)
         dq = data_quality(a, merged_prints)
         lean = directional_lean(a, merged_prints)
+        # validate prior levels, then tune the latest master by what held
+        hr_detail = hr_summary = None
+        tuned_w: dict = {}
+        if len(hr_days) >= 2:
+            hr_detail, hr_summary = level_hit_rate(hr_days)
+            tuned_w = tuned_layer_weights(hr_detail)
+            if tuned_w:
+                master = confluence_levels(
+                    a, magnets, oi_lvls,
+                    blk_lvls if not blk_lvls.empty else None,
+                    dark_lvls if not dark_lvls.empty else None, weights=tuned_w)
     else:
         try:
             a, magnets, oi_lvls, blk_books, blk_lvls, dark_lvls, master, dq, lean = _main_bundle(
@@ -1165,7 +1213,7 @@ def main() -> None:
 
     if hist is not None and len(hist) >= 2:
         history_section(hist)
-        hit_rate_section(hr_days)
+        hit_rate_section(hr_detail, hr_summary, tuned_w)
         if len(campaign_days) >= 2:
             campaign_section(campaign_days)
 
@@ -1189,6 +1237,7 @@ def main() -> None:
         scenario_section(a, chain, asof, rate, weight, multiplier)
 
     if merged_prints is not None:
+        intraday_timeline_section(merged_prints)
         notable_flow_section(merged_prints, a.spot)
 
     playbook_section(a, master, lean)

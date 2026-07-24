@@ -564,6 +564,27 @@ def flow_books(prints: pd.DataFrame, spot: float, asof: date, rate: float = 0.04
     return books
 
 
+def intraday_flow(prints: pd.DataFrame, freq: str = "5min") -> pd.DataFrame:
+    """Cumulative signed order flow through the session, binned in time.
+    Positive = net customer buying (dealers pushed short). Separate running
+    totals for all prints, blocks, and sweeps so you can see *when* — and
+    *who* — the flow landed. Columns: time, cum_all, cum_block, cum_sweep."""
+    cols = ["time", "cum_all", "cum_block", "cum_sweep"]
+    if prints is None or "trade_time" not in prints or "signed_size" not in prints:
+        return pd.DataFrame(columns=cols)
+    p = prints.dropna(subset=["trade_time"])
+    if p.empty:
+        return pd.DataFrame(columns=cols)
+    idx = p.set_index("trade_time").sort_index()
+    ss = idx["signed_size"]
+    allc = ss.resample(freq).sum().cumsum()
+    blk = ss.where(idx.get("is_block", False), 0.0).resample(freq).sum().cumsum()
+    swp = ss.where(idx.get("is_sweep", False), 0.0).resample(freq).sum().cumsum()
+    return pd.DataFrame({"time": allc.index, "cum_all": allc.to_numpy(),
+                         "cum_block": blk.reindex(allc.index).to_numpy(),
+                         "cum_sweep": swp.reindex(allc.index).to_numpy()})
+
+
 def session_range(prints: pd.DataFrame) -> tuple[float, float, float, float] | None:
     """Reconstruct a session's (low, high, close, open) from the reference
     price stamped on each print — the traded-through range, a stand-in for
@@ -606,14 +627,16 @@ def level_hit_rate(days: list[dict], touch: float = 0.0015,
     reference prices, not exchange OHLC, and it is a small sample.
     """
     cols = ["from_date", "to_date", "level", "role", "confidence",
-            "type", "tested", "held", "outcome"]
+            "type", "tested", "held", "outcome", "families"]
     rows = []
     for prev, nxt in zip(days, days[1:]):
         lo, hi, close = nxt["low"], nxt["high"], nxt["close"]
         if prev.get("master") is None or prev["master"].empty:
             continue
+        has_fam = "families" in prev["master"].columns
         for _, lv in prev["master"].iterrows():
             level, role, conf = float(lv["level"]), lv["role"], lv["confidence"]
+            fams = list(lv["families"]) if has_fam else []
             kind = _role_kind(role)
             tested = held = False
             if kind == "support":
@@ -627,7 +650,7 @@ def level_hit_rate(days: list[dict], touch: float = 0.0015,
                 held = tested and abs(close - level) <= level * touch * 2
             outcome = "not tested" if not tested else ("held" if held else "broke")
             rows.append((prev["date"], nxt["date"], level, role, conf,
-                         kind, tested, held, outcome))
+                         kind, tested, held, outcome, fams))
 
     detail = pd.DataFrame(rows, columns=cols)
     tested = detail[detail["tested"]]
@@ -887,15 +910,21 @@ def confluence_levels(a: "Analysis", magnets: pd.DataFrame | None = None,
                       oi_lvls: pd.DataFrame | None = None,
                       block_lvls: pd.DataFrame | None = None,
                       dark_lvls: pd.DataFrame | None = None,
-                      band: float | None = None, top_n: int = 6) -> pd.DataFrame:
+                      band: float | None = None, top_n: int = 6,
+                      weights: dict | None = None) -> pd.DataFrame:
     """Fuse every level system into one ranked master table. Each source
     contributes a weighted vote to a price; nearby votes cluster, and the
     cluster's total weight becomes a 0-100 confluence score. A level
     confirmed by many independent layers is the one to trade.
 
-    Columns: level, score, n_layers, layers (list), role, distance_pct,
-    confidence (high/medium/low — from the count of distinct layer families).
+    ``weights`` optionally multiplies each layer family's base weight — used
+    to feed empirical hit-rate back into the scoring (see tuned_layer_weights).
+
+    Columns: level, score, n_layers, layers (list), families (list), role,
+    distance_pct, confidence (high/medium/low — from the count of distinct
+    layer families).
     """
+    weights = weights or {}
     if magnets is None:
         magnets = magnet_levels(a)
     if oi_lvls is None:
@@ -935,8 +964,11 @@ def confluence_levels(a: "Analysis", magnets: pd.DataFrame | None = None,
             src.append((r["level"], 0.8 * r["strength"] / 100,
                         "Dark pool", "dark_pool"))
 
+    # apply per-family weight multipliers (empirical tuning), then filter
+    src = [(p, w * weights.get(fam, 1.0), lbl, fam) for (p, w, lbl, fam) in src]
     src = [s for s in src if s[0] is not None and abs(s[0] / a.spot - 1) <= 0.12 and s[1] > 0]
-    cols = ["level", "score", "n_layers", "layers", "role", "distance_pct", "confidence"]
+    cols = ["level", "score", "n_layers", "layers", "families", "role",
+            "distance_pct", "confidence"]
     if not src:
         return pd.DataFrame(columns=cols)
 
@@ -960,16 +992,51 @@ def confluence_levels(a: "Analysis", magnets: pd.DataFrame | None = None,
             if x[2] not in seen:
                 seen.add(x[2])
                 labels.append(x[2])
-        rows.append((center, w, len(fams), labels,
+        rows.append((center, w, len(fams), labels, sorted(fams),
                      _confluence_role(fams, center, a.spot),
                      (center / a.spot - 1) * 100))
     df = pd.DataFrame(rows, columns=["level", "weight", "n_layers", "layers",
-                                     "role", "distance_pct"])
+                                     "families", "role", "distance_pct"])
     df = df.sort_values("weight", ascending=False).head(top_n).reset_index(drop=True)
     df["score"] = (100 * df["weight"] / df["weight"].max()).round(0)
     df["confidence"] = df["n_layers"].map(
         lambda n: "high" if n >= 3 else "medium" if n == 2 else "low")
     return df[cols]
+
+
+_FAMILY_LABEL = {
+    "gamma_wall": "gamma walls", "flip": "gamma flip", "oi_wall": "OI walls",
+    "magnet": "magnets", "accel": "accelerators", "oi_cluster": "OI clusters",
+    "block": "block levels", "dark_pool": "dark-pool", "max_pain": "max pain",
+}
+
+
+def tuned_layer_weights(detail: pd.DataFrame, min_n: int = 4) -> dict:
+    """Turn historical hit-rate into per-family confluence weight multipliers.
+
+    Among tested levels, each layer family's held-rate becomes a multiplier
+    in [0.5, 1.5] (0.5 + rate): families whose levels held more get more say
+    in future scoring, and vice versa. Families with fewer than ``min_n``
+    tested instances keep their default weight (1.0) — no tuning on noise.
+
+    Returns {family: multiplier} (only families that met the sample gate).
+    """
+    if detail is None or detail.empty or "families" not in detail:
+        return {}
+    tested = detail[detail["tested"]]
+    if tested.empty:
+        return {}
+    tally: dict[str, list[int]] = {}
+    for _, r in tested.iterrows():
+        for fam in (r["families"] or []):
+            t = tally.setdefault(fam, [0, 0])
+            t[0] += 1
+            t[1] += int(bool(r["held"]))
+    out = {}
+    for fam, (n, held) in tally.items():
+        if n >= min_n:
+            out[fam] = round(float(np.clip(0.5 + held / n, 0.5, 1.5)), 3)
+    return out
 
 
 def max_pain(chain: pd.DataFrame) -> float:

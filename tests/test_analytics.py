@@ -793,6 +793,53 @@ def test_option_file_not_misdetected_as_darkpool():
     assert pf.dark is None and not pf.chain.empty
 
 
+def test_intraday_flow_cumulative():
+    from dealer_gex.parsing import parse_file
+    from dealer_gex.analytics import intraday_flow
+
+    pf = parse_file(QUANTDATA_CSV)
+    qqq = pf.prints[pf.prints["ticker"] == "QQQ"]
+    tl = intraday_flow(qqq, freq="1min")
+    assert not tl.empty
+    assert list(tl.columns) == ["time", "cum_all", "cum_block", "cum_sweep"]
+    # cumulative and monotone in time; final all-flow = net signed of all prints
+    assert tl["cum_all"].iloc[-1] == pytest.approx(qqq["signed_size"].sum())
+    # block line only accumulates block prints
+    assert tl["cum_block"].iloc[-1] == pytest.approx(
+        qqq.loc[qqq["is_block"], "signed_size"].sum())
+
+
+def test_tuned_layer_weights_gating_and_direction():
+    from dealer_gex.analytics import tuned_layer_weights
+
+    # 6 tested levels carrying family "gamma_wall": 5 held, 1 broke -> up-weight
+    rows = []
+    for i in range(6):
+        rows.append({"tested": True, "held": i < 5, "families": ["gamma_wall"]})
+    # a family seen only twice must be gated out (min_n=4)
+    rows.append({"tested": True, "held": False, "families": ["dark_pool"]})
+    rows.append({"tested": True, "held": False, "families": ["dark_pool"]})
+    detail = pd.DataFrame(rows)
+    w = tuned_layer_weights(detail, min_n=4)
+    assert "gamma_wall" in w and w["gamma_wall"] == pytest.approx(0.5 + 5 / 6, abs=1e-3)
+    assert "dark_pool" not in w          # gated: too few samples
+    assert 0.5 <= w["gamma_wall"] <= 1.5  # bounded
+
+
+def test_tuned_weights_reweight_confluence():
+    from dealer_gex.analytics import confluence_levels
+
+    chain, spot = read_chain((REPO / "data" / "sample_option_chain.csv").read_bytes())
+    a = analyze(chain, spot, ASOF)
+    base = confluence_levels(a, top_n=20)
+    assert "families" in base.columns and base["families"].map(len).max() >= 1
+    # the OI-wall family is present in the default fusion
+    assert base["families"].map(lambda f: "oi_wall" in f).any()
+    # zeroing that family removes its vote entirely -> it vanishes from fusion
+    zeroed = confluence_levels(a, top_n=20, weights={"oi_wall": 0.0})
+    assert not zeroed["families"].map(lambda f: "oi_wall" in f).any()
+
+
 def test_fmt_dollars():
     assert fmt_dollars(1_460_000_000) == "$1.46B"
     assert fmt_dollars(-441_430_000) == "-$441.43M"
