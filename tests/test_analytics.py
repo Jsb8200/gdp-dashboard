@@ -840,6 +840,26 @@ def test_tuned_weights_reweight_confluence():
     assert not zeroed["families"].map(lambda f: "oi_wall" in f).any()
 
 
+def test_scan_ticker_summary():
+    from dealer_gex.parsing import parse_file
+    from dealer_gex.analytics import scan_ticker
+
+    pf = parse_file(QUANTDATA_CSV)
+    qqq_ch = pf.chain[pf.chain["ticker"] == "QQQ"]
+    qqq_pr = pf.prints[pf.prints["ticker"] == "QQQ"]
+    r = scan_ticker(qqq_ch, pf.spots["QQQ"], pf.asof, 0.045, "open_interest",
+                    100.0, qqq_pr)
+    assert r is not None
+    assert r["regime"] in ("long_gamma", "short_gamma")
+    assert set(r) >= {"spot", "flip", "flip_dist", "net_gex", "lean",
+                      "lean_label", "divergence"}
+    assert -100 <= r["lean"] <= 100
+    # a ticker with no unexpired contracts returns None, not a crash
+    from datetime import date as _date
+    assert scan_ticker(qqq_ch, pf.spots["QQQ"], _date(2027, 1, 1), 0.045,
+                       "open_interest", 100.0, qqq_pr) is None
+
+
 def test_fmt_dollars():
     assert fmt_dollars(1_460_000_000) == "$1.46B"
     assert fmt_dollars(-441_430_000) == "-$441.43M"

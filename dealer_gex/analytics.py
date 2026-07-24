@@ -545,6 +545,36 @@ def block_levels(prints: pd.DataFrame, spot: float, top_n: int = 5) -> pd.DataFr
     return df
 
 
+def scan_ticker(chain: pd.DataFrame, spot: float, asof: date, rate: float,
+                weight: str, multiplier: float,
+                prints: pd.DataFrame | None = None) -> dict | None:
+    """One compact positioning summary for a single ticker — the row behind
+    the multi-ticker scan. Returns None if the ticker can't be analyzed.
+
+    Keys: spot, regime, flip, flip_dist (% of spot, None if no flip),
+    net_gex, lean (score), lean_label, divergence (blocks vs sweeps lean
+    opposite ways; None when there's no flow data).
+    """
+    try:
+        a = analyze(chain, spot, asof, rate, weight=weight, multiplier=multiplier)
+    except (ValueError, Exception):  # noqa: BLE001 - skip un-analyzable tickers
+        return None
+    lean = directional_lean(a, prints)
+    divergence = None
+    if prints is not None and "is_block" in prints and prints["is_block"].any():
+        books = flow_books(prints, a.spot, a.asof, rate, multiplier=multiplier)
+        if "blocks" in books and "sweeps" in books:
+            b, s = -books["blocks"].dex, -books["sweeps"].dex
+            divergence = (b >= 0) != (s >= 0)
+    flip_dist = None if a.gamma_flip is None else (a.gamma_flip / a.spot - 1) * 100
+    return {
+        "spot": a.spot, "regime": a.regime, "flip": a.gamma_flip,
+        "flip_dist": flip_dist, "net_gex": a.total_gex,
+        "lean": lean["score"], "lean_label": lean["label"],
+        "divergence": divergence,
+    }
+
+
 def flow_books(prints: pd.DataFrame, spot: float, asof: date, rate: float = 0.045,
                multiplier: float = DEFAULT_MULTIPLIER) -> dict[str, "Analysis"]:
     """Analyze the blocks-only and sweeps-only books separately (signed-flow
