@@ -1,87 +1,117 @@
 # ⚖️ Dealer Positioning Dashboard
 
-A Streamlit dashboard that detects **market-maker (dealer) hedging obligations**
-from options open interest: net gamma exposure (GEX), whether dealers are
-*forced* to hedge short or long, and the price levels where that behavior flips
-or concentrates — the **gamma flip**, **call wall**, and **put wall**. It also
-generates a downloadable **dealer-positioning report** (markdown or HTML).
+A Streamlit dashboard that reads **market-maker (dealer) hedging obligations**
+from options data and fuses every level system into one ranked read. It detects
+whether dealers are *forced* to hedge with or against the market, finds the
+price levels where that behavior concentrates or flips, cross-checks them
+against raw open interest, institutional block flow, and dark-pool prints, and
+— given several days of data — validates whether those levels actually held.
+
+Everything is driven by CSV uploads (no live feed). It opens on a bundled
+synthetic sample so it works with zero setup.
 
 ## How to run it
 
-1. Install the requirements
+```
+pip install -r requirements.txt
+streamlit run streamlit_app.py
+```
 
-   ```
-   pip install -r requirements.txt
-   ```
-
-2. Run the app
-
-   ```
-   streamlit run streamlit_app.py
-   ```
-
-The app opens with a bundled synthetic SPY-like sample chain so everything works
-without any data. Switch the sidebar to **Upload CSV** to analyze your own
-option chains.
+Switch the sidebar to **Upload CSV** to analyze your own data.
 
 ## Input data
 
-Upload option-chain CSV exports from your broker or CBOE. Two shapes are
-auto-detected:
+Four file shapes are auto-detected — no configuration:
 
-- **Long format** — one row per contract, with columns like
-  `Expiration Date, Type, Strike, Open Interest, Volume, Implied Volatility`
-  (column names are matched case-insensitively against common synonyms:
-  `OI`/`Open Int`, `IV`/`Impl Vol`, `Exp`/`Expiration`, `Call/Put`/`Right`, …).
-  See `data/sample_option_chain.csv` for a working example.
-- **CBOE side-by-side** — calls and puts on the same row per strike (the CBOE
-  `quotedata` download format, including its metadata preamble lines).
+- **Long-format chain** — one row per contract (broker export). Column names are
+  matched against synonyms (`OI`/`Open Int`, `IV`/`Impl Vol`, `Exp`, `Call/Put`…).
+  See `data/sample_option_chain.csv`.
+- **CBOE side-by-side** — calls and puts per strike (`quotedata` download,
+  preamble and all).
+- **Trade-level order flow** (QuantData "Options Order Flow") — one row per
+  print. Prints are collapsed to a correct per-contract chain (open interest is
+  taken as a max, never summed), ticker/spot/date are inferred, and the ask/bid
+  side codes power the signed-flow, block, and conviction features.
+- **Dark-pool / equity blocks** — price + size per print, no strike. Used as a
+  confluence *overlay* on an options analysis (upload alongside a chain).
 
-If auto-detection fails, the sidebar shows a manual column-mapping form.
-A `Gamma` column is used when present; otherwise gamma is computed with
-Black-Scholes from each contract's implied volatility. If the file includes an
-underlying/spot price it is picked up automatically; otherwise set it in the
-sidebar. Multiple files (e.g. one per expiry) can be uploaded together.
+If auto-detection fails, a manual column-mapping form appears. Missing greeks
+are filled with Black-Scholes gamma from each contract's IV. Multiple files
+combine into one book — or, when they cover different days, can be **compared as
+history** instead.
 
 ## What it computes
 
+**Headline read**
+
 | Output | Meaning |
 |---|---|
-| **Net GEX** | Dollar dealer gamma per 1% move: `gamma × OI × 100 × spot² × 1%`, calls positive / puts negative |
-| **Verdict** | Dealers **long gamma** → obliged to buy dips and sell rips (stabilizing, mean-reverting). Dealers **short gamma** → forced to sell weakness and buy strength (destabilizing, trending) |
-| **Gamma flip** | The spot level where net GEX crosses zero — recomputed across a ±15% spot grid and interpolated |
-| **Call / put wall** | Strikes with the largest positive / negative dealer gamma — pin and acceleration levels |
-| **Max pain** | Level minimizing option-holder payout at expiry (interpolated between strikes) |
-| **Expected move** | 1σ straddle-approximation range to the nearest expiry, from near-the-money IV |
-| **Vanna / charm flows** | Forced dealer re-hedging per 1-pt IV drop and per day of delta decay |
-| **Net DEX** | Net dealer delta inventory under the same convention |
-| **Trading interpretation** | Auto-generated playbook: regime read, level-by-level meaning, and a price-sorted level ladder |
-| **Report** | Downloadable `.md` / `.html` summary of all of the above with the playbook and a per-expiry breakdown |
+| **Verdict** | Dealers **long gamma** → buy dips / sell rips (stabilizing, mean-reverting) vs **short gamma** → sell weakness / buy strength (destabilizing, trending) |
+| **TL;DR** | One-line synthesis of regime, top level, expected move, and lean |
+| **Master levels (confluence)** | Every level system fused into one 0-100 ranking; a level confirmed by more independent systems ranks higher, with a high/medium/low confidence flag |
+| **Directional lean** | A -100…+100 *positioning* tilt from order-flow, block, and max-pain ingredients — a lean, not a signal |
 
-Three weighting modes: **open interest** (standing positioning, updates
-overnight), **volume** (today's traded flow — better for intraday/0DTE
-reads; zero-OI strikes that traded today are included), and — for
-trade-level order-flow exports — **signed order flow** (dealer positioning
-inferred from actual ask/bid trade direction).
+**Levels (all pinpoint, not strike-rounded)**
 
-Order-flow extras (QuantData-style exports): a **conviction filter**
-(rebuild all levels from sweeps / golden sweeps / unusual / opening prints
-only), a **notable flow** table (largest premium prints with flags), and
-**level history** — upload several days of exports and see how the flip,
-walls, and regime migrated day over day.
+| Level | Meaning |
+|---|---|
+| **Gamma flip** | Spot where net GEX crosses zero — bisected to the cent |
+| **Gamma call / put wall** | Peak aggregate dealer gamma per side |
+| **OI call / put wall** | Peak raw open interest per side |
+| **Magnets & accelerators** | Every positive (pin) / negative (repel) net-gamma peak, ranked |
+| **OI clusters** | Kernel-smoothed open-interest concentration, call/put labeled |
+| **Block commitment levels** | Where negotiated institutional premium concentrated |
+| **Dark-pool levels** | Where off-exchange equity size concentrated |
+| **Max pain / expected move** | Expiry gravitation; 1σ straddle range |
+
+**Flow intelligence** (order-flow files)
+
+- **Net GEX / DEX / vanna / charm** — dollar hedging demand per 1% move, dealer
+  delta inventory, and forced re-hedging from IV drops and time decay.
+- **Block intelligence** — the blocks-only vs sweeps-only books side by side
+  (smart vs fast money) with an automatic aligned/divergent verdict.
+- **Conviction filter** — rebuild *every* level from flagged prints only
+  (sweeps / blocks / splits / golden / unusual / opening).
+- **Notable flow** — the largest premium prints with flags.
+- **Intraday timeline** — cumulative signed flow through the session, split by
+  blocks vs sweeps: *when* and *who*.
+
+**Multi-day (upload several daily files)**
+
+- **Level migration** — how the flip, walls, and regime moved day over day.
+- **Block campaigns** — contracts hit by blocks across multiple days.
+- **Level hit-rate** — each prior day's levels tested against the next day's
+  range (reconstructed from print reference prices): did they actually hold?
+- **Adaptive confluence** — the hit-rate feeds back to re-weight the confluence
+  scoring by what held on this ticker (gated to avoid tuning on noise).
+
+**Tools & output**
+
+- **Scenario simulator** — re-price the whole book at a hypothetical spot/IV to
+  see the regime, flip, and forced hedge flow *before* the market goes there.
+- **0DTE mode** — restrict to same-day expiry (per-hour charm, move to the close).
+- **Contract multiplier** — 100 for equities/index, 50 ES, 20 NQ… (levels are
+  scale-invariant; only dollar figures scale).
+- **Weighting** — open interest / volume / signed order flow.
+- **Report** — downloadable `.md` / `.html` with the TL;DR, master levels,
+  playbook, and every table.
 
 ## Assumptions & caveats
 
-Dealer positioning uses the standard GEX convention: dealers are assumed long
-customer-sold calls and short customer-bought puts. Actual dealer books can
-differ, open interest updates only once daily, and the flip curve holds IV
-fixed (sticky-strike). Treat every level as an estimate — this is positioning
-analysis, **not trading advice**.
+Convention-based positioning assumes dealers are long customer-sold calls and
+short customer-bought puts; signed-flow mode instead reads actual trade
+direction. Open interest updates once daily, the flip curve holds IV fixed
+(sticky-strike), dark-pool and hit-rate ranges are reconstructions, and small
+samples are flagged. Every level is an estimate — this is positioning analysis,
+**not trading advice**.
 
 ## Development
 
 ```
 pip install pytest
-python -m pytest tests/
-python scripts/make_sample_chain.py   # regenerate the bundled sample chain
+python -m pytest tests/                 # 53 tests
+python scripts/make_sample_chain.py     # regenerate the bundled sample chain
 ```
+
+Layout: `dealer_gex/` (parsing, analytics, report) · `streamlit_app.py` (UI) ·
+`tests/` · `data/` (bundled sample).
