@@ -13,9 +13,11 @@ import plotly.graph_objects as go
 import streamlit as st
 
 from dealer_gex.analytics import (
-    Analysis, analyze, block_levels, flow_books, fmt_dollars, magnet_levels,
-    oi_levels, oi_walls,
+    Analysis, analyze, block_levels, confluence_levels, data_quality, flow_books,
+    fmt_dollars, magnet_levels, oi_levels, oi_walls,
 )
+
+_CONF_ICON = {"high": "🟢", "medium": "🟡", "low": "🔴"}
 from dealer_gex.parsing import (
     ChainParseError, ParsedFile, aggregate_prints, normalize_chain, parse_file,
 )
@@ -481,6 +483,40 @@ def oi_levels_section(a: Analysis, levels: pd.DataFrame) -> None:
         )
 
 
+def confluence_section(a: Analysis, master: pd.DataFrame, dq: dict) -> None:
+    st.subheader("🎯 Master levels (confluence)")
+    if dq["level"] != "high":
+        icon = "⚠️" if dq["level"] == "low" else "📊"
+        st.warning(
+            f"{_CONF_ICON[dq['level']]} Data quality: **{dq['level']}**. "
+            + " ".join(dq["notes"]) + " Treat levels with extra caution.",
+            icon=icon,
+        )
+    if master.empty:
+        st.info("Not enough level structure to score confluence.")
+        return
+    view = pd.DataFrame({
+        "Level": master["level"].map(lambda x: f"{x:,.2f}"),
+        "Role": master["role"],
+        "score": master["score"],
+        "Confidence": master["confidence"].map(lambda c: f"{_CONF_ICON[c]} {c}"),
+        "Layers": master["n_layers"],
+        "Confirmed by": master["layers"].map(lambda ls: ", ".join(ls)),
+        "Distance": master["distance_pct"].map(lambda x: f"{x:+.1f}%"),
+    })
+    st.dataframe(
+        view, use_container_width=True, hide_index=True,
+        column_config={"score": st.column_config.ProgressColumn(
+            "Confluence", min_value=0, max_value=100, format="%.0f")},
+    )
+    st.caption(
+        "Every level system fused into one ranking — the more independent "
+        "layers agree on a price, the higher the score and confidence. "
+        "🟢 = 3+ layers confirm, 🟡 = 2, 🔴 = 1 (thin). Trade the top rows; "
+        "treat lone-layer levels as tentative."
+    )
+
+
 def history_section(hist: pd.DataFrame) -> None:
     st.subheader("🗓️ Level migration")
     series = [
@@ -687,10 +723,13 @@ def tables(a: Analysis) -> None:
 
 def report_section(a: Analysis, ticker: str, hist: pd.DataFrame | None = None,
                    blk_books: dict | None = None,
-                   blk_lvls: pd.DataFrame | None = None) -> None:
+                   blk_lvls: pd.DataFrame | None = None,
+                   master: pd.DataFrame | None = None,
+                   dq: dict | None = None) -> None:
     st.subheader("Report")
     md = build_markdown(a, ticker=ticker, history=hist,
-                        block_books=blk_books, block_lvls=blk_lvls)
+                        block_books=blk_books, block_lvls=blk_lvls,
+                        master=master, dq=dq)
     stem = f"dealer-positioning-{a.asof:%Y%m%d}"
     c1, c2, _ = st.columns([1, 1, 3])
     c1.download_button("Download report (.md)", md, file_name=f"{stem}.md",
@@ -913,28 +952,9 @@ def main() -> None:
             "sidebar. All levels depend on it.", icon="📍",
         )
 
-    verdict_banner(a)
-    if zero_dte:
-        st.caption(f"⏱️ 0DTE mode: {a.n_contracts:,} contracts expiring {a.asof} — "
-                   "this is the gamma that binds into today's close.")
-    metrics_row(a, zero_dte)
-
-    if hist is not None and len(hist) >= 2:
-        history_section(hist)
-        if len(campaign_days) >= 2:
-            campaign_section(campaign_days)
-
+    # --- compute all analytics up front so confluence can fuse them ---
     magnets = magnet_levels(a)
     oi_lvls = oi_levels(a)
-    gex_by_strike_chart(a, magnets)
-    col1, col2 = st.columns(2)
-    with col1:
-        gex_curve_chart(a)
-    with col2:
-        oi_chart(a, oi_lvls)
-
-    magnet_section(a, magnets)
-    oi_levels_section(a, oi_lvls)
 
     merged_prints = None
     if all_prints:
@@ -948,6 +968,36 @@ def main() -> None:
     if merged_prints is not None and merged_prints["is_block"].any():
         blk_books = flow_books(merged_prints, a.spot, a.asof, rate, multiplier=multiplier)
         blk_lvls = block_levels(merged_prints, a.spot)
+
+    master = confluence_levels(a, magnets, oi_lvls,
+                               blk_lvls if not blk_lvls.empty else None)
+    dq = data_quality(a, merged_prints)
+
+    # --- render ---
+    verdict_banner(a)
+    if zero_dte:
+        st.caption(f"⏱️ 0DTE mode: {a.n_contracts:,} contracts expiring {a.asof} — "
+                   "this is the gamma that binds into today's close.")
+    metrics_row(a, zero_dte)
+
+    confluence_section(a, master, dq)
+
+    if hist is not None and len(hist) >= 2:
+        history_section(hist)
+        if len(campaign_days) >= 2:
+            campaign_section(campaign_days)
+
+    gex_by_strike_chart(a, magnets)
+    col1, col2 = st.columns(2)
+    with col1:
+        gex_curve_chart(a)
+    with col2:
+        oi_chart(a, oi_lvls)
+
+    magnet_section(a, magnets)
+    oi_levels_section(a, oi_lvls)
+
+    if blk_books or not blk_lvls.empty:
         block_section(a, merged_prints, blk_books, blk_lvls)
 
     if not history:
@@ -958,7 +1008,7 @@ def main() -> None:
 
     playbook_section(a)
     tables(a)
-    report_section(a, ticker, hist, blk_books, blk_lvls)
+    report_section(a, ticker, hist, blk_books, blk_lvls, master, dq)
 
     with st.expander("Methodology & assumptions"):
         st.markdown(

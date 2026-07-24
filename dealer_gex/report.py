@@ -168,7 +168,9 @@ def build_playbook(a: Analysis) -> list[str]:
 def build_markdown(a: Analysis, ticker: str = "",
                    history: pd.DataFrame | None = None,
                    block_books: dict | None = None,
-                   block_lvls: pd.DataFrame | None = None) -> str:
+                   block_lvls: pd.DataFrame | None = None,
+                   master: pd.DataFrame | None = None,
+                   dq: dict | None = None) -> str:
     title, body = regime_text(a.regime)
     label = f"{ticker.upper()} " if ticker else ""
     flip = f"{a.gamma_flip:,.2f}" if a.gamma_flip is not None else "no crossing in ±15% range"
@@ -180,6 +182,30 @@ def build_markdown(a: Analysis, ticker: str = "",
         "",
         body,
         "",
+    ]
+
+    if dq is not None and dq["level"] != "high":
+        lines += [f"> **Data quality: {dq['level']}.** {' '.join(dq['notes'])}", ""]
+
+    if master is not None and not master.empty:
+        lines += [
+            "## Master levels (confluence)",
+            "",
+            "The levels confirmed by the most independent systems — trade the "
+            "top rows, treat lone-layer levels as tentative.",
+            "",
+            "| Level | Role | Confluence | Confidence | Confirmed by |",
+            "|---|---|---|---|---|",
+        ]
+        for _, r in master.iterrows():
+            lines.append(
+                f"| {r['level']:,.2f} | {r['role']} | {r['score']:.0f} "
+                f"| {r['confidence']} ({r['n_layers']} layers) "
+                f"| {', '.join(r['layers'])} |"
+            )
+        lines.append("")
+
+    lines += [
         "## Key levels",
         "",
         "| Level | Value | Meaning |",

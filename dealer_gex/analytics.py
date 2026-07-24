@@ -619,6 +619,137 @@ def block_campaigns(day_prints: list[tuple[date, pd.DataFrame]],
     return df
 
 
+def data_quality(a: "Analysis", prints: pd.DataFrame | None = None) -> dict:
+    """Honest read on how much to trust today's levels. Returns
+    {'level': high|medium|low, 'notes': [...], ...}. Thin chains, light OI,
+    and a high undirected-print ratio all soften the signal."""
+    order = {"high": 2, "medium": 1, "low": 0}
+    level, notes = "high", []
+
+    def cap(l: str) -> None:
+        nonlocal level
+        if order[l] < order[level]:
+            level = l
+
+    total_oi = float(a.by_strike[["call_oi", "put_oi"]].to_numpy().sum())
+    if a.n_contracts < 25:
+        notes.append(f"Only {a.n_contracts} contracts — levels are sparse and jumpy.")
+        cap("low")
+    elif a.n_contracts < 80:
+        notes.append(f"{a.n_contracts} contracts — moderate coverage.")
+        cap("medium")
+    if total_oi and total_oi < 20000:
+        notes.append("Light total open interest — walls may not hold.")
+        cap("medium")
+
+    signed_ratio = None
+    if prints is not None and len(prints) and "signed_size" in prints:
+        undirected = float((prints["signed_size"] == 0).mean())
+        signed_ratio = 1 - undirected
+        if a.weight_mode == "flow" and undirected > 0.5:
+            notes.append(f"{undirected:.0%} of prints are mid/undirected — "
+                         "signed-flow direction is soft.")
+            cap("medium")
+
+    return {"level": level, "notes": notes, "n_contracts": a.n_contracts,
+            "total_oi": total_oi, "signed_ratio": signed_ratio}
+
+
+def _confluence_role(families: set, center: float, spot: float) -> str:
+    if "flip" in families:
+        return "Regime pivot"
+    base = "Resistance" if center > spot else "Support"
+    if "accel" in families and "magnet" not in families:
+        return f"{base} · accelerator"
+    if "magnet" in families or "max_pain" in families:
+        return f"{base} · pin"
+    return base
+
+
+def confluence_levels(a: "Analysis", magnets: pd.DataFrame | None = None,
+                      oi_lvls: pd.DataFrame | None = None,
+                      block_lvls: pd.DataFrame | None = None,
+                      band: float | None = None, top_n: int = 6) -> pd.DataFrame:
+    """Fuse every level system into one ranked master table. Each source
+    contributes a weighted vote to a price; nearby votes cluster, and the
+    cluster's total weight becomes a 0-100 confluence score. A level
+    confirmed by many independent layers is the one to trade.
+
+    Columns: level, score, n_layers, layers (list), role, distance_pct,
+    confidence (high/medium/low — from the count of distinct layer families).
+    """
+    if magnets is None:
+        magnets = magnet_levels(a)
+    if oi_lvls is None:
+        oi_lvls = oi_levels(a)
+    ow = oi_walls(a)
+    ks = a.by_strike["strike"].to_numpy()
+    spacing = float(np.median(np.diff(np.sort(np.unique(ks))))) if len(ks) > 1 else a.spot * 0.005
+    if band is None:
+        band = max(spacing * 0.5, a.spot * 0.0015)
+
+    # (price, weight, label, family)
+    src: list[tuple] = [
+        (a.call_wall, 1.0, "Gamma call wall", "gamma_wall"),
+        (a.put_wall, 1.0, "Gamma put wall", "gamma_wall"),
+        (a.max_pain, 0.6, "Max pain", "max_pain"),
+    ]
+    if a.gamma_flip is not None:
+        src.append((a.gamma_flip, 0.9, "Gamma flip", "flip"))
+    if ow.call is not None:
+        src.append((ow.call, 1.0, "Call OI wall", "oi_wall"))
+    if ow.put is not None:
+        src.append((ow.put, 1.0, "Put OI wall", "oi_wall"))
+    for _, r in magnets.iterrows():
+        if r["kind"] == "magnet":
+            src.append((r["level"], r["strength"] / 100, "Magnet", "magnet"))
+        else:
+            src.append((r["level"], 0.8 * r["strength"] / 100, "Accelerator", "accel"))
+    for _, r in oi_lvls.iterrows():
+        src.append((r["level"], 0.8 * r["strength"] / 100,
+                    f"OI cluster ({r['side']})", "oi_cluster"))
+    if block_lvls is not None:
+        for _, r in block_lvls.iterrows():
+            src.append((r["level"], 1.2 * r["strength"] / 100,
+                        f"Block {r['direction']}", "block"))
+
+    src = [s for s in src if s[0] is not None and abs(s[0] / a.spot - 1) <= 0.12 and s[1] > 0]
+    cols = ["level", "score", "n_layers", "layers", "role", "distance_pct", "confidence"]
+    if not src:
+        return pd.DataFrame(columns=cols)
+
+    src.sort(key=lambda s: s[0])
+    clusters, cur = [], [src[0]]
+    for s in src[1:]:
+        if s[0] - cur[-1][0] <= band:
+            cur.append(s)
+        else:
+            clusters.append(cur)
+            cur = [s]
+    clusters.append(cur)
+
+    rows = []
+    for cl in clusters:
+        w = sum(x[1] for x in cl)
+        center = sum(x[0] * x[1] for x in cl) / w
+        fams = {x[3] for x in cl}
+        seen, labels = set(), []
+        for x in sorted(cl, key=lambda y: -y[1]):
+            if x[2] not in seen:
+                seen.add(x[2])
+                labels.append(x[2])
+        rows.append((center, w, len(fams), labels,
+                     _confluence_role(fams, center, a.spot),
+                     (center / a.spot - 1) * 100))
+    df = pd.DataFrame(rows, columns=["level", "weight", "n_layers", "layers",
+                                     "role", "distance_pct"])
+    df = df.sort_values("weight", ascending=False).head(top_n).reset_index(drop=True)
+    df["score"] = (100 * df["weight"] / df["weight"].max()).round(0)
+    df["confidence"] = df["n_layers"].map(
+        lambda n: "high" if n >= 3 else "medium" if n == 2 else "low")
+    return df[cols]
+
+
 def max_pain(chain: pd.DataFrame) -> float:
     """Level minimizing the total intrinsic payout to option holders.
 

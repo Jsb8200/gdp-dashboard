@@ -527,6 +527,83 @@ def test_block_campaigns_multi_day():
     assert block_campaigns([(_date(2026, 7, 14), day1)]).empty
 
 
+def test_confluence_levels_fuses_layers():
+    from dealer_gex.analytics import confluence_levels
+
+    chain, spot = read_chain((REPO / "data" / "sample_option_chain.csv").read_bytes())
+    a = analyze(chain, spot, ASOF)
+    m = confluence_levels(a)
+    assert not m.empty
+    # ranked by score, normalized to 100
+    assert list(m["score"]) == sorted(m["score"], reverse=True)
+    assert m["score"].iloc[0] == 100
+    # the top level is confirmed by multiple independent layers
+    assert m["n_layers"].iloc[0] >= 3
+    assert m["confidence"].iloc[0] == "high"
+    # confidence tracks layer count
+    for _, r in m.iterrows():
+        expected = "high" if r["n_layers"] >= 3 else "medium" if r["n_layers"] == 2 else "low"
+        assert r["confidence"] == expected
+    # 600 (put wall + OI fortress + accelerator cluster) should surface strongly
+    assert any(abs(x - 600) < 5 for x in m["level"])
+
+
+def test_confidence_vs_data_quality_are_independent():
+    """Layer-confidence measures how many systems agree; data_quality
+    measures whether the underlying data is trustworthy. A lone strike can
+    show high layer-confluence yet fail the data-quality gate — that split
+    is the design."""
+    from dealer_gex.analytics import confluence_levels, data_quality
+
+    rows = [{"expiry": pd.Timestamp("2026-08-21"), "strike": 100.0, "type": t,
+             "open_interest": 500.0, "volume": 0.0, "iv": 0.25, "gamma": np.nan}
+            for t in ("C", "P")]
+    a = analyze(pd.DataFrame(rows), spot=100.0, asof=ASOF)
+    m = confluence_levels(a)
+    # multiple systems pile onto the single strike -> layer-confidence can be high
+    assert not m.empty
+    # but the data-quality gate catches the thinness (2 contracts)
+    assert data_quality(a)["level"] == "low"
+
+
+def test_data_quality_flags():
+    from dealer_gex.analytics import data_quality
+    from dealer_gex.parsing import parse_file
+
+    chain, spot = read_chain((REPO / "data" / "sample_option_chain.csv").read_bytes())
+    a = analyze(chain, spot, ASOF)
+    dq = data_quality(a)
+    assert dq["level"] == "high" and dq["n_contracts"] > 80
+
+    thin = analyze(pd.DataFrame([
+        {"expiry": pd.Timestamp("2026-08-21"), "strike": 100.0, "type": "C",
+         "open_interest": 50.0, "volume": 0.0, "iv": 0.25, "gamma": np.nan},
+        {"expiry": pd.Timestamp("2026-08-21"), "strike": 100.0, "type": "P",
+         "open_interest": 50.0, "volume": 0.0, "iv": 0.25, "gamma": np.nan},
+    ]), spot=100.0, asof=ASOF)
+    dq_thin = data_quality(thin)
+    assert dq_thin["level"] == "low" and dq_thin["notes"]
+
+    # flow file with mostly mid prints -> soft signed-flow note
+    pf = parse_file(QUANTDATA_CSV)
+    qqq_ch = pf.chain[pf.chain["ticker"] == "QQQ"]
+    a_flow = analyze(qqq_ch, pf.spots["QQQ"], pf.asof, weight="flow")
+    dq_flow = data_quality(a_flow, pf.prints[pf.prints["ticker"] == "QQQ"])
+    assert dq_flow["signed_ratio"] is not None
+
+
+def test_report_master_levels_section():
+    from dealer_gex.analytics import confluence_levels, data_quality
+    from dealer_gex.report import build_markdown
+
+    chain, spot = read_chain((REPO / "data" / "sample_option_chain.csv").read_bytes())
+    a = analyze(chain, spot, ASOF)
+    m = confluence_levels(a)
+    md = build_markdown(a, ticker="SPY", master=m, dq=data_quality(a))
+    assert "## Master levels (confluence)" in md
+    assert "Confirmed by" in md
+
+
 def test_fmt_dollars():
     assert fmt_dollars(1_460_000_000) == "$1.46B"
     assert fmt_dollars(-441_430_000) == "-$441.43M"
