@@ -83,6 +83,33 @@ def _parse(file_bytes: bytes):
     return parse_file(file_bytes)
 
 
+@st.cache_data(show_spinner=False)
+def _analyze_cached(chain, spot, asof, rate, weight, multiplier):
+    """Cached analyze — reused by the scenario slider and history loop so
+    unchanged (spot, IV) states don't re-run the GEX grid + flip bisection."""
+    return analyze(chain, spot, asof, rate, weight=weight, multiplier=multiplier)
+
+
+@st.cache_data(show_spinner=False)
+def _main_bundle(chain, spot, asof, rate, weight, multiplier, prints):
+    """All main-view analytics in one cached unit, keyed on the inputs that
+    actually change. Keeps the whole level stack stable while the scenario
+    slider (which passes a *different* spot) drags — only the scenario's own
+    analyze recomputes, so interaction is near-instant on big files."""
+    a = analyze(chain, spot, asof, rate, weight=weight, multiplier=multiplier)
+    magnets = magnet_levels(a)
+    oi_lvls = oi_levels(a)
+    blk_books, blk_lvls = {}, pd.DataFrame()
+    if prints is not None and "is_block" in prints and prints["is_block"].any():
+        blk_books = flow_books(prints, a.spot, a.asof, rate, multiplier=multiplier)
+        blk_lvls = block_levels(prints, a.spot)
+    master = confluence_levels(a, magnets, oi_lvls,
+                               blk_lvls if not blk_lvls.empty else None)
+    dq = data_quality(a, prints)
+    lean = directional_lean(a, prints)
+    return a, magnets, oi_lvls, blk_books, blk_lvls, master, dq, lean
+
+
 def _manual_mapping_ui(name: str, file_bytes: bytes) -> pd.DataFrame | None:
     """Fallback column-mapping UI when auto-detection fails."""
     try:
@@ -200,7 +227,7 @@ def scenario_section(a: Analysis, chain: pd.DataFrame, asof, rate: float,
     if iv_shift:
         ch = chain.assign(iv=(chain["iv"] + iv_shift / 100.0).clip(lower=0.005))
     try:
-        s = analyze(ch, spot_h, asof, rate, weight=weight, multiplier=multiplier)
+        s = _analyze_cached(ch, spot_h, asof, rate, weight, multiplier)
     except ValueError as exc:
         st.error(str(exc))
         return
@@ -945,6 +972,27 @@ def main() -> None:
             if picked and len(picked) < len(all_exp):
                 chain = chain[chain["expiry"].dt.date.isin(picked)]
 
+    # prints for this ticker (flow-file extras) — needed by both paths
+    merged_prints = None
+    if all_prints:
+        merged_prints = pd.concat(all_prints, ignore_index=True)
+        if file_tickers and len(file_tickers) > 1:
+            merged_prints = merged_prints[merged_prints["ticker"] == ticker]
+        if merged_prints.empty:
+            merged_prints = None
+
+    def _derive(a, prints):
+        """Level stack from an Analysis + prints (shared by both paths)."""
+        magnets = magnet_levels(a)
+        oi_lvls = oi_levels(a)
+        blk_books, blk_lvls = {}, pd.DataFrame()
+        if prints is not None and prints["is_block"].any():
+            blk_books = flow_books(prints, a.spot, a.asof, rate, multiplier=multiplier)
+            blk_lvls = block_levels(prints, a.spot)
+        master = confluence_levels(a, magnets, oi_lvls,
+                                   blk_lvls if not blk_lvls.empty else None)
+        return magnets, oi_lvls, blk_books, blk_lvls, master
+
     hist = None
     campaign_days: list = []
     if history:
@@ -957,15 +1005,14 @@ def main() -> None:
             if ch is None or sp is None:
                 continue
             try:
-                ai = analyze(ch, sp, pf.asof, rate, weight=weight, multiplier=multiplier)
+                ai = _analyze_cached(ch, sp, pf.asof, rate, weight, multiplier)
             except ValueError:
                 continue
             walls_oi = _oiw(ai)
-            cw_oi, pw_oi = walls_oi.call, walls_oi.put
             rows.append({
                 "date": pf.asof, "spot": sp, "flip": ai.gamma_flip,
                 "call_wall": ai.call_wall, "put_wall": ai.put_wall,
-                "call_oi_wall": cw_oi, "put_oi_wall": pw_oi,
+                "call_oi_wall": walls_oi.call, "put_oi_wall": walls_oi.put,
                 "max_pain": ai.max_pain, "net_gex": ai.total_gex,
                 "regime": ai.regime,
             })
@@ -984,9 +1031,13 @@ def main() -> None:
         st.info(f"History mode: levels below are for the latest day "
                 f"(**{a.asof}**); the migration view covers {len(hist)} days.",
                 icon="🗓️")
+        magnets, oi_lvls, blk_books, blk_lvls, master = _derive(a, merged_prints)
+        dq = data_quality(a, merged_prints)
+        lean = directional_lean(a, merged_prints)
     else:
         try:
-            a = analyze(chain, spot, asof, rate, weight=weight, multiplier=multiplier)
+            a, magnets, oi_lvls, blk_books, blk_lvls, master, dq, lean = _main_bundle(
+                chain, spot, asof, rate, weight, multiplier, merged_prints)
         except ValueError as exc:
             st.error(f"{exc} — check the as-of date against the chain's expiries.")
             return
@@ -994,34 +1045,11 @@ def main() -> None:
     if weight == "volume" and chain["volume"].sum() == 0:
         st.warning("This file has no volume data — volume weighting shows nothing. "
                    "Switch back to open interest.", icon="⚠️")
-
     if inferred_spot is None:
         st.warning(
             "No underlying price found in the file — set the spot price in the "
             "sidebar. All levels depend on it.", icon="📍",
         )
-
-    # --- compute all analytics up front so confluence can fuse them ---
-    magnets = magnet_levels(a)
-    oi_lvls = oi_levels(a)
-
-    merged_prints = None
-    if all_prints:
-        merged_prints = pd.concat(all_prints, ignore_index=True)
-        if file_tickers and len(file_tickers) > 1:
-            merged_prints = merged_prints[merged_prints["ticker"] == ticker]
-        if merged_prints.empty:
-            merged_prints = None
-
-    blk_books, blk_lvls = {}, pd.DataFrame()
-    if merged_prints is not None and merged_prints["is_block"].any():
-        blk_books = flow_books(merged_prints, a.spot, a.asof, rate, multiplier=multiplier)
-        blk_lvls = block_levels(merged_prints, a.spot)
-
-    master = confluence_levels(a, magnets, oi_lvls,
-                               blk_lvls if not blk_lvls.empty else None)
-    dq = data_quality(a, merged_prints)
-    lean = directional_lean(a, merged_prints)
 
     # --- render ---
     verdict_banner(a)

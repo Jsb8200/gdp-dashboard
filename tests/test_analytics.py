@@ -592,6 +592,22 @@ def test_data_quality_flags():
     assert dq_flow["signed_ratio"] is not None
 
 
+def test_report_dedups_ladder_when_master_present():
+    from dealer_gex.analytics import confluence_levels
+    from dealer_gex.report import build_markdown
+
+    chain, spot = read_chain((REPO / "data" / "sample_option_chain.csv").read_bytes())
+    a = analyze(chain, spot, ASOF)
+    m = confluence_levels(a)
+    # with the confluence master table, the flat ladder is dropped
+    with_master = build_markdown(a, ticker="SPY", master=m)
+    assert "## Master levels (confluence)" in with_master
+    assert "## Level ladder" not in with_master
+    # without it, the ladder is the fallback
+    without = build_markdown(a, ticker="SPY")
+    assert "## Level ladder" in without
+
+
 def test_report_master_levels_section():
     from dealer_gex.analytics import confluence_levels, data_quality
     from dealer_gex.report import build_markdown

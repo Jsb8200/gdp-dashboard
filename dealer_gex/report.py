@@ -306,16 +306,19 @@ def build_markdown(a: Analysis, ticker: str = "",
     for bullet in build_playbook(a, master=master, lean=lean):
         lines.append(f"- {bullet}")
 
-    ladder = key_ladder(a)
-    lines += [
-        "",
-        "## Level ladder",
-        "",
-        "| Level | Price | Reading |",
-        "|---|---|---|",
-    ]
-    for _, r in ladder.iterrows():
-        lines.append(f"| {r['Level']} | {r['Price']:,.2f} | {r['Reading']} |")
+    # The confluence "Master levels" table supersedes the flat price-sorted
+    # ladder; only fall back to the ladder when confluence wasn't computed.
+    if master is None or master.empty:
+        ladder = key_ladder(a)
+        lines += [
+            "",
+            "## Level ladder",
+            "",
+            "| Level | Price | Reading |",
+            "|---|---|---|",
+        ]
+        for _, r in ladder.iterrows():
+            lines.append(f"| {r['Level']} | {r['Price']:,.2f} | {r['Reading']} |")
 
     magnets = magnet_levels(a)
     if not magnets.empty:
