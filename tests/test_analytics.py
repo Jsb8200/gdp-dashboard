@@ -639,6 +639,28 @@ def test_directional_lean_neutral_without_flow():
     assert len(L["components"]) == 1
 
 
+def test_executive_summary_and_confluence_playbook():
+    from dealer_gex.analytics import confluence_levels, directional_lean
+    from dealer_gex.report import build_playbook, executive_summary
+
+    chain, spot = read_chain((REPO / "data" / "sample_option_chain.csv").read_bytes())
+    a = analyze(chain, spot, ASOF)
+    m = confluence_levels(a)
+    lean = directional_lean(a)
+
+    tldr = executive_summary(a, m, lean)
+    assert tldr[0].isupper() and tldr.endswith(".")
+    assert ". o" not in tldr and ". t" not in tldr  # every sentence capitalized
+    assert f"{m.iloc[0]['level']:,.2f}" in tldr     # names the top confluence level
+
+    pb = build_playbook(a, master=m, lean=lean)
+    # the playbook now leads with the confluence ranking, not a lone wall
+    assert "confluence" in pb[0].lower()
+    assert f"{m.iloc[0]['level']:,.2f}" in pb[0]
+    # and folds in the lean as a tiebreaker
+    assert any("Positioning lean" in b for b in pb) == lean["has_flow"]
+
+
 def test_report_directional_lean_section():
     from dealer_gex.analytics import directional_lean
     from dealer_gex.report import build_markdown

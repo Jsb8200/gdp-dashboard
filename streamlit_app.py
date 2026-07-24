@@ -22,7 +22,8 @@ from dealer_gex.parsing import (
     ChainParseError, ParsedFile, aggregate_prints, normalize_chain, parse_file,
 )
 from dealer_gex.report import (
-    build_markdown, build_playbook, key_ladder, markdown_to_html, regime_text,
+    build_markdown, build_playbook, executive_summary, key_ladder,
+    markdown_to_html, regime_text,
 )
 
 SAMPLE_PATH = Path(__file__).parent / "data" / "sample_option_chain.csv"
@@ -735,12 +736,15 @@ def notable_flow_section(prints: pd.DataFrame, spot: float) -> None:
     )
 
 
-def playbook_section(a: Analysis) -> None:
+def playbook_section(a: Analysis, master: pd.DataFrame | None = None,
+                     lean: dict | None = None) -> None:
     st.subheader("Trading interpretation")
     left, right = st.columns([3, 2])
     with left:
         # escape $ so st.markdown doesn't read paired dollars as LaTeX math
-        st.markdown("\n".join(f"- {b}" for b in build_playbook(a)).replace("$", "\\$"))
+        st.markdown("\n".join(
+            f"- {b}" for b in build_playbook(a, master=master, lean=lean)
+        ).replace("$", "\\$"))
     with right:
         ladder = key_ladder(a).copy()
         ladder["Price"] = ladder["Price"].map(lambda x: f"{x:,.2f}")
@@ -1021,6 +1025,7 @@ def main() -> None:
 
     # --- render ---
     verdict_banner(a)
+    st.markdown("**TL;DR** — " + executive_summary(a, master, lean).replace("$", "\\$"))
     if zero_dte:
         st.caption(f"⏱️ 0DTE mode: {a.n_contracts:,} contracts expiring {a.asof} — "
                    "this is the gamma that binds into today's close.")
@@ -1053,7 +1058,7 @@ def main() -> None:
     if merged_prints is not None:
         notable_flow_section(merged_prints, a.spot)
 
-    playbook_section(a)
+    playbook_section(a, master, lean)
     tables(a)
     report_section(a, ticker, hist, blk_books, blk_lvls, master, dq, lean)
 

@@ -62,10 +62,48 @@ def _fmt_flow(x: float) -> str:
     return f"~{fmt_dollars(abs(x))} of {verb}"
 
 
-def build_playbook(a: Analysis) -> list[str]:
+def executive_summary(a: Analysis, master: pd.DataFrame | None = None,
+                      lean: dict | None = None) -> str:
+    """One-paragraph TL;DR fusing regime, the top confluence level, and the
+    positioning lean — the single-glance read the rest of the page expands."""
+    regime = "long gamma (moves dampened, mean-reverting)" if a.regime == "long_gamma" \
+        else "short gamma (moves amplified, trending)"
+    bits = [f"Dealers are **{regime}**"]
+    if a.gamma_flip is not None:
+        bits[0] += f"; the regime flips at **{a.gamma_flip:,.2f}**"
+    if master is not None and not master.empty:
+        top = master.iloc[0]
+        bits.append(
+            f"the strongest level is **{top['level']:,.2f}** "
+            f"({top['role'].lower()}, {int(top['n_layers'])} systems agree, "
+            f"{top['confidence']} confidence)"
+        )
+    if a.expected_move is not None:
+        bits.append(f"options price a ±{a.expected_move:,.2f} move to "
+                    f"{a.nearest_expiry}")
+    if lean is not None:
+        bits.append(f"positioning shows a **{lean['label'].lower()}** "
+                    f"({lean['confidence']} confidence)")
+    return ". ".join(s[0].upper() + s[1:] for s in bits) + "."
+
+
+def build_playbook(a: Analysis, master: pd.DataFrame | None = None,
+                   lean: dict | None = None) -> list[str]:
     """Turn the day's numbers into a trading interpretation (markdown bullets)."""
     long_g = a.regime == "long_gamma"
     lines = []
+
+    if master is not None and not master.empty:
+        top = master.head(3)
+        named = "; ".join(
+            f"**{r['level']:,.2f}** ({r['role'].lower()}, score {r['score']:.0f})"
+            for _, r in top.iterrows()
+        )
+        lines.append(
+            f"**Key levels by confluence: {named}.** These are where the most "
+            "independent systems agree — trade their reactions first; the "
+            "individual walls and magnets below are the components."
+        )
 
     if long_g:
         lines.append(
@@ -147,6 +185,19 @@ def build_playbook(a: Analysis) -> list[str]:
         "into the close and ahead of expiry."
     )
 
+    if lean is not None and lean["has_flow"]:
+        strong = [c for c in lean["components"]
+                  if c[0].startswith(("Order-flow", "Block"))]
+        detail = "; ".join(
+            f"{n.split('(')[0].strip().lower()} {'bullish' if v > 8 else 'bearish' if v < -8 else 'neutral'}"
+            for n, v, _ in strong) if strong else ""
+        lines.append(
+            f"**Positioning lean: {lean['label']}** (score {lean['score']:+.0f}, "
+            f"{lean['confidence']} confidence"
+            + (f" — {detail}" if detail else "") + "). A tiebreaker on the levels "
+            "above, not an entry trigger: news and live flow override it."
+        )
+
     if a.weight_mode == "volume":
         lines.append(
             "**Volume-weighted (intraday) view** — levels reflect today's traded "
@@ -177,6 +228,8 @@ def build_markdown(a: Analysis, ticker: str = "",
 
     lines = [
         f"# {label}Dealer Positioning Report — {a.asof:%Y-%m-%d}",
+        "",
+        f"**TL;DR** — {executive_summary(a, master, lean)}",
         "",
         f"## Verdict: {title}",
         "",
@@ -250,7 +303,7 @@ def build_markdown(a: Analysis, ticker: str = "",
         "## Trading interpretation",
         "",
     ]
-    for bullet in build_playbook(a):
+    for bullet in build_playbook(a, master=master, lean=lean):
         lines.append(f"- {bullet}")
 
     ladder = key_ladder(a)
