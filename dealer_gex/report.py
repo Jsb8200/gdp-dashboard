@@ -221,7 +221,8 @@ def build_markdown(a: Analysis, ticker: str = "",
                    block_books: dict | None = None,
                    block_lvls: pd.DataFrame | None = None,
                    master: pd.DataFrame | None = None,
-                   dq: dict | None = None, lean: dict | None = None) -> str:
+                   dq: dict | None = None, lean: dict | None = None,
+                   dark_lvls: pd.DataFrame | None = None) -> str:
     title, body = regime_text(a.regime)
     label = f"{ticker.upper()} " if ticker else ""
     flip = f"{a.gamma_flip:,.2f}" if a.gamma_flip is not None else "no crossing in ±15% range"
@@ -396,6 +397,20 @@ def build_markdown(a: Analysis, ticker: str = "",
             lines.append(
                 f"| {r['level']:,.2f} | {side_label[r['side']]} | {dir_label[r['direction']]} "
                 f"| {r['strength']:.0f} | {fmt_dollars(r['premium'])} | {r['distance_pct']:+.1f}% |"
+            )
+
+    if dark_lvls is not None and not dark_lvls.empty:
+        lines += [
+            "",
+            "## Dark-pool levels (institutional block prints)",
+            "",
+            "| Level | Weight | Premium | Distance |",
+            "|---|---|---|---|",
+        ]
+        for _, r in dark_lvls.iterrows():
+            lines.append(
+                f"| {r['level']:,.2f} | {r['strength']:.0f} "
+                f"| {fmt_dollars(r['premium'])} | {r['distance_pct']:+.1f}% |"
             )
 
     oi = oi_levels(a)

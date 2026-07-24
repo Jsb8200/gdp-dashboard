@@ -86,6 +86,17 @@ class ParsedFile:
     asof: date | None = None          # last trade date for flow files
     tickers: list[str] = field(default_factory=list)  # by activity, descending
     prints: pd.DataFrame | None = None  # normalized per-print rows (flow files only)
+    dark: pd.DataFrame | None = None    # normalized dark-pool prints (equity blocks)
+
+
+# Dark-pool (equity block) exports: no strike/expiry/option-type, just
+# price + size per print. Matched with a dedicated vocabulary.
+DP_PRICE = {"price", "tradeprice", "fillprice", "executionprice", "lastprice", "fill"}
+DP_SIZE = {"size", "quantity", "qty", "shares", "tradesize"}
+DP_VALUE = {"premium", "value", "notional", "dollarvolume", "tradevalue",
+            "premiumprice", "dollars"}
+DP_TIME = {"time", "tradetime", "timestamp", "datetime"}
+DP_TICKER = {"ticker", "symbol", "underlyingsymbol"}
 
 
 def _norm(name: str) -> str:
@@ -125,6 +136,56 @@ def _find_header_row(text: str) -> tuple[int, float | None]:
     )
 
 
+def _try_dark_pool(text: str) -> ParsedFile | None:
+    """Detect and parse an equity dark-pool / block-print export: price +
+    size per row, with no strike/expiry/option-type. Returns a ParsedFile
+    whose ``dark`` frame is set, or None if the file isn't dark-pool."""
+    try:
+        raw = pd.read_csv(io.StringIO(text), nrows=200)
+    except Exception:
+        return None
+    norm = {c: _norm(_strip_dup_suffix(c)) for c in raw.columns}
+    vals = set(norm.values())
+
+    def pick(vocab):
+        for col, n in norm.items():
+            if n in vocab:
+                return col
+        return None
+
+    price_c, size_c = pick(DP_PRICE), pick(DP_SIZE)
+    has_strike = any(v in SYNONYMS["strike"] for v in vals)
+    has_type = any(v in SYNONYMS["type"] for v in vals)
+    if price_c is None or size_c is None or has_strike or has_type:
+        return None
+
+    raw = pd.read_csv(io.StringIO(text))
+    tkr_c, val_c, time_c = pick(DP_TICKER), pick(DP_VALUE), pick(DP_TIME)
+    df = pd.DataFrame({
+        "ticker": raw[tkr_c].astype(str) if tkr_c else "",
+        "price": _to_num(raw[price_c]),
+        "size": _to_num(raw[size_c]).fillna(0),
+    })
+    df["premium"] = _to_num(raw[val_c]) if val_c else df["price"] * df["size"]
+    df["premium"] = df["premium"].fillna(df["price"] * df["size"]).fillna(0)
+    df["time"] = (pd.to_datetime(raw[time_c], errors="coerce", utc=True, format="ISO8601")
+                  if time_c else pd.NaT)
+    df = df.dropna(subset=["price"])
+    df = df[df["price"] > 0]
+    if df.empty:
+        return None
+
+    spots, tickers = {}, []
+    if tkr_c:
+        ordered = df.sort_values("time", na_position="first") if time_c else df
+        for tk, sub in ordered.groupby("ticker"):
+            spots[str(tk)] = float(sub["price"].iloc[-1])
+        tickers = list(df["ticker"].value_counts().index.astype(str))
+    asof = df["time"].max().date() if time_c and df["time"].notna().any() else None
+    return ParsedFile(chain=df.iloc[0:0], spots=spots, asof=asof,
+                      tickers=tickers, dark=df)
+
+
 def parse_file(data: bytes | str) -> ParsedFile:
     """Parse raw CSV bytes/text into a canonical chain plus file context.
 
@@ -133,6 +194,9 @@ def parse_file(data: bytes | str) -> ParsedFile:
     :func:`normalize_chain`.
     """
     text = data.decode("utf-8-sig", errors="replace") if isinstance(data, bytes) else data
+    dp = _try_dark_pool(text)
+    if dp is not None:
+        return dp
     header_row, spot = _find_header_row(text)
     raw = pd.read_csv(io.StringIO(text), skiprows=header_row)
 

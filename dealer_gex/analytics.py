@@ -564,6 +564,93 @@ def flow_books(prints: pd.DataFrame, spot: float, asof: date, rate: float = 0.04
     return books
 
 
+def session_range(prints: pd.DataFrame) -> tuple[float, float, float, float] | None:
+    """Reconstruct a session's (low, high, close, open) from the reference
+    price stamped on each print — the traded-through range, a stand-in for
+    the day's OHLC using only the data in the flow file."""
+    if prints is None or "ref_price" not in prints:
+        return None
+    sub = prints.dropna(subset=["ref_price"])
+    if sub.empty:
+        return None
+    lo, hi = float(sub["ref_price"].min()), float(sub["ref_price"].max())
+    if "trade_time" in sub and sub["trade_time"].notna().any():
+        s = sub.dropna(subset=["trade_time"]).sort_values("trade_time")
+        return lo, hi, float(s["ref_price"].iloc[-1]), float(s["ref_price"].iloc[0])
+    return lo, hi, float(sub["ref_price"].iloc[-1]), float(sub["ref_price"].iloc[0])
+
+
+def _role_kind(role: str) -> str:
+    if "pin" in role or role in ("Regime pivot", "At spot"):
+        return "pin"
+    if role.startswith("Support"):
+        return "support"
+    if role.startswith("Resistance"):
+        return "resistance"
+    return "pin"
+
+
+def level_hit_rate(days: list[dict], touch: float = 0.0015,
+                   brk: float = 0.003) -> tuple[pd.DataFrame, dict]:
+    """Did prior-day levels hold the next day? For each consecutive day
+    pair, test the earlier day's confluence levels against the later day's
+    reconstructed range.
+
+    ``days``: sorted list of {date, master (DataFrame), low, high, close}.
+    Support holds if price reached it (low ≤ level·(1+touch)) without
+    breaking through (low ≥ level·(1-brk)); resistance is the mirror; pins
+    hold if the range straddled the level and price closed within 2·touch.
+
+    Returns (detail_df, summary_dict). The summary carries overall and
+    per-confidence hit rates. Honest caveat: the range comes from print
+    reference prices, not exchange OHLC, and it is a small sample.
+    """
+    cols = ["from_date", "to_date", "level", "role", "confidence",
+            "type", "tested", "held", "outcome"]
+    rows = []
+    for prev, nxt in zip(days, days[1:]):
+        lo, hi, close = nxt["low"], nxt["high"], nxt["close"]
+        if prev.get("master") is None or prev["master"].empty:
+            continue
+        for _, lv in prev["master"].iterrows():
+            level, role, conf = float(lv["level"]), lv["role"], lv["confidence"]
+            kind = _role_kind(role)
+            tested = held = False
+            if kind == "support":
+                tested = lo <= level * (1 + touch)
+                held = tested and lo >= level * (1 - brk)
+            elif kind == "resistance":
+                tested = hi >= level * (1 - touch)
+                held = tested and hi <= level * (1 + brk)
+            else:  # pin
+                tested = lo <= level <= hi
+                held = tested and abs(close - level) <= level * touch * 2
+            outcome = "not tested" if not tested else ("held" if held else "broke")
+            rows.append((prev["date"], nxt["date"], level, role, conf,
+                         kind, tested, held, outcome))
+
+    detail = pd.DataFrame(rows, columns=cols)
+    tested = detail[detail["tested"]]
+    n_t = len(tested)
+    summary = {
+        "pairs": max(len(days) - 1, 0),
+        "tested": n_t,
+        "held": int(tested["held"].sum()) if n_t else 0,
+        "rate": float(tested["held"].mean()) if n_t else None,
+        "by_confidence": {
+            c: {"tested": int((tested["confidence"] == c).sum()),
+                "held": int(tested.loc[tested["confidence"] == c, "held"].sum())}
+            for c in ("high", "medium", "low")
+        },
+        "by_type": {
+            k: {"tested": int((tested["type"] == k).sum()),
+                "held": int(tested.loc[tested["type"] == k, "held"].sum())}
+            for k in ("support", "resistance", "pin")
+        },
+    }
+    return detail, summary
+
+
 def block_campaigns(day_prints: list[tuple[date, pd.DataFrame]],
                     min_days: int = 2, top_n: int = 10) -> pd.DataFrame:
     """Detect multi-day block campaigns: option contracts hit by block
@@ -735,6 +822,56 @@ def data_quality(a: "Analysis", prints: pd.DataFrame | None = None) -> dict:
             "total_oi": total_oi, "signed_ratio": signed_ratio}
 
 
+def darkpool_levels(dark: pd.DataFrame, spot: float, top_n: int = 5) -> pd.DataFrame:
+    """Price levels where dark-pool (equity block) size concentrated —
+    institutional interest zones that act as support/resistance. Kernel
+    density of traded size over price, weighted by dollar value.
+
+    Columns: level, strength (0-100), premium, size, distance_pct.
+    """
+    cols = ["level", "strength", "premium", "size", "distance_pct"]
+    if dark is None or dark.empty:
+        return pd.DataFrame(columns=cols)
+    d = dark[dark["price"].between(spot * 0.90, spot * 1.10)].copy()
+    if d.empty:
+        return pd.DataFrame(columns=cols)
+    # bin to a cent-ish grid, weight by premium (falls back to size)
+    per = d.groupby(d["price"].round(2)).agg(
+        premium=("premium", "sum"), size=("size", "sum")).reset_index()
+    px = per["price"].to_numpy()
+    w = per["premium"].to_numpy(dtype=float)
+    if w.sum() <= 0:
+        w = per["size"].to_numpy(dtype=float)
+    bw = max(spot * 0.001, 0.05)
+    lo, hi = spot * 0.90, spot * 1.10
+    grid = np.arange(lo, hi, bw)
+    dens = np.array([_kernel_density(px, w, x, bw) for x in grid])
+    if dens.max() <= 0:
+        return pd.DataFrame(columns=cols)
+
+    floor = 0.05 * dens.max()
+    rows = []
+    for i in range(1, len(grid) - 1):
+        if dens[i] > floor and dens[i] > dens[i - 1] and dens[i] >= dens[i + 1]:
+            level = _golden_max(lambda x: _kernel_density(px, w, x, bw),
+                                grid[i] - bw * 3, grid[i] + bw * 3)
+            near = per[np.abs(per["price"] - level) <= bw * 3]
+            rows.append((level, _kernel_density(px, w, level, bw),
+                         float(near["premium"].sum()), float(near["size"].sum()),
+                         (level / spot - 1) * 100))
+    if not rows:
+        return pd.DataFrame(columns=cols)
+    df = pd.DataFrame(rows, columns=cols)
+    df = df.sort_values("strength", ascending=False)
+    kept: list[int] = []
+    for idx, row in df.iterrows():
+        if all(abs(row["level"] - df.loc[k, "level"]) > bw * 3 for k in kept):
+            kept.append(idx)
+    df = df.loc[kept].head(top_n).reset_index(drop=True)
+    df["strength"] = (100 * df["strength"] / df["strength"].max()).round(0)
+    return df
+
+
 def _confluence_role(families: set, center: float, spot: float) -> str:
     if "flip" in families:
         return "Regime pivot"
@@ -749,6 +886,7 @@ def _confluence_role(families: set, center: float, spot: float) -> str:
 def confluence_levels(a: "Analysis", magnets: pd.DataFrame | None = None,
                       oi_lvls: pd.DataFrame | None = None,
                       block_lvls: pd.DataFrame | None = None,
+                      dark_lvls: pd.DataFrame | None = None,
                       band: float | None = None, top_n: int = 6) -> pd.DataFrame:
     """Fuse every level system into one ranked master table. Each source
     contributes a weighted vote to a price; nearby votes cluster, and the
@@ -792,6 +930,10 @@ def confluence_levels(a: "Analysis", magnets: pd.DataFrame | None = None,
         for _, r in block_lvls.iterrows():
             src.append((r["level"], 1.2 * r["strength"] / 100,
                         f"Block {r['direction']}", "block"))
+    if dark_lvls is not None:
+        for _, r in dark_lvls.iterrows():
+            src.append((r["level"], 0.8 * r["strength"] / 100,
+                        "Dark pool", "dark_pool"))
 
     src = [s for s in src if s[0] is not None and abs(s[0] / a.spot - 1) <= 0.12 and s[1] > 0]
     cols = ["level", "score", "n_layers", "layers", "role", "distance_pct", "confidence"]

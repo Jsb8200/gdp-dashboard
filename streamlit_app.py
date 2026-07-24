@@ -13,8 +13,9 @@ import plotly.graph_objects as go
 import streamlit as st
 
 from dealer_gex.analytics import (
-    Analysis, analyze, block_levels, confluence_levels, data_quality,
-    directional_lean, flow_books, fmt_dollars, magnet_levels, oi_levels, oi_walls,
+    Analysis, analyze, block_levels, confluence_levels, darkpool_levels,
+    data_quality, directional_lean, flow_books, fmt_dollars, magnet_levels,
+    oi_levels, oi_walls,
 )
 
 _CONF_ICON = {"high": "🟢", "medium": "🟡", "low": "🔴"}
@@ -91,7 +92,7 @@ def _analyze_cached(chain, spot, asof, rate, weight, multiplier):
 
 
 @st.cache_data(show_spinner=False)
-def _main_bundle(chain, spot, asof, rate, weight, multiplier, prints):
+def _main_bundle(chain, spot, asof, rate, weight, multiplier, prints, dark):
     """All main-view analytics in one cached unit, keyed on the inputs that
     actually change. Keeps the whole level stack stable while the scenario
     slider (which passes a *different* spot) drags — only the scenario's own
@@ -103,11 +104,13 @@ def _main_bundle(chain, spot, asof, rate, weight, multiplier, prints):
     if prints is not None and "is_block" in prints and prints["is_block"].any():
         blk_books = flow_books(prints, a.spot, a.asof, rate, multiplier=multiplier)
         blk_lvls = block_levels(prints, a.spot)
+    dark_lvls = darkpool_levels(dark, a.spot) if dark is not None else pd.DataFrame()
     master = confluence_levels(a, magnets, oi_lvls,
-                               blk_lvls if not blk_lvls.empty else None)
+                               blk_lvls if not blk_lvls.empty else None,
+                               dark_lvls if not dark_lvls.empty else None)
     dq = data_quality(a, prints)
     lean = directional_lean(a, prints)
-    return a, magnets, oi_lvls, blk_books, blk_lvls, master, dq, lean
+    return a, magnets, oi_lvls, blk_books, blk_lvls, dark_lvls, master, dq, lean
 
 
 def _manual_mapping_ui(name: str, file_bytes: bytes) -> pd.DataFrame | None:
@@ -701,6 +704,49 @@ def block_section(a: Analysis, prints: pd.DataFrame, books: dict,
         st.info("No block prints in this file.")
 
 
+def hit_rate_section(hr_days: list) -> None:
+    from dealer_gex.analytics import level_hit_rate
+
+    if len(hr_days) < 2:
+        return
+    detail, s = level_hit_rate(hr_days)
+    if s["tested"] == 0:
+        return
+    st.subheader("✅ Level hit-rate (did they hold?)")
+    if s["pairs"] < 3:
+        st.caption(f"Only {s['pairs']} day-pair(s) so far — upload 4-5 daily "
+                   "exports for a meaningful rate.")
+    cols = st.columns(4)
+    rate = s["rate"]
+    cols[0].metric("Overall hit-rate", f"{rate:.0%}" if rate is not None else "—",
+                   f"{s['held']}/{s['tested']} tested", delta_color="off")
+    hc = s["by_confidence"]["high"]
+    cols[1].metric("🟢 High-confidence", f"{hc['held']}/{hc['tested']}" if hc["tested"] else "—",
+                   "levels held", delta_color="off")
+    sup, res = s["by_type"]["support"], s["by_type"]["resistance"]
+    cols[2].metric("Support held", f"{sup['held']}/{sup['tested']}" if sup["tested"] else "—",
+                   delta_color="off")
+    cols[3].metric("Resistance held", f"{res['held']}/{res['tested']}" if res["tested"] else "—",
+                   delta_color="off")
+
+    view = detail[detail["tested"]].copy()
+    view["Level"] = view["level"].map(lambda x: f"{x:,.2f}")
+    view["Held?"] = view["outcome"].map({"held": "✅ held", "broke": "❌ broke"})
+    view["Confidence"] = view["confidence"].map(lambda c: f"{_CONF_ICON[c]} {c}")
+    view["Set"] = view["from_date"].astype(str) + " → " + view["to_date"].astype(str)
+    st.dataframe(
+        view[["Set", "Level", "role", "Confidence", "Held?"]].rename(columns={"role": "Role"}),
+        use_container_width=True, hide_index=True,
+    )
+    st.caption(
+        "Each prior-day confluence level tested against the next day's range "
+        "(reconstructed from print reference prices — a proxy for OHLC, small "
+        "sample). Validation, not a promise: it shows whether these levels "
+        "have actually been respected on this ticker recently. Watch whether "
+        "🟢 high-confidence levels hold better than 🔴 lone-layer ones."
+    )
+
+
 def campaign_section(day_prints: list) -> None:
     from dealer_gex.analytics import block_campaigns
 
@@ -730,6 +776,32 @@ def campaign_section(day_prints: list) -> None:
         "adding over time, the strongest footprint in the data. A strike "
         "**built up** day after day (consistent direction) is a conviction "
         "position; check whether its strike lines up with your walls."
+    )
+
+
+def darkpool_section(dark_lvls: pd.DataFrame, spot: float) -> None:
+    st.subheader("🌑 Dark-pool levels (institutional block prints)")
+    if dark_lvls.empty:
+        st.info("No dark-pool concentration within ±10% of spot.")
+        return
+    view = dark_lvls.copy()
+    view["Level"] = view["level"].map(lambda x: f"{x:,.2f}")
+    view["Premium"] = view["premium"].map(fmt_dollars)
+    view["Shares"] = view["size"].map(lambda x: f"{x:,.0f}")
+    view["Distance"] = view["distance_pct"].map(lambda x: f"{x:+.1f}%")
+    st.dataframe(
+        view[["Level", "strength", "Premium", "Shares", "Distance"]]
+        .rename(columns={"strength": "Weight"}),
+        use_container_width=True, hide_index=True,
+        column_config={"Weight": st.column_config.ProgressColumn(
+            "Weight", min_value=0, max_value=100, format="%.0f")},
+    )
+    st.caption(
+        "Prices where large off-exchange equity blocks concentrated — "
+        "institutional interest zones that often act as support/resistance. "
+        "Dark-pool prints carry **no direction** (mid-executed) and no "
+        "hedging obligation, so this is a confluence layer, not a signal: a "
+        "level that also appears in the master table is stronger for it."
     )
 
 
@@ -801,11 +873,12 @@ def report_section(a: Analysis, ticker: str, hist: pd.DataFrame | None = None,
                    blk_books: dict | None = None,
                    blk_lvls: pd.DataFrame | None = None,
                    master: pd.DataFrame | None = None,
-                   dq: dict | None = None, lean: dict | None = None) -> None:
+                   dq: dict | None = None, lean: dict | None = None,
+                   dark_lvls: pd.DataFrame | None = None) -> None:
     st.subheader("Report")
     md = build_markdown(a, ticker=ticker, history=hist,
                         block_books=blk_books, block_lvls=blk_lvls,
-                        master=master, dq=dq, lean=lean)
+                        master=master, dq=dq, lean=lean, dark_lvls=dark_lvls)
     stem = f"dealer-positioning-{a.asof:%Y%m%d}"
     c1, c2, _ = st.columns([1, 1, 3])
     c1.download_button("Download report (.md)", md, file_name=f"{stem}.md",
@@ -825,10 +898,21 @@ def main() -> None:
         "exposure (GEX), forced-hedging direction, and the levels where it flips."
     )
 
-    pfs, default_ticker = load_data()
-    if not pfs:
+    pfs_all, default_ticker = load_data()
+    if not pfs_all:
         st.info("⬅️ Choose a data source in the sidebar to begin.")
         return
+
+    # dark-pool (equity block) files are a confluence overlay, not chains
+    dark_pfs = [pf for pf in pfs_all if pf.dark is not None]
+    pfs = [pf for pf in pfs_all if pf.dark is None]
+    dark_all = pd.concat([pf.dark for pf in dark_pfs], ignore_index=True) if dark_pfs else None
+    if not pfs:
+        st.warning("Only a dark-pool file was uploaded — it's an overlay. "
+                   "Add an options-chain / order-flow export to analyze.", icon="📊")
+        return
+    if dark_pfs:
+        st.sidebar.caption(f"🌑 Dark-pool overlay: {sum(len(pf.dark) for pf in dark_pfs):,} prints.")
 
     # multiple files covering different days can be compared as history
     dated = sorted({pf.asof for pf in pfs if pf.asof is not None})
@@ -981,7 +1065,13 @@ def main() -> None:
         if merged_prints.empty:
             merged_prints = None
 
-    def _derive(a, prints):
+    # dark-pool overlay for this ticker
+    dark_t = dark_all
+    if dark_all is not None and "ticker" in dark_all.columns:
+        by_tk = dark_all[dark_all["ticker"] == ticker]
+        dark_t = by_tk if not by_tk.empty else (dark_all if not file_tickers else None)
+
+    def _derive(a, prints, dark=None):
         """Level stack from an Analysis + prints (shared by both paths)."""
         magnets = magnet_levels(a)
         oi_lvls = oi_levels(a)
@@ -989,14 +1079,17 @@ def main() -> None:
         if prints is not None and prints["is_block"].any():
             blk_books = flow_books(prints, a.spot, a.asof, rate, multiplier=multiplier)
             blk_lvls = block_levels(prints, a.spot)
+        dark_lvls = darkpool_levels(dark, a.spot) if dark is not None else pd.DataFrame()
         master = confluence_levels(a, magnets, oi_lvls,
-                                   blk_lvls if not blk_lvls.empty else None)
-        return magnets, oi_lvls, blk_books, blk_lvls, master
+                                   blk_lvls if not blk_lvls.empty else None,
+                                   dark_lvls if not dark_lvls.empty else None)
+        return magnets, oi_lvls, blk_books, blk_lvls, dark_lvls, master
 
     hist = None
     campaign_days: list = []
+    hr_days: list = []
     if history:
-        from dealer_gex.analytics import oi_walls as _oiw
+        from dealer_gex.analytics import oi_walls as _oiw, session_range
 
         rows, analyses = [], []
         for pf in sorted([p for p in pfs if p.asof], key=lambda p: p.asof):
@@ -1017,11 +1110,18 @@ def main() -> None:
                 "regime": ai.regime,
             })
             analyses.append(ai)
+            dp = None
             if pf.prints is not None:
                 dp = pf.prints
                 if file_tickers and len(file_tickers) > 1:
                     dp = dp[dp["ticker"] == ticker]
                 campaign_days.append((pf.asof, dp))
+            # per-day confluence + reconstructed range for hit-rate validation
+            *_, day_master = _derive(ai, dp)
+            rng = session_range(dp) if dp is not None else None
+            if rng is not None:
+                hr_days.append({"date": pf.asof, "master": day_master,
+                                "low": rng[0], "high": rng[1], "close": rng[2]})
         if not analyses:
             st.error("No day could be analyzed — check that each file carries "
                      "a spot price and unexpired contracts.")
@@ -1031,13 +1131,14 @@ def main() -> None:
         st.info(f"History mode: levels below are for the latest day "
                 f"(**{a.asof}**); the migration view covers {len(hist)} days.",
                 icon="🗓️")
-        magnets, oi_lvls, blk_books, blk_lvls, master = _derive(a, merged_prints)
+        magnets, oi_lvls, blk_books, blk_lvls, dark_lvls, master = _derive(
+            a, merged_prints, dark_t)
         dq = data_quality(a, merged_prints)
         lean = directional_lean(a, merged_prints)
     else:
         try:
-            a, magnets, oi_lvls, blk_books, blk_lvls, master, dq, lean = _main_bundle(
-                chain, spot, asof, rate, weight, multiplier, merged_prints)
+            a, magnets, oi_lvls, blk_books, blk_lvls, dark_lvls, master, dq, lean = _main_bundle(
+                chain, spot, asof, rate, weight, multiplier, merged_prints, dark_t)
         except ValueError as exc:
             st.error(f"{exc} — check the as-of date against the chain's expiries.")
             return
@@ -1064,6 +1165,7 @@ def main() -> None:
 
     if hist is not None and len(hist) >= 2:
         history_section(hist)
+        hit_rate_section(hr_days)
         if len(campaign_days) >= 2:
             campaign_section(campaign_days)
 
@@ -1077,6 +1179,9 @@ def main() -> None:
     magnet_section(a, magnets)
     oi_levels_section(a, oi_lvls)
 
+    if dark_t is not None:
+        darkpool_section(dark_lvls, a.spot)
+
     if blk_books or not blk_lvls.empty:
         block_section(a, merged_prints, blk_books, blk_lvls)
 
@@ -1088,7 +1193,7 @@ def main() -> None:
 
     playbook_section(a, master, lean)
     tables(a)
-    report_section(a, ticker, hist, blk_books, blk_lvls, master, dq, lean)
+    report_section(a, ticker, hist, blk_books, blk_lvls, master, dq, lean, dark_lvls)
 
     with st.expander("Methodology & assumptions"):
         st.markdown(

@@ -688,6 +688,111 @@ def test_report_directional_lean_section():
     assert "lean*, not a signal" in md
 
 
+def test_session_range_from_ref_prices():
+    from dealer_gex.parsing import parse_file
+    from dealer_gex.analytics import session_range
+
+    pf = parse_file(QUANTDATA_CSV)
+    qqq = pf.prints[pf.prints["ticker"] == "QQQ"]
+    rng = session_range(qqq)
+    assert rng is not None
+    lo, hi, close, open_ = rng
+    assert lo <= open_ <= hi and lo <= close <= hi
+    # last QQQ print in the fixture stamps ref 721.10
+    assert close == pytest.approx(721.10)
+
+
+def test_level_hit_rate_classification():
+    from dealer_gex.analytics import level_hit_rate
+
+    # day-1 levels; day-2 range [598, 652] closing 650
+    master = pd.DataFrame({
+        "level": [600.0, 650.0, 625.0, 700.0],
+        "role": ["Support", "Resistance", "Support · pin", "Resistance"],
+        "confidence": ["high", "high", "medium", "low"],
+    })
+    # day-2 range [599, 652] closing 650: reaches 600 (holds), pushes above 650
+    days = [
+        {"date": date(2026, 7, 16), "master": master, "low": 620, "high": 630, "close": 625},
+        {"date": date(2026, 7, 17), "master": master, "low": 599.0, "high": 652.0, "close": 650.0},
+    ]
+    detail, s = level_hit_rate(days)
+    by = {r["level"]: r["outcome"] for _, r in detail.iterrows()}
+    assert by[600.0] == "held"      # low 599 >= 600*(1-0.003)=598.2 -> held support
+    assert by[650.0] == "broke"     # high 652 > 650*(1+0.003)=651.95 -> broke resistance
+    assert by[625.0] == "broke"     # range straddles but close 650 far from 625 -> not pinned
+    assert by[700.0] == "not tested"  # high 652 never reached 700
+    assert s["tested"] == 3 and s["pairs"] == 1
+    assert s["held"] == 1
+    assert s["by_confidence"]["high"]["tested"] == 2
+
+
+def test_level_hit_rate_pin_holds():
+    from dealer_gex.analytics import level_hit_rate
+
+    master = pd.DataFrame({"level": [625.0], "role": ["Support · pin"],
+                           "confidence": ["high"]})
+    days = [
+        {"date": date(2026, 7, 16), "master": master, "low": 620, "high": 630, "close": 625},
+        {"date": date(2026, 7, 17), "master": master, "low": 620.0, "high": 630.0, "close": 625.3},
+    ]
+    detail, s = level_hit_rate(days)
+    assert detail.iloc[0]["outcome"] == "held"  # closed within 2*touch of the pin
+    assert s["rate"] == 1.0
+
+
+DARKPOOL_CSV = """Time,Symbol,Price,Size,Value
+2026-07-14T14:00:00Z,QQQ,700.10,40000,"28,004,000"
+2026-07-14T14:01:00Z,QQQ,700.05,35000,"24,501,750"
+2026-07-14T14:02:00Z,QQQ,699.95,50000,"34,997,500"
+2026-07-14T14:03:00Z,QQQ,720.20,20000,"14,404,000"
+2026-07-14T14:04:00Z,QQQ,720.10,18000,"12,961,800"
+2026-07-14T15:00:00Z,QQQ,711.50,5000,"3,557,500"
+"""
+
+
+def test_darkpool_detection_and_levels():
+    from dealer_gex.parsing import parse_file
+    from dealer_gex.analytics import darkpool_levels
+
+    pf = parse_file(DARKPOOL_CSV)
+    assert pf.dark is not None and pf.chain.empty
+    assert pf.spots["QQQ"] == pytest.approx(711.50)  # last by time
+    assert len(pf.dark) == 6
+
+    lv = darkpool_levels(pf.dark, spot=710.0)
+    assert not lv.empty
+    assert list(lv["strength"]) == sorted(lv["strength"], reverse=True)
+    assert lv["strength"].iloc[0] == 100
+    # heaviest concentration near 700 (125k shares), secondary near 720
+    assert abs(lv.iloc[0]["level"] - 700) < 3
+
+
+def test_darkpool_feeds_confluence():
+    from dealer_gex.parsing import parse_file
+    from dealer_gex.analytics import confluence_levels, darkpool_levels
+
+    chain, spot = read_chain((REPO / "data" / "sample_option_chain.csv").read_bytes())
+    a = analyze(chain, spot, ASOF)
+    # a dark level right at the 600 put fortress should reinforce it
+    dark = pd.DataFrame({"ticker": ["SPY"] * 3, "price": [600.0, 600.1, 599.9],
+                         "size": [50000.0, 40000.0, 45000.0],
+                         "premium": [3e7, 2.4e7, 2.7e7], "time": pd.NaT})
+    dlv = darkpool_levels(dark, spot)
+    m = confluence_levels(a, dark_lvls=dlv)
+    row600 = m[m["level"].sub(600).abs() < 3]
+    assert not row600.empty
+    assert any("Dark pool" in ls for ls in row600.iloc[0]["layers"])
+
+
+def test_option_file_not_misdetected_as_darkpool():
+    from dealer_gex.parsing import parse_file
+
+    # the QuantData flow file has strike+type -> must NOT be read as dark-pool
+    pf = parse_file(QUANTDATA_CSV)
+    assert pf.dark is None and not pf.chain.empty
+
+
 def test_fmt_dollars():
     assert fmt_dollars(1_460_000_000) == "$1.46B"
     assert fmt_dollars(-441_430_000) == "-$441.43M"
