@@ -13,8 +13,8 @@ import plotly.graph_objects as go
 import streamlit as st
 
 from dealer_gex.analytics import (
-    Analysis, analyze, block_levels, confluence_levels, data_quality, flow_books,
-    fmt_dollars, magnet_levels, oi_levels, oi_walls,
+    Analysis, analyze, block_levels, confluence_levels, data_quality,
+    directional_lean, flow_books, fmt_dollars, magnet_levels, oi_levels, oi_walls,
 )
 
 _CONF_ICON = {"high": "🟢", "medium": "🟡", "low": "🔴"}
@@ -483,6 +483,51 @@ def oi_levels_section(a: Analysis, levels: pd.DataFrame) -> None:
         )
 
 
+def lean_section(lean: dict) -> None:
+    st.subheader("🧭 Directional lean")
+    score = lean["score"]
+    # diverging meter: 0 centered, bearish left (red) / bullish right (green)
+    pos = 50 + score / 2  # 0..100
+    tilt = C["good_text"] if score >= 0 else C["critical"]
+    st.markdown(
+        f"""<div style="margin:0.2rem 0 0.6rem;">
+          <div style="display:flex; justify-content:space-between;
+               font-size:0.8rem; color:{C['muted']};">
+            <span>◄ Bearish</span><span>Balanced</span><span>Bullish ►</span></div>
+          <div style="position:relative; height:12px; border-radius:6px;
+               background:linear-gradient(90deg,
+                 {C['critical']}33 0%, {C['muted']}22 50%, {C['good_text']}33 100%);
+               margin-top:4px;">
+            <div style="position:absolute; left:50%; top:-3px; width:1px; height:18px;
+                 background:{C['muted']};"></div>
+            <div style="position:absolute; left:{pos:.1f}%; top:-4px;
+                 transform:translateX(-50%); width:12px; height:20px; border-radius:4px;
+                 background:{tilt};"></div>
+          </div>
+          <div style="margin-top:0.5rem; font-size:1.1rem; font-weight:700; color:{tilt};">
+            {lean['label']} &nbsp;<span style="color:{C['muted']};
+              font-weight:400; font-size:0.85rem;">score {score:+.0f} ·
+              {_CONF_ICON[lean['confidence']]} {lean['confidence']} confidence</span>
+          </div>
+        </div>""",
+        unsafe_allow_html=True,
+    )
+    comp = pd.DataFrame(
+        [(n, f"{v:+.0f}", ("🟢 bullish" if v > 8 else "🔴 bearish" if v < -8 else "⚪ neutral"), note)
+         for n, v, note in lean["components"]],
+        columns=["Ingredient", "Tilt", "Lean", "What it reads"],
+    )
+    st.dataframe(comp, use_container_width=True, hide_index=True)
+    caveat = (
+        "A **lean, not a signal** — it says which way *positioning* tilts, "
+        "not which way price will go. News and real order flow override it. "
+    )
+    if not lean["has_flow"]:
+        caveat += ("Only max-pain gravitation is available here (no trade-"
+                   "direction data) — treat as weak.")
+    st.caption(caveat)
+
+
 def confluence_section(a: Analysis, master: pd.DataFrame, dq: dict) -> None:
     st.subheader("🎯 Master levels (confluence)")
     if dq["level"] != "high":
@@ -725,11 +770,11 @@ def report_section(a: Analysis, ticker: str, hist: pd.DataFrame | None = None,
                    blk_books: dict | None = None,
                    blk_lvls: pd.DataFrame | None = None,
                    master: pd.DataFrame | None = None,
-                   dq: dict | None = None) -> None:
+                   dq: dict | None = None, lean: dict | None = None) -> None:
     st.subheader("Report")
     md = build_markdown(a, ticker=ticker, history=hist,
                         block_books=blk_books, block_lvls=blk_lvls,
-                        master=master, dq=dq)
+                        master=master, dq=dq, lean=lean)
     stem = f"dealer-positioning-{a.asof:%Y%m%d}"
     c1, c2, _ = st.columns([1, 1, 3])
     c1.download_button("Download report (.md)", md, file_name=f"{stem}.md",
@@ -972,6 +1017,7 @@ def main() -> None:
     master = confluence_levels(a, magnets, oi_lvls,
                                blk_lvls if not blk_lvls.empty else None)
     dq = data_quality(a, merged_prints)
+    lean = directional_lean(a, merged_prints)
 
     # --- render ---
     verdict_banner(a)
@@ -981,6 +1027,7 @@ def main() -> None:
     metrics_row(a, zero_dte)
 
     confluence_section(a, master, dq)
+    lean_section(lean)
 
     if hist is not None and len(hist) >= 2:
         history_section(hist)
@@ -1008,7 +1055,7 @@ def main() -> None:
 
     playbook_section(a)
     tables(a)
-    report_section(a, ticker, hist, blk_books, blk_lvls, master, dq)
+    report_section(a, ticker, hist, blk_books, blk_lvls, master, dq, lean)
 
     with st.expander("Methodology & assumptions"):
         st.markdown(

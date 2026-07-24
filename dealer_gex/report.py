@@ -170,7 +170,7 @@ def build_markdown(a: Analysis, ticker: str = "",
                    block_books: dict | None = None,
                    block_lvls: pd.DataFrame | None = None,
                    master: pd.DataFrame | None = None,
-                   dq: dict | None = None) -> str:
+                   dq: dict | None = None, lean: dict | None = None) -> str:
     title, body = regime_text(a.regime)
     label = f"{ticker.upper()} " if ticker else ""
     flip = f"{a.gamma_flip:,.2f}" if a.gamma_flip is not None else "no crossing in ±15% range"
@@ -186,6 +186,22 @@ def build_markdown(a: Analysis, ticker: str = "",
 
     if dq is not None and dq["level"] != "high":
         lines += [f"> **Data quality: {dq['level']}.** {' '.join(dq['notes'])}", ""]
+
+    if lean is not None:
+        lines += [
+            "## Directional lean",
+            "",
+            f"**{lean['label']}** (score {lean['score']:+.0f}, "
+            f"{lean['confidence']} confidence) — a *lean*, not a signal: which "
+            "way positioning tilts, not where price will go.",
+            "",
+            "| Ingredient | Tilt | Reads |",
+            "|---|---|---|",
+        ]
+        for name, val, note in lean["components"]:
+            tilt = "bullish" if val > 8 else "bearish" if val < -8 else "neutral"
+            lines.append(f"| {name} | {val:+.0f} ({tilt}) | {note} |")
+        lines.append("")
 
     if master is not None and not master.empty:
         lines += [

@@ -619,6 +619,86 @@ def block_campaigns(day_prints: list[tuple[date, pd.DataFrame]],
     return df
 
 
+def _imbalance(sub: pd.DataFrame) -> float | None:
+    """Net signed / gross directed size for a set of prints, in [-1, 1].
+    Convention-free: it reads who was the aggressor (ask vs bid), not any
+    long-calls/short-puts assumption. None when nothing is directed."""
+    if sub is None or sub.empty or "signed_size" not in sub:
+        return None
+    gross = float(sub["signed_size"].abs().sum())
+    if gross <= 0:
+        return None
+    return float(np.clip(sub["signed_size"].sum() / gross, -1.0, 1.0))
+
+
+def directional_lean(a: "Analysis", prints: pd.DataFrame | None = None) -> dict:
+    """A single **positioning lean** (-100 bearish … +100 bullish) fusing the
+    genuinely directional ingredients: order-flow aggressor imbalance, block
+    (institutional) flow direction, signed-flow customer delta, and max-pain
+    gravitation into expiry. This is a *lean*, not a trade signal — it says
+    which way positioning tilts, not where price will go. Convention-based
+    OI delta is deliberately excluded (it isn't directional).
+
+    Returns {score, label, confidence, components:[(name, value, note)],
+    has_flow}.
+    """
+    comps: list[tuple] = []  # (name, value[-100,100], weight, note, is_flow)
+    total_oi = float(a.by_strike[["call_oi", "put_oi"]].to_numpy().sum())
+
+    if prints is not None and len(prints):
+        allimb = _imbalance(prints)
+        if allimb is not None:
+            comps.append(("Order-flow aggressor", allimb * 100, 0.30,
+                          "net buy vs sell across all directed prints", True))
+        if "is_block" in prints and prints["is_block"].any():
+            binb = _imbalance(prints[prints["is_block"]])
+            if binb is not None:
+                comps.append(("Block (institutional) flow", binb * 100, 0.30,
+                              "net direction of negotiated size", True))
+
+    if a.weight_mode == "flow":
+        cd = -a.dex  # customer delta = opposite of dealer inventory
+        scale = 0.25 * a.spot * max(total_oi, 1.0) * 100 * a.multiplier
+        comps.append(("Customer net delta", float(np.tanh(cd / scale)) * 100, 0.25,
+                      "directional exposure from signed trades", True))
+
+    denom = a.expected_move if a.expected_move else a.spot * 0.01
+    mp = float(np.clip((a.max_pain - a.spot) / denom, -1.0, 1.0)) * 100
+    comps.append(("Max-pain pull", mp, 0.15,
+                  "into-expiry gravitation toward max pain", False))
+
+    wsum = sum(c[2] for c in comps)
+    score = sum(c[1] * c[2] for c in comps) / wsum if wsum else 0.0
+
+    flow_comps = [c for c in comps if c[4]]
+    strong_flow = [c for c in flow_comps if c[0].startswith(("Order-flow", "Block"))]
+    if not flow_comps:
+        confidence = "low"          # only max-pain pull — weak, expiry-only
+    elif len(strong_flow) >= 2:
+        confidence = "high" if (strong_flow[0][1] >= 0) == (strong_flow[1][1] >= 0) else "medium"
+    else:
+        confidence = "medium"
+
+    if score > 40:
+        label = "Bullish lean"
+    elif score > 15:
+        label = "Mild bullish lean"
+    elif score >= -15:
+        label = "Balanced — no clear lean"
+    elif score >= -40:
+        label = "Mild bearish lean"
+    else:
+        label = "Bearish lean"
+
+    return {
+        "score": round(float(score), 1),
+        "label": label,
+        "confidence": confidence,
+        "components": [(c[0], round(c[1], 1), c[3]) for c in comps],
+        "has_flow": bool(flow_comps),
+    }
+
+
 def data_quality(a: "Analysis", prints: pd.DataFrame | None = None) -> dict:
     """Honest read on how much to trust today's levels. Returns
     {'level': high|medium|low, 'notes': [...], ...}. Thin chains, light OI,

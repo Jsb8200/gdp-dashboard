@@ -604,6 +604,52 @@ def test_report_master_levels_section():
     assert "Confirmed by" in md
 
 
+def test_directional_lean_bullish_when_customers_buy():
+    from dealer_gex.parsing import parse_file
+    from dealer_gex.analytics import directional_lean
+
+    # every print is an ask-side buy of calls -> strongly bullish flow
+    csv_lines = ["Trade ID,Trade Time,Ticker,Expiration Date,Strike Price,"
+                 "Contract Type,Reference Price,Size,Volume,Open Interest,Side Code,"
+                 "Implied Volatility,Gamma,Premium Price,Consolidation Type,"
+                 "Is Golden Sweep,Is Unusual,Is Opening Position"]
+    for i, k in enumerate((615, 620, 625, 630)):
+        csv_lines.append(f"{i},2026-07-14T14:00:0{i}Z,QQQ,2026-08-21,${k}.00,CALL,"
+                         f"$620.00,200,500,3000,A,20%,0.012,\"$40,000.00\",SWEEP,No,No,Yes")
+    pf = parse_file("\n".join(csv_lines) + "\n")
+    p = pf.prints
+    a = analyze(pf.chain, pf.spots["QQQ"], pf.asof, weight="flow")
+    L = directional_lean(a, p)
+    assert L["score"] > 15          # bullish tilt
+    assert "bullish" in L["label"].lower()
+    # order-flow aggressor component is fully bullish (all ask-side)
+    of = [v for n, v, _ in L["components"] if n.startswith("Order-flow")][0]
+    assert of == pytest.approx(100.0)
+
+
+def test_directional_lean_neutral_without_flow():
+    from dealer_gex.analytics import directional_lean
+
+    chain, spot = read_chain((REPO / "data" / "sample_option_chain.csv").read_bytes())
+    a = analyze(chain, spot, ASOF)   # OI mode, no prints
+    L = directional_lean(a, None)
+    # only max-pain pull is available -> low confidence, single component
+    assert L["confidence"] == "low"
+    assert L["has_flow"] is False
+    assert len(L["components"]) == 1
+
+
+def test_report_directional_lean_section():
+    from dealer_gex.analytics import directional_lean
+    from dealer_gex.report import build_markdown
+
+    chain, spot = read_chain((REPO / "data" / "sample_option_chain.csv").read_bytes())
+    a = analyze(chain, spot, ASOF)
+    md = build_markdown(a, ticker="SPY", lean=directional_lean(a))
+    assert "## Directional lean" in md
+    assert "lean*, not a signal" in md
+
+
 def test_fmt_dollars():
     assert fmt_dollars(1_460_000_000) == "$1.46B"
     assert fmt_dollars(-441_430_000) == "-$441.43M"
