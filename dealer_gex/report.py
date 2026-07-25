@@ -7,9 +7,26 @@ import html
 import pandas as pd
 
 from dealer_gex.analytics import (
-    Analysis, block_tier_summary, fmt_dollars, magnet_levels, oi_levels,
-    oi_walls,
+    Analysis, block_behaviour_note, block_tier_summary, block_type_behaviour,
+    fmt_dollars, magnet_levels, oi_levels, oi_walls,
 )
+
+
+def block_type_behaviour_from(block_types: pd.DataFrame,
+                              block_prints: pd.DataFrame | None):
+    """Measured behaviour when the prints are available, the static
+    behavioural read alone when they are not."""
+    if block_prints is not None and not block_prints.empty:
+        return block_type_behaviour(block_prints)
+    if block_types is None or block_types.empty:
+        return None
+    out = block_types[["block_type", "tier", "prints", "premium"]].copy()
+    out["scored"] = 0
+    for c in ("followed_horizon", "followed_close", "hit_rate"):
+        out[c] = float("nan")
+    out["sample"] = "thin"
+    out["behaviour"] = [block_behaviour_note(r) for _, r in block_types.iterrows()]
+    return out
 
 _REGIME_TEXT = {
     "long_gamma": (
@@ -219,7 +236,8 @@ def build_markdown(a: Analysis, ticker: str = "",
                    dark_lvls: pd.DataFrame | None = None,
                    forecast=None,
                    flow_types: pd.DataFrame | None = None,
-                   block_types: pd.DataFrame | None = None) -> str:
+                   block_types: pd.DataFrame | None = None,
+                   block_prints: pd.DataFrame | None = None) -> str:
     title, body = regime_text(a.regime)
     label = f"{ticker.upper()} " if ticker else ""
     flip = f"{a.gamma_flip:,.2f}" if a.gamma_flip is not None else "no crossing in ±15% range"
@@ -434,6 +452,40 @@ def build_markdown(a: Analysis, ticker: str = "",
             "percent of the premium. Stock-tied prints are delta-hedged on "
             "the trade — a volatility position, not a directional one.",
         ]
+
+        bh = block_type_behaviour_from(block_types, block_prints)
+        if bh is not None and not bh.empty:
+            lines += [
+                "",
+                "### Behaviour — did the tape follow?",
+                "",
+                "| Block type | Scored | +30 min | To close | Followed |",
+                "|---|---|---|---|---|",
+            ]
+            for _, r in bh.iterrows():
+                pct = lambda x: "—" if pd.isna(x) else f"{x:+.2f}%"
+                hit = "—" if pd.isna(r["hit_rate"]) else f"{r['hit_rate']:.0%}"
+                flag = " ⚠️" if r["sample"] in ("thin", "small") else ""
+                lines.append(
+                    f"| {r['block_type']} | {int(r['scored'])}/"
+                    f"{int(r['prints'])}{flag} | {pct(r['followed_horizon'])} "
+                    f"| {pct(r['followed_close'])} | {hit} |"
+                )
+            lines += [
+                "",
+                "Signed by what each print expressed (bought calls and sold "
+                "puts are bullish), so positive means price went the way the "
+                "block leaned. Moves are measured from the reference price "
+                "stamped on the print — not exchange OHLC — over one file's "
+                "sessions; ⚠️ marks a sample too thin to read.",
+                "",
+                "**What each type means**",
+                "",
+            ]
+            for _, r in bh.head(6).iterrows():
+                if r["behaviour"]:
+                    lines.append(f"- **{r['block_type']}** — {r['behaviour']}")
+            lines.append("")
 
     if flow_types is not None and not flow_types.empty:
         lines += [

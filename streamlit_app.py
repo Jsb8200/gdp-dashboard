@@ -14,7 +14,8 @@ import streamlit as st
 
 from dealer_gex.analytics import (
     Analysis, analyze, block_levels, confluence_levels, darkpool_levels,
-    BLOCK_TIER_NOTE, block_tier_summary, block_type_breakdown, data_quality,
+    BLOCK_TIER_NOTE, block_tier_summary, block_type_behaviour,
+    block_type_breakdown, data_quality,
     flow_books, flow_type_breakdown, fmt_dollars, institutional_mask,
     intraday_flow, level_hit_rate, magnet_levels, oi_levels, oi_walls,
     tuned_layer_weights,
@@ -671,6 +672,62 @@ def block_type_section(prints: pd.DataFrame, spot: float) -> None:
     )
 
 
+def block_behaviour_section(prints: pd.DataFrame) -> None:
+    """What each block type means, and what the tape actually did after it."""
+    bh = block_type_behaviour(prints)
+    if bh.empty:
+        return
+    st.markdown("**Block type behaviour — what each one means, and whether "
+                "the tape followed:**")
+
+    view = bh.copy()
+    view["Type"] = [f"{_TIER_ICON.get(r['tier'], '')} {r['block_type']}"
+                    for _, r in bh.iterrows()]
+    view["Premium"] = view["premium"].map(fmt_dollars)
+    view["Scored"] = [
+        f"{int(r['scored'])}/{int(r['prints'])}"
+        + ("  ⚠️" if r["sample"] in ("thin", "small") else "")
+        for _, r in bh.iterrows()
+    ]
+    pct = lambda x: "—" if pd.isna(x) else f"{x:+.2f}%"
+    view["+30 min"] = view["followed_horizon"].map(pct)
+    view["To close"] = view["followed_close"].map(pct)
+    view["Followed"] = view["hit_rate"].map(
+        lambda x: "—" if pd.isna(x) else f"{x:.0%}")
+    st.dataframe(
+        view[["Type", "Premium", "Scored", "+30 min", "To close", "Followed"]],
+        use_container_width=True, hide_index=True,
+    )
+    st.caption(
+        "Signed by what the print expressed — bought calls and sold puts are "
+        "bullish — so **positive means price went the way the block leaned**. "
+        "*+30 min* and *To close* are the underlying's move from that print's "
+        "reference price; *Followed* is the share of prints that ended up on "
+        "the right side. ⚠️ marks a sample too thin to read. Prints inside the "
+        "last 30 minutes have no horizon left and are excluded from *+30 min* "
+        "rather than counted as zero. This is one file's tape, not a backtest: "
+        "reference prices are stamped on prints, not exchange OHLC."
+    )
+
+    top = bh[bh["behaviour"].astype(bool)].head(6)
+    if not top.empty:
+        with st.expander("What each block type means", expanded=False):
+            for _, r in top.iterrows():
+                measured = ""
+                if pd.notna(r["followed_close"]):
+                    verdict = ("followed" if r["followed_close"] > 0.05 else
+                               "faded" if r["followed_close"] < -0.05 else
+                               "went nowhere")
+                    measured = (f" &nbsp;·&nbsp; *Here: {verdict} "
+                                f"({r['followed_close']:+.2f}% to the close on "
+                                f"{int(r['scored'])} prints).*")
+                st.markdown(
+                    f"**{_TIER_ICON.get(r['tier'], '')} {r['block_type']}** — "
+                    f"{r['behaviour']}{measured}".replace("$", "\\$"),
+                    unsafe_allow_html=True,
+                )
+
+
 def flow_type_table(prints: pd.DataFrame) -> None:
     """Consolidated premium and quantity per precise execution type —
     floor vs auto vs block vs sweep, never averaged together."""
@@ -716,6 +773,7 @@ def block_section(a: Analysis, prints: pd.DataFrame, books: dict,
     st.subheader("🧱 Block intelligence (smart vs fast money)")
 
     block_type_section(prints, a.spot)
+    block_behaviour_section(prints)
     with st.expander("All flow types (sweeps, splits, everything else)"):
         flow_type_table(prints)
 
@@ -1079,13 +1137,14 @@ def report_section(a: Analysis, ticker: str, hist: pd.DataFrame | None = None,
                    dark_lvls: pd.DataFrame | None = None,
                    forecast: ExpectedMoveForecast | None = None,
                    flow_types: pd.DataFrame | None = None,
-                   block_types: pd.DataFrame | None = None) -> None:
+                   block_types: pd.DataFrame | None = None,
+                   block_prints: pd.DataFrame | None = None) -> None:
     st.subheader("Report")
     md = build_markdown(a, ticker=ticker, history=hist,
                         block_books=blk_books, block_lvls=blk_lvls,
                         master=master, dq=dq, dark_lvls=dark_lvls,
                         forecast=forecast, flow_types=flow_types,
-                        block_types=block_types)
+                        block_types=block_types, block_prints=block_prints)
     stem = f"dealer-positioning-{a.asof:%Y%m%d}"
     c1, c2, _ = st.columns([1, 1, 3])
     c1.download_button("Download report (.md)", md, file_name=f"{stem}.md",
@@ -1429,7 +1488,8 @@ def main() -> None:
     report_section(a, ticker, hist, blk_books, blk_lvls, master, dq,
                    dark_lvls, forecast,
                    flow_type_breakdown(merged_prints) if merged_prints is not None else None,
-                   block_type_breakdown(merged_prints) if merged_prints is not None else None)
+                   block_type_breakdown(merged_prints) if merged_prints is not None else None,
+                   merged_prints)
 
     with st.expander("Methodology & assumptions"):
         st.markdown(

@@ -90,6 +90,15 @@ history** instead.
   type carries the **premium-weighted strike it traded at** and that level's
   distance from spot: a $25M block 5% out is a different trade from the same
   size at the money.
+- **Block type behaviour** — what each type means for dealer hedging (a floor
+  print leaves a dealer with a real hedging obligation; a cross may leave the
+  bank flat; a stock-tied print has already hedged its delta), and whether the
+  tape actually followed. Every block print is scored by the underlying's move
+  from its own reference price — 30 minutes out and to the session close —
+  signed by what the print expressed, so positive means price went the way the
+  block leaned. Premium-weighted, with a hit rate and a ⚠️ on samples too thin
+  to read; prints inside the last 30 minutes are excluded from the horizon
+  rather than counted as zero.
 - **Conviction filter** — rebuild *every* level from flagged prints only
   (sweeps / blocks / floor / cross / auto / splits / golden / unusual /
   opening).
@@ -151,7 +160,7 @@ estimate — this is positioning analysis, **not trading advice**.
 
 ```
 pip install pytest
-python -m pytest tests/                 # 105 tests
+python -m pytest tests/                 # 113 tests
 python scripts/make_sample_chain.py     # regenerate the bundled sample chain
 ```
 

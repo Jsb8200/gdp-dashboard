@@ -700,6 +700,178 @@ def block_tier_summary(breakdown: pd.DataFrame) -> pd.DataFrame:
     return g.sort_values("_rank")[cols].reset_index(drop=True)
 
 
+#: What each execution mechanism means for dealer hedging and price. These
+#: are readings of the mechanism, not of any one day's tape — the measured
+#: numbers in ``block_type_behaviour`` are what test them on your file.
+MECHANISM_BEHAVIOUR = {
+    "floor": "Negotiated upstairs and printed on the floor: someone had to "
+             "find the other side, and a dealer is usually on it. Expect a "
+             "real hedging obligation anchored at that strike — pinning "
+             "toward it in a long-gamma book, acceleration through it in a "
+             "short-gamma one. The highest-information block there is.",
+    "cross": "Both sides arranged before the print (facilitation). The bank "
+             "may be flat rather than warehousing the risk, so the forced-"
+             "hedging read is weaker than the size suggests — treat the "
+             "strike as a marker of institutional interest, not of flow the "
+             "dealer still has to cover.",
+    "cob": "Worked through the complex-order book. Real size, but the market "
+           "saw it and priced it as it filled — the reaction is usually "
+           "already in the tape by the time the print lands.",
+    "cob auction": "A complex order exposed to auction for price improvement. "
+                   "Advertised size: the move tends to happen at the print "
+                   "and fade rather than build.",
+    "auction": "Exposed to an auction before filling. The size was public, so "
+               "read it as confirmation of a level rather than a catalyst.",
+    "auto": "The default electronic route — size without evidence anyone "
+            "negotiated it. Read it with the rest of the tape, not on its own.",
+    "iso": "Intermarket sweep: took liquidity across exchanges to get filled "
+           "now. Urgency rather than patience — closer in character to a "
+           "sweep than to a block.",
+}
+MODIFIER_BEHAVIOUR = {
+    "fragment": "One leg of a spread package, with the offsetting legs "
+                "elsewhere in this file. Do not read it directionally, and "
+                "do not add its premium to the outright total.",
+    "tied": "Stock-tied — the delta was hedged on the trade itself, so there "
+            "is no follow-on hedging flow to chase. This is a volatility "
+            "position: it changes gamma at the strike, not direction.",
+    "spread": "Printed as a package, so the premium covers more than one leg "
+              "and the net exposure is smaller than the headline number.",
+}
+
+
+def block_behaviour_note(row) -> str:
+    """The behavioural read for one ``block_type_breakdown`` row."""
+    parts = []
+    if row.get("spread_leg"):
+        parts.append(MODIFIER_BEHAVIOUR["fragment"])
+    else:
+        base = MECHANISM_BEHAVIOUR.get(str(row.get("mechanism", "")), "")
+        if base:
+            parts.append(base)
+        if row.get("tied"):
+            parts.append(MODIFIER_BEHAVIOUR["tied"])
+        if str(row.get("block_type", "")).endswith("spread"):
+            parts.append(MODIFIER_BEHAVIOUR["spread"])
+    return " ".join(parts)
+
+
+def _bullish_intent(df: pd.DataFrame) -> pd.Series:
+    """+1 when the print expresses a bullish view, -1 bearish, 0 unknown:
+    bought calls and sold puts are bullish, the mirrors bearish."""
+    signed = pd.to_numeric(df.get("signed_size", 0.0), errors="coerce").fillna(0.0)
+    cp = df["type"].astype(str).str.strip().str.upper().str[0]
+    return np.sign(signed) * np.where(cp == "P", -1.0, 1.0)
+
+
+def block_type_behaviour(prints: pd.DataFrame, horizon_min: int = 30,
+                         min_prints: int = 3) -> pd.DataFrame:
+    """Did the tape follow each block type, on this file?
+
+    For every block print, the underlying's move from that print's
+    reference price is measured twice — ``horizon_min`` minutes later and
+    at the session's last print — and signed by what the print expressed
+    (bought calls / sold puts = bullish). Positive means price went the way
+    the block leaned.
+
+    Columns: block_type, tier, prints, premium, scored, followed_horizon,
+    followed_close, hit_rate, sample, behaviour.
+
+    Honest limits: the reference price is what the flow file stamps on each
+    print, not exchange OHLC; a session or two is a tiny sample; and a
+    block that prints at 15:58 has no horizon left to be measured over
+    (those rows are excluded from the horizon column, not counted as zero).
+    Types under ``min_prints`` are marked ``thin`` and left unscored.
+    """
+    cols = ["block_type", "tier", "prints", "premium", "scored",
+            "followed_horizon", "followed_close", "hit_rate", "sample",
+            "behaviour"]
+    if prints is None or prints.empty or "is_block" not in prints:
+        return pd.DataFrame(columns=cols)
+
+    base = block_type_breakdown(prints)
+    if base.empty:
+        return pd.DataFrame(columns=cols)
+    notes = {r["block_type"]: block_behaviour_note(r) for _, r in base.iterrows()}
+
+    need = {"trade_time", "ref_price", "flow_type", "type"}
+    p = prints.copy()
+    if not need <= set(p.columns):
+        out = base[["block_type", "tier", "prints", "premium"]].copy()
+        out["scored"] = 0
+        for c in ("followed_horizon", "followed_close", "hit_rate"):
+            out[c] = np.nan
+        out["sample"] = "no timestamps"
+        out["behaviour"] = out["block_type"].map(notes)
+        return out[cols].reset_index(drop=True)
+
+    p["trade_time"] = pd.to_datetime(p["trade_time"], errors="coerce", utc=True)
+    p["ref_price"] = pd.to_numeric(p["ref_price"], errors="coerce")
+    p = p[p["trade_time"].notna() & (p["ref_price"] > 0)]
+    if p.empty:
+        return pd.DataFrame(columns=cols)
+    p["_day"] = p["trade_time"].dt.date
+    p["_tkr"] = p["ticker"].astype(str) if "ticker" in p else ""
+
+    # the price path is every print's reference price, per ticker per day
+    path = (p[["trade_time", "ref_price", "_day", "_tkr"]]
+            .sort_values("trade_time").reset_index(drop=True))
+    session = path.groupby(["_tkr", "_day"]).agg(
+        close=("ref_price", "last"), last_time=("trade_time", "max"))
+
+    b = p[p["is_block"].fillna(False)].copy()
+    if b.empty:
+        return pd.DataFrame(columns=cols)
+    b["_target"] = b["trade_time"] + pd.Timedelta(minutes=horizon_min)
+    b = b.sort_values("_target")
+    later = pd.merge_asof(
+        b[["_target", "_day", "_tkr"]], path.rename(columns={"ref_price": "_ref_h"}),
+        left_on="_target", right_on="trade_time", by=["_tkr", "_day"],
+        direction="backward",
+    )
+    b["_ref_h"] = later["_ref_h"].to_numpy()
+    keys = pd.MultiIndex.from_arrays([b["_tkr"], b["_day"]])
+    b["_close"] = session["close"].reindex(keys).to_numpy()
+    b["_last_time"] = session["last_time"].reindex(keys).to_numpy()
+    # a print with less than the horizon left in the session cannot be scored
+    b.loc[b["_target"] > b["_last_time"], "_ref_h"] = np.nan
+
+    intent = _bullish_intent(b)
+    b["_ft_h"] = intent * (b["_ref_h"] / b["ref_price"] - 1.0) * 100.0
+    b["_ft_c"] = intent * (b["_close"] / b["ref_price"] - 1.0) * 100.0
+    b.loc[intent == 0, ["_ft_h", "_ft_c"]] = np.nan   # mid prints have no side
+    b["_w"] = b["premium"].where(b["premium"] > 0, 0.0)
+
+    def _wmean(sub: pd.DataFrame, col: str) -> float:
+        ok = sub[sub[col].notna()]
+        w = ok["_w"]
+        if ok.empty or w.sum() <= 0:
+            return float(ok[col].mean()) if not ok.empty else np.nan
+        return float(np.average(ok[col], weights=w))
+
+    rows = []
+    for name, sub in b.groupby("flow_type", dropna=False):
+        scored = int(sub["_ft_c"].notna().sum())
+        thin = scored < min_prints
+        rows.append({
+            "block_type": name,
+            "scored": scored,
+            "followed_horizon": np.nan if thin else _wmean(sub, "_ft_h"),
+            "followed_close": np.nan if thin else _wmean(sub, "_ft_c"),
+            "hit_rate": np.nan if thin else
+                        float((sub["_ft_c"].dropna() > 0).mean()),
+            "sample": "thin" if thin else ("ok" if scored >= 3 * min_prints
+                                           else "small"),
+        })
+    measured = pd.DataFrame(rows)
+    out = base[["block_type", "tier", "prints", "premium"]].merge(
+        measured, on="block_type", how="left")
+    out["scored"] = out["scored"].fillna(0).astype(int)
+    out["sample"] = out["sample"].fillna("thin")
+    out["behaviour"] = out["block_type"].map(notes).fillna("")
+    return out[cols].reset_index(drop=True)
+
+
 def institutional_mask(prints: pd.DataFrame, types: list[str] | None = None,
                        drop_fragments: bool = True) -> pd.Series:
     """Which prints count as institutional size.

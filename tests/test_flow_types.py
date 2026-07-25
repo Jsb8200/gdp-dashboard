@@ -5,7 +5,8 @@ import pandas as pd
 import pytest
 
 from dealer_gex.analytics import (
-    analyze, block_levels, flow_books, flow_type_breakdown, institutional_mask,
+    analyze, block_levels, block_type_behaviour, flow_books,
+    flow_type_breakdown, institutional_mask,
 )
 from dealer_gex.parsing import classify_flow, parse_file
 
@@ -337,3 +338,130 @@ def test_block_level_without_a_spot_falls_back_to_reference_price():
     br = block_type_breakdown(pf.prints)          # no spot passed
     assert br["level"].notna().all()
     assert br["distance_pct"].notna().all()       # measured off the ref prices
+
+
+# --- behaviour ---------------------------------------------------------------
+
+BEHAVIOUR_CSV_HEADER = ("Trade ID,Trade Time,Ticker,Expiration Date,Strike Price,"
+                        "Contract Type,Reference Price,Size,Volume,Open Interest,"
+                        "Side Code,Implied Volatility,Gamma,Premium Price,"
+                        "Trade Type,Consolidation Type\n")
+
+
+def _behaviour_csv(rows) -> bytes:
+    """rows: (minute, strike, cp, ref, size, side, premium, trade_type, cons)"""
+    out = [BEHAVIOUR_CSV_HEADER]
+    for i, (m, k, cp, ref, size, side, prem, tt, cons) in enumerate(rows, 1):
+        out.append(
+            f"{i},2026-07-08T{13 + m // 60:02d}:{m % 60:02d}:00.000Z,QQQ,"
+            f"2026-08-21,${k:.2f},{cp},${ref:.2f},{size},\"9,000\",\"20,000\","
+            f"{side},20.0%,0.010,\"${prem:,.2f}\",{tt},{cons}\n")
+    return "".join(out).encode()
+
+
+def test_behaviour_signs_bought_calls_and_sold_puts_as_bullish():
+    """Price rises after both a bought call and a sold put: both leaned
+    bullish, so both must score positive."""
+    rows = [
+        (0, 700, "CALL", 700.0, 100, "A", 1_000_000, "FLR", "BLOCK"),
+        (1, 700, "PUT", 700.0, 100, "B", 1_000_000, "FLR", "BLOCK"),
+        (2, 700, "CALL", 700.0, 100, "A", 1_000_000, "FLR", "BLOCK"),
+        (90, 700, "CALL", 707.0, 1, "A", 1, "AUTO", "SWEEP"),   # price +1%
+    ]
+    bh = block_type_behaviour(parse_file(_behaviour_csv(rows)).prints)
+    r = bh.set_index("block_type").loc["floor block"]
+    assert r["scored"] == 3
+    assert r["followed_close"] == pytest.approx(1.0, abs=0.01)
+    assert r["hit_rate"] == 1.0
+
+
+def test_behaviour_is_negative_when_the_tape_fades_the_block():
+    rows = [
+        (0, 700, "CALL", 700.0, 100, "A", 1_000_000, "FLR", "BLOCK"),
+        (1, 700, "CALL", 700.0, 100, "A", 1_000_000, "FLR", "BLOCK"),
+        (2, 700, "CALL", 700.0, 100, "A", 1_000_000, "FLR", "BLOCK"),
+        (90, 700, "CALL", 693.0, 1, "A", 1, "AUTO", "SWEEP"),   # price -1%
+    ]
+    bh = block_type_behaviour(parse_file(_behaviour_csv(rows)).prints)
+    r = bh.set_index("block_type").loc["floor block"]
+    assert r["followed_close"] == pytest.approx(-1.0, abs=0.01)
+    assert r["hit_rate"] == 0.0
+
+
+def test_behaviour_is_premium_weighted_across_prints():
+    """A $10M block that worked outweighs three $10K ones that didn't."""
+    rows = [
+        (0, 700, "CALL", 700.0, 1000, "A", 10_000_000, "FLR", "BLOCK"),
+        (1, 700, "CALL", 710.0, 1, "A", 10_000, "FLR", "BLOCK"),
+        (2, 700, "CALL", 710.0, 1, "A", 10_000, "FLR", "BLOCK"),
+        (3, 700, "CALL", 710.0, 1, "A", 10_000, "FLR", "BLOCK"),
+        (90, 700, "CALL", 707.0, 1, "A", 1, "AUTO", "SWEEP"),
+    ]
+    bh = block_type_behaviour(parse_file(_behaviour_csv(rows)).prints)
+    r = bh.set_index("block_type").loc["floor block"]
+    assert r["hit_rate"] == pytest.approx(0.25)     # 1 of 4 prints was right
+    assert r["followed_close"] > 0.9               # ...but it was ~all the money
+
+
+def test_late_prints_have_no_horizon_and_are_not_scored_as_zero():
+    """A block printed at the bell has no 30 minutes left to be judged on.
+    Scoring it zero would silently dilute the type it belongs to."""
+    rows = [
+        (0, 700, "CALL", 700.0, 100, "A", 1_000_000, "FLR", "BLOCK"),
+        (20, 700, "CALL", 707.0, 1, "A", 1, "AUTO", "SWEEP"),     # +1%
+        (100, 700, "CALL", 707.0, 100, "A", 1_000_000, "FLR", "BLOCK"),  # last print
+    ]
+    p = parse_file(_behaviour_csv(rows)).prints
+    bh = block_type_behaviour(p, horizon_min=30, min_prints=1).set_index("block_type")
+    r = bh.loc["floor block"]
+    assert r["scored"] == 2                                    # both reach a close
+    # to the close: +1% for the early print, 0% for the late one -> +0.5%
+    assert r["followed_close"] == pytest.approx(0.5, abs=0.01)
+    # at +30 min only the early print is measurable, and it is the full +1%
+    assert r["followed_horizon"] == pytest.approx(1.0, abs=0.01)
+
+
+def test_thin_types_are_flagged_and_left_unscored():
+    rows = [
+        (0, 700, "CALL", 700.0, 100, "A", 1_000_000, "FLR", "BLOCK"),
+        (1, 700, "CALL", 700.0, 100, "A", 1_000_000, "CROSS", "BLOCK"),
+        (90, 700, "CALL", 707.0, 1, "A", 1, "AUTO", "SWEEP"),
+    ]
+    bh = block_type_behaviour(parse_file(_behaviour_csv(rows)).prints,
+                              min_prints=3).set_index("block_type")
+    assert bh.loc["floor block", "sample"] == "thin"
+    assert pd.isna(bh.loc["floor block", "followed_close"])
+    assert bh.loc["floor block", "scored"] == 1        # counted, just not read
+
+
+def test_every_block_type_carries_a_behavioural_read(real):
+    bh = block_type_behaviour(real.prints).set_index("block_type")
+    assert (bh["behaviour"].str.len() > 40).all()
+    assert "find the other side" in bh.loc["floor block", "behaviour"]
+    assert "arranged before the print" in bh.loc["tied cross block spread", "behaviour"]
+    assert "delta was hedged" in bh.loc["tied cross block spread", "behaviour"]
+    # a leg gets the fragment warning instead of a mechanism read
+    leg = bh.loc["auto block leg", "behaviour"]
+    assert "Do not read it directionally" in leg
+    assert "default electronic route" not in leg
+
+
+def test_behaviour_without_timestamps_still_explains_the_types():
+    p = parse_file(FLOW_CSV.encode()).prints.drop(columns=["trade_time"])
+    bh = block_type_behaviour(p)
+    assert (bh["sample"] == "no timestamps").all()
+    assert bh["scored"].sum() == 0
+    assert (bh["behaviour"].str.len() > 40).all()
+
+
+def test_report_includes_behaviour(real):
+    from dealer_gex.analytics import block_type_breakdown
+    from dealer_gex.report import build_markdown
+
+    a = analyze(real.chain, real.spots["QQQ"], real.asof)
+    md = build_markdown(a, ticker="QQQ",
+                        block_types=block_type_breakdown(real.prints),
+                        block_prints=real.prints)
+    assert "### Behaviour — did the tape follow?" in md
+    assert "**What each type means**" in md
+    assert "find the other side" in md
