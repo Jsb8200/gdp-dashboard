@@ -19,6 +19,9 @@ from dealer_gex.analytics import (
 )
 
 _CONF_ICON = {"high": "🟢", "medium": "🟡", "low": "🔴"}
+from dealer_gex.forecast import (
+    ExpectedMoveForecast, forecast_expected_move, lightgbm_available,
+)
 from dealer_gex.parsing import (
     ChainParseError, ParsedFile, aggregate_prints, normalize_chain, parse_file,
 )
@@ -757,6 +760,82 @@ def hit_rate_section(detail, s, tuned: dict | None = None) -> None:
         st.info(note.replace("$", "\\$"), icon="🎚️")
 
 
+def forecast_section(f: ExpectedMoveForecast) -> None:
+    """Learned expected move: what positioning says the next session holds,
+    against what the option market is charging for it."""
+    if f is None or f.baseline_pct is None:
+        return
+    st.subheader("🤖 Expected-move model (LightGBM)")
+
+    cols = st.columns(4)
+    cols[0].metric("Implied (1σ, per session)", f"±{f.implied_sigma:,.2f}",
+                   "what options price", delta_color="off",
+                   help="The straddle expected move rescaled to one trading "
+                        "session — the baseline the model has to beat.")
+    if f.used_model:
+        rich = f.richness
+        cols[1].metric("Model (1σ, per session)", f"±{f.predicted_sigma:,.2f}",
+                       f"{rich:.0%} of implied", delta_color="off",
+                       help="Implied and model blended by measured skill.")
+        cols[2].metric("Out-of-sample skill", f"{f.skill:+.0%}",
+                       f"{f.weight:.0%} model weight", delta_color="off",
+                       help="1 − model MAE / implied MAE on walk-forward "
+                            "predictions the model never trained on.")
+    else:
+        cols[1].metric("Model (1σ, per session)", "—", "no edge yet",
+                       delta_color="off")
+        skill = f"{f.skill:+.0%}" if f.skill is not None else "—"
+        cols[2].metric("Out-of-sample skill", skill, "0% model weight",
+                       delta_color="off")
+    cols[3].metric("Scored sessions", f"{f.n_oos}",
+                   f"{f.n_train} labelled day-pairs", delta_color="off",
+                   help="Every scored session was predicted by a model fit "
+                        "only on the days before it.")
+
+    icon = "🤖" if f.used_model else "ℹ️"
+    (st.success if f.used_model else st.info)(f.message, icon=icon)
+
+    if not f.backtest.empty:
+        bt = f.backtest
+        fig = go.Figure()
+        fig.add_trace(go.Scatter(
+            x=bt["target_date"], y=bt["actual"] * 100, name="realized",
+            mode="lines+markers", line=dict(color=C["ink"], width=2)))
+        fig.add_trace(go.Scatter(
+            x=bt["target_date"], y=bt["baseline"] * 100, name="implied",
+            mode="lines", line=dict(color=C["muted"], width=1.5, dash="dot")))
+        fig.add_trace(go.Scatter(
+            x=bt["target_date"], y=bt["predicted"] * 100, name="model",
+            mode="lines", line=dict(color=C["call"], width=1.5, dash="dash")))
+        fig.update_layout(title="Walk-forward: realized move vs implied vs model")
+        fig.update_yaxes(title_text="|move| (% of spot)", ticksuffix="%")
+        st.plotly_chart(_style(fig), use_container_width=True)
+
+    if not f.importance.empty and f.used_model:
+        top = f.importance.head(8).copy()
+        top["Weight"] = top["share"].map(lambda x: f"{x:.0%}")
+        st.dataframe(
+            top[["feature", "Weight"]].rename(columns={"feature": "Feature"}),
+            use_container_width=True, hide_index=True,
+        )
+        st.caption("What the model leaned on. Importance is descriptive, not "
+                   "causal — with this few sessions, read it as a hint.")
+
+    st.caption(
+        f"Engine: **{f.engine}**. Target is the next session's absolute move "
+        "(close to close from reconstructed session closes, √t-scaled when "
+        "uploads skip days); features are the positioning state at each day's "
+        "close, so no fit ever sees its own answer. The blend weight *is* the "
+        "measured skill — beat implied by 20% out of sample and the model gets "
+        "20% of the number. Small samples, reconstructed closes, one ticker: "
+        "this is a calibration aid, **not trading advice**."
+    )
+    if not lightgbm_available():
+        st.caption("⚠️ `lightgbm` is not installed — running the ridge "
+                   "fallback. `pip install lightgbm` for the gradient-boosted "
+                   "model.")
+
+
 def campaign_section(day_prints: list) -> None:
     from dealer_gex.analytics import block_campaigns
 
@@ -911,11 +990,13 @@ def report_section(a: Analysis, ticker: str, hist: pd.DataFrame | None = None,
                    blk_lvls: pd.DataFrame | None = None,
                    master: pd.DataFrame | None = None,
                    dq: dict | None = None, lean: dict | None = None,
-                   dark_lvls: pd.DataFrame | None = None) -> None:
+                   dark_lvls: pd.DataFrame | None = None,
+                   forecast: ExpectedMoveForecast | None = None) -> None:
     st.subheader("Report")
     md = build_markdown(a, ticker=ticker, history=hist,
                         block_books=blk_books, block_lvls=blk_lvls,
-                        master=master, dq=dq, lean=lean, dark_lvls=dark_lvls)
+                        master=master, dq=dq, lean=lean, dark_lvls=dark_lvls,
+                        forecast=forecast)
     stem = f"dealer-positioning-{a.asof:%Y%m%d}"
     c1, c2, _ = st.columns([1, 1, 3])
     c1.download_button("Download report (.md)", md, file_name=f"{stem}.md",
@@ -1125,6 +1206,8 @@ def main() -> None:
     hist = None
     campaign_days: list = []
     hr_days: list = []
+    fc_days: list = []
+    forecast = None
     if history:
         from dealer_gex.analytics import oi_walls as _oiw, session_range
 
@@ -1159,6 +1242,13 @@ def main() -> None:
             if rng is not None:
                 hr_days.append({"date": pf.asof, "master": day_master,
                                 "low": rng[0], "high": rng[1], "close": rng[2]})
+            # expected-move model: positioning state + realized session move
+            fc_days.append({
+                "date": pf.asof, "analysis": ai,
+                "close": rng[2] if rng is not None else sp,
+                "low": rng[0] if rng is not None else None,
+                "high": rng[1] if rng is not None else None,
+            })
         if not analyses:
             st.error("No day could be analyzed — check that each file carries "
                      "a spot price and unexpired contracts.")
@@ -1183,6 +1273,8 @@ def main() -> None:
                     a, magnets, oi_lvls,
                     blk_lvls if not blk_lvls.empty else None,
                     dark_lvls if not dark_lvls.empty else None, weights=tuned_w)
+        if len(fc_days) >= 2:
+            forecast = forecast_expected_move(fc_days)
     else:
         try:
             a, magnets, oi_lvls, blk_books, blk_lvls, dark_lvls, master, dq, lean = _main_bundle(
@@ -1202,7 +1294,8 @@ def main() -> None:
 
     # --- render ---
     verdict_banner(a)
-    st.markdown("**TL;DR** — " + executive_summary(a, master, lean).replace("$", "\\$"))
+    st.markdown("**TL;DR** — "
+                + executive_summary(a, master, lean, forecast).replace("$", "\\$"))
     if zero_dte:
         st.caption(f"⏱️ 0DTE mode: {a.n_contracts:,} contracts expiring {a.asof} — "
                    "this is the gamma that binds into today's close.")
@@ -1214,6 +1307,7 @@ def main() -> None:
     if hist is not None and len(hist) >= 2:
         history_section(hist)
         hit_rate_section(hr_detail, hr_summary, tuned_w)
+        forecast_section(forecast)
         if len(campaign_days) >= 2:
             campaign_section(campaign_days)
 
@@ -1242,7 +1336,8 @@ def main() -> None:
 
     playbook_section(a, master, lean)
     tables(a)
-    report_section(a, ticker, hist, blk_books, blk_lvls, master, dq, lean, dark_lvls)
+    report_section(a, ticker, hist, blk_books, blk_lvls, master, dq, lean,
+                   dark_lvls, forecast)
 
     with st.expander("Methodology & assumptions"):
         st.markdown(
@@ -1265,6 +1360,11 @@ def main() -> None:
   forced by a 1-point IV drop and by one day of delta decay. **Expected
   move** is the 1σ straddle approximation from near-the-money IV at the
   nearest expiry.
+- **Expected-move model** (multi-day uploads) — a LightGBM regression from
+  the day's positioning state to the *next session's* realized absolute
+  move. Features are known at each day's close, the score is
+  expanding-window walk-forward, and the model is blended into the implied
+  move at exactly its measured out-of-sample skill: no skill, no weight.
 - **Weighting** — open interest reads the standing book (updates
   overnight); volume mode weights by today's traded contracts for
   intraday/0DTE reads.

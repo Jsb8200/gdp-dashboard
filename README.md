@@ -84,6 +84,17 @@ history** instead.
   range (reconstructed from print reference prices): did they actually hold?
 - **Adaptive confluence** — the hit-rate feeds back to re-weight the confluence
   scoring by what held on this ticker (gated to avoid tuning on noise).
+- **Expected-move model (LightGBM)** — the implied expected move is a *price*,
+  not a forecast. A gradient-boosted-tree regression learns the map from the
+  day's positioning state (GEX regime, distance to flip, wall width, DEX,
+  vanna/charm, recent realized vol…) to the **next session's realized move**,
+  and reports whether that beats the option market. Scored by expanding-window
+  walk-forward — every evaluated prediction is out of sample — and blended into
+  the implied move at exactly its measured skill: beat implied by 20% and the
+  model gets 20% of the number, fail to beat it and the model gets zero. Needs
+  ~10 daily files before it will say anything; until then it shows the implied
+  move and how many more days it wants. Without `lightgbm` installed the same
+  pipeline runs on a ridge fallback, labelled as such.
 
 **Tools & output**
 
@@ -102,16 +113,21 @@ Convention-based positioning assumes dealers are long customer-sold calls and
 short customer-bought puts; signed-flow mode instead reads actual trade
 direction. Open interest updates once daily, the flip curve holds IV fixed
 (sticky-strike), dark-pool and hit-rate ranges are reconstructions, and small
-samples are flagged. Every level is an estimate — this is positioning analysis,
-**not trading advice**.
+samples are flagged. The expected-move model trains on a handful of
+reconstructed session closes from one ticker — its skill number is honest but
+noisy, which is exactly why it only gets the weight it earns. Every level is an
+estimate — this is positioning analysis, **not trading advice**.
 
 ## Development
 
 ```
 pip install pytest
-python -m pytest tests/                 # 53 tests
+python -m pytest tests/                 # 84 tests
 python scripts/make_sample_chain.py     # regenerate the bundled sample chain
 ```
 
-Layout: `dealer_gex/` (parsing, analytics, report) · `streamlit_app.py` (UI) ·
-`tests/` · `data/` (bundled sample).
+Layout: `dealer_gex/` (parsing, analytics, forecast, report) ·
+`streamlit_app.py` (UI) · `tests/` · `data/` (bundled sample).
+
+`lightgbm` is only needed for the expected-move model; the rest of the app —
+and the test suite — runs without it.

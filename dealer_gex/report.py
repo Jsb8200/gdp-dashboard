@@ -63,7 +63,7 @@ def _fmt_flow(x: float) -> str:
 
 
 def executive_summary(a: Analysis, master: pd.DataFrame | None = None,
-                      lean: dict | None = None) -> str:
+                      lean: dict | None = None, forecast=None) -> str:
     """One-paragraph TL;DR fusing regime, the top confluence level, and the
     positioning lean — the single-glance read the rest of the page expands."""
     regime = "long gamma (moves dampened, mean-reverting)" if a.regime == "long_gamma" \
@@ -81,6 +81,14 @@ def executive_summary(a: Analysis, master: pd.DataFrame | None = None,
     if a.expected_move is not None:
         bits.append(f"options price a ±{a.expected_move:,.2f} move to "
                     f"{a.nearest_expiry}")
+    if forecast is not None and forecast.used_model:
+        rich = forecast.richness or 1.0
+        verdict = ("under-pricing" if rich > 1.05 else
+                   "over-pricing" if rich < 0.95 else "fairly pricing")
+        bits.append(
+            f"the model expects **±{forecast.predicted_sigma:,.2f}** next "
+            f"session ({rich:.0%} of implied — the market is {verdict} it)"
+        )
     if lean is not None:
         bits.append(f"positioning shows a **{lean['label'].lower()}** "
                     f"({lean['confidence']} confidence)")
@@ -222,7 +230,8 @@ def build_markdown(a: Analysis, ticker: str = "",
                    block_lvls: pd.DataFrame | None = None,
                    master: pd.DataFrame | None = None,
                    dq: dict | None = None, lean: dict | None = None,
-                   dark_lvls: pd.DataFrame | None = None) -> str:
+                   dark_lvls: pd.DataFrame | None = None,
+                   forecast=None) -> str:
     title, body = regime_text(a.regime)
     label = f"{ticker.upper()} " if ticker else ""
     flip = f"{a.gamma_flip:,.2f}" if a.gamma_flip is not None else "no crossing in ±15% range"
@@ -230,7 +239,7 @@ def build_markdown(a: Analysis, ticker: str = "",
     lines = [
         f"# {label}Dealer Positioning Report — {a.asof:%Y-%m-%d}",
         "",
-        f"**TL;DR** — {executive_summary(a, master, lean)}",
+        f"**TL;DR** — {executive_summary(a, master, lean, forecast)}",
         "",
         f"## Verdict: {title}",
         "",
@@ -256,6 +265,39 @@ def build_markdown(a: Analysis, ticker: str = "",
             tilt = "bullish" if val > 8 else "bearish" if val < -8 else "neutral"
             lines.append(f"| {name} | {val:+.0f} ({tilt}) | {note} |")
         lines.append("")
+
+    if forecast is not None and forecast.baseline_pct is not None:
+        f = forecast
+        lines += [
+            "## Expected move — implied vs model",
+            "",
+            "| Estimate | 1σ move | Range |",
+            "|---|---|---|",
+            f"| Implied (options, per session) | ±{f.implied_sigma:,.2f} "
+            f"| {a.spot - f.implied_sigma:,.2f} – {a.spot + f.implied_sigma:,.2f} |",
+        ]
+        if f.used_model:
+            lines.append(
+                f"| Model ({f.engine}, blended) | ±{f.predicted_sigma:,.2f} "
+                f"| {a.spot - f.predicted_sigma:,.2f} – "
+                f"{a.spot + f.predicted_sigma:,.2f} |"
+            )
+        lines += ["", f.message, ""]
+        if f.used_model:
+            lines += [
+                f"Skill is measured out of sample: {f.n_oos} walk-forward "
+                f"session(s), model MAE {f.mae_model * 100:.3f}% of spot vs "
+                f"implied {f.mae_baseline * 100:.3f}%. The model is fit only "
+                "on days before each prediction, on positioning features known "
+                "at that day's close.",
+                "",
+            ]
+            if not f.importance.empty:
+                top = ", ".join(
+                    f"{r['feature']} ({r['share']:.0%})"
+                    for _, r in f.importance.head(5).iterrows()
+                )
+                lines += [f"Leading features: {top}.", ""]
 
     if master is not None and not master.empty:
         lines += [
@@ -473,6 +515,14 @@ def build_markdown(a: Analysis, ticker: str = "",
         "- Vanna/charm flows are Black-Scholes estimates of dealer re-hedging "
         "from IV and time changes; the expected move is the 1-sigma straddle "
         "approximation from near-the-money IV at the nearest expiry.",
+        *(["- The expected-move model is a gradient-boosted-tree regression "
+           "(LightGBM) from the day's positioning state to the next session's "
+           "realized absolute move, scored by expanding-window walk-forward "
+           "against the implied move and blended at exactly its measured "
+           "out-of-sample skill — zero skill, zero weight. Realized moves come "
+           "from session closes reconstructed from print reference prices, on "
+           "a sample of days, on one ticker."]
+          if forecast is not None and forecast.baseline_pct is not None else []),
         "- Dealer positioning uses the standard GEX convention: dealers assumed "
         "long customer-sold calls and short customer-bought puts, so call OI "
         "contributes positive dealer gamma and put OI negative. Actual dealer "
