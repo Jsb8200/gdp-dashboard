@@ -682,6 +682,84 @@ def block_type_breakdown(prints: pd.DataFrame,
     return g[cols].sort_values("premium", ascending=False).reset_index(drop=True)
 
 
+def block_oi_breakdown(prints: pd.DataFrame,
+                       spot: float | None = None) -> pd.DataFrame:
+    """The same block types, measured against the **standing book**.
+
+    Premium says how much money printed; this says how much of the existing
+    open interest that flow landed on, and how far it moved it. Open
+    interest is a property of the contract, not of the print — several
+    blocks on one strike all carry the same OI — so it is taken as a max
+    per contract and summed across contracts, never summed over prints. On
+    a real export the naive version overstates it several-fold.
+
+    ``add_ratio`` is traded size over that open interest: 0.5 means this
+    type traded half the standing book on the contracts it touched, which
+    is a position being built; 0.01 is noise landing on a crowded strike.
+    ``opening_share`` is the size fraction the file flagged as opening a
+    position rather than closing one.
+
+    Columns: block_type, tier, contracts_touched, open_interest, traded,
+    add_ratio, opening_share, oi_share, level, distance_pct.
+
+    A contract touched by two block types is counted under both — the
+    shares are per type, so they describe composition, not a partition.
+    """
+    cols = ["block_type", "tier", "contracts_touched", "open_interest",
+            "traded", "add_ratio", "opening_share", "oi_share", "level",
+            "distance_pct"]
+    if prints is None or prints.empty or "is_block" not in prints:
+        return pd.DataFrame(columns=cols)
+    b = prints[prints["is_block"].fillna(False)].copy()
+    if b.empty or "open_interest" not in b:
+        return pd.DataFrame(columns=cols)
+
+    b["open_interest"] = pd.to_numeric(b["open_interest"], errors="coerce").fillna(0.0)
+    b["size"] = pd.to_numeric(b.get("size", 0.0), errors="coerce").fillna(0.0)
+    b["_open_sz"] = b["size"] * b.get("is_opening", False).astype(float)
+    if "flow_type" not in b:
+        b["flow_type"] = "block"
+    if "block_tier" not in b:
+        b["block_tier"] = ""
+    keys = ["flow_type", "block_tier"]
+    for c in ("ticker", "expiry", "strike", "type"):
+        if c in b:
+            keys.append(c)
+
+    # one row per (type, contract): OI is the contract's, size is this
+    # type's traded volume on it
+    per = b.groupby(keys, dropna=False).agg(
+        open_interest=("open_interest", "max"),
+        traded=("size", "sum"),
+        opening=("_open_sz", "sum"),
+    ).reset_index()
+    per["_wk"] = per["open_interest"] * pd.to_numeric(
+        per.get("strike", np.nan), errors="coerce")
+
+    g = per.groupby(["flow_type", "block_tier"], dropna=False).agg(
+        contracts_touched=("open_interest", "size"),
+        open_interest=("open_interest", "sum"),
+        traded=("traded", "sum"),
+        opening=("opening", "sum"),
+        _wk=("_wk", "sum"),
+    ).reset_index().rename(columns={"flow_type": "block_type",
+                                    "block_tier": "tier"})
+
+    with np.errstate(invalid="ignore", divide="ignore"):
+        g["add_ratio"] = np.where(g["open_interest"] > 0,
+                                  g["traded"] / g["open_interest"], np.nan)
+        g["opening_share"] = np.where(g["traded"] > 0,
+                                      g["opening"] / g["traded"], np.nan)
+        g["level"] = np.where(g["open_interest"] > 0,
+                              g["_wk"] / g["open_interest"], np.nan)
+    total = float(g["open_interest"].sum())
+    g["oi_share"] = g["open_interest"] / total if total > 0 else 0.0
+    ref = float(spot) if spot else np.nan
+    g["distance_pct"] = ((g["level"] / ref - 1.0) * 100.0
+                         if np.isfinite(ref) else np.nan)
+    return g[cols].sort_values("open_interest", ascending=False).reset_index(drop=True)
+
+
 def block_tier_summary(breakdown: pd.DataFrame) -> pd.DataFrame:
     """Roll a ``block_type_breakdown`` up to one row per tier, ranked by how
     much the tier means rather than by how many prints it has."""

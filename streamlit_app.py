@@ -14,8 +14,8 @@ import streamlit as st
 
 from dealer_gex.analytics import (
     Analysis, analyze, block_levels, confluence_levels, darkpool_levels,
-    BLOCK_TIER_NOTE, block_tier_summary, block_type_behaviour,
-    block_type_breakdown, data_quality,
+    BLOCK_TIER_NOTE, block_oi_breakdown, block_tier_summary,
+    block_type_behaviour, block_type_breakdown, data_quality,
     flow_books, flow_type_breakdown, fmt_dollars, institutional_mask,
     intraday_flow, level_hit_rate, magnet_levels, oi_levels, oi_walls,
     tuned_layer_weights,
@@ -672,6 +672,49 @@ def block_type_section(prints: pd.DataFrame, spot: float) -> None:
     )
 
 
+def block_oi_section(prints: pd.DataFrame, spot: float) -> None:
+    """The same block types against the standing book instead of premium."""
+    oi = block_oi_breakdown(prints, spot)
+    if oi.empty:
+        return
+    st.markdown("**Block types by open interest — what the flow landed on:**")
+    view = oi.copy()
+    view["Type"] = [f"{_TIER_ICON.get(r['tier'], '')} {r['block_type']}"
+                    for _, r in oi.iterrows()]
+    view["Open interest"] = view["open_interest"].map(lambda x: f"{x:,.0f}")
+    view["Contracts"] = view["contracts_touched"].map(lambda x: f"{x:,.0f}")
+    view["Traded"] = view["traded"].map(lambda x: f"{x:,.0f}")
+    view["Add"] = view["add_ratio"].map(
+        lambda x: "—" if pd.isna(x) else f"{x:.0%}")
+    view["Opening"] = view["opening_share"].map(
+        lambda x: "—" if pd.isna(x) else f"{x:.0%}")
+    view["Level"] = view["level"].map(
+        lambda x: f"{x:,.2f}" if pd.notna(x) else "—")
+    view["vs spot"] = view["distance_pct"].map(
+        lambda x: f"{x:+.1f}%" if pd.notna(x) else "—")
+    view["Share"] = view["oi_share"] * 100
+    st.dataframe(
+        view[["Type", "Open interest", "Contracts", "Traded", "Add", "Opening",
+              "Level", "vs spot", "Share"]],
+        use_container_width=True, hide_index=True,
+        column_config={"Share": st.column_config.ProgressColumn(
+            "% block OI", min_value=0, max_value=100, format="%.1f%%")},
+    )
+    st.caption(
+        "Open interest belongs to the *contract*, not the print, so it is "
+        "taken as a max per contract and summed across contracts — never "
+        "summed over prints, which would overstate it several-fold. "
+        "**Add** is traded size over that open interest: over ~50% means "
+        "this type is building a position rather than trading inside a "
+        "crowded strike, and over 100% means it traded more than the book "
+        "that was already there. **Opening** is the size the file flagged as "
+        "opening rather than closing. **Level** is the OI-weighted strike — "
+        "where the standing book sits, which is not always where the premium "
+        "went. A contract touched by two block types counts under both, so "
+        "the shares describe composition, not a partition."
+    )
+
+
 def block_behaviour_section(prints: pd.DataFrame) -> None:
     """What each block type means, and what the tape actually did after it."""
     bh = block_type_behaviour(prints)
@@ -773,6 +816,7 @@ def block_section(a: Analysis, prints: pd.DataFrame, books: dict,
     st.subheader("🧱 Block intelligence (smart vs fast money)")
 
     block_type_section(prints, a.spot)
+    block_oi_section(prints, a.spot)
     block_behaviour_section(prints)
     with st.expander("All flow types (sweeps, splits, everything else)"):
         flow_type_table(prints)

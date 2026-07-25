@@ -90,6 +90,14 @@ history** instead.
   type carries the **premium-weighted strike it traded at** and that level's
   distance from spot: a $25M block 5% out is a different trade from the same
   size at the money.
+- **Block types by open interest** — the same types measured against the
+  *standing book* instead of premium, which reorders them completely. Open
+  interest belongs to the contract, not the print, so it is a max per contract
+  summed across contracts — never summed over prints, which overstates it
+  several-fold (7.5× on a real export). Carries **add** (traded size over that
+  open interest: past ~50% the type is building a position rather than trading
+  inside a crowded strike), **opening** share, and the OI-weighted strike —
+  where the book sits, which is not always where the premium went.
 - **Block type behaviour** — what each type means for dealer hedging (a floor
   print leaves a dealer with a real hedging obligation; a cross may leave the
   bank flat; a stock-tied print has already hedged its delta), and whether the
@@ -160,7 +168,7 @@ estimate — this is positioning analysis, **not trading advice**.
 
 ```
 pip install pytest
-python -m pytest tests/                 # 113 tests
+python -m pytest tests/                 # 120 tests
 python scripts/make_sample_chain.py     # regenerate the bundled sample chain
 ```
 

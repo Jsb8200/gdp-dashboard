@@ -7,8 +7,8 @@ import html
 import pandas as pd
 
 from dealer_gex.analytics import (
-    Analysis, block_behaviour_note, block_tier_summary, block_type_behaviour,
-    fmt_dollars, magnet_levels, oi_levels, oi_walls,
+    Analysis, block_behaviour_note, block_oi_breakdown, block_tier_summary,
+    block_type_behaviour, fmt_dollars, magnet_levels, oi_levels, oi_walls,
 )
 
 
@@ -452,6 +452,36 @@ def build_markdown(a: Analysis, ticker: str = "",
             "percent of the premium. Stock-tied prints are delta-hedged on "
             "the trade — a volatility position, not a directional one.",
         ]
+
+        oi_bd = (block_oi_breakdown(block_prints, a.spot)
+                 if block_prints is not None and not block_prints.empty
+                 else None)
+        if oi_bd is not None and not oi_bd.empty:
+            lines += [
+                "",
+                "### By open interest — what the flow landed on",
+                "",
+                "| Block type | Open interest | Contracts | Traded | Add | Opening | Level |",
+                "|---|---|---|---|---|---|---|",
+            ]
+            for _, r in oi_bd.iterrows():
+                add = "—" if pd.isna(r["add_ratio"]) else f"{r['add_ratio']:.0%}"
+                opn = "—" if pd.isna(r["opening_share"]) else f"{r['opening_share']:.0%}"
+                lvl = "—" if pd.isna(r["level"]) else f"{r['level']:,.2f}"
+                lines.append(
+                    f"| {r['block_type']} | {r['open_interest']:,.0f} "
+                    f"| {r['contracts_touched']:,.0f} | {r['traded']:,.0f} "
+                    f"| {add} | {opn} | {lvl} |"
+                )
+            lines += [
+                "",
+                "Open interest is a property of the contract, so it is a max "
+                "per contract summed across contracts — never summed over "
+                "prints. **Add** is traded size over that open interest: past "
+                "~50% the type is building a position rather than trading "
+                "inside a crowded strike. A contract touched by two types "
+                "counts under both.",
+            ]
 
         bh = block_type_behaviour_from(block_types, block_prints)
         if bh is not None and not bh.empty:

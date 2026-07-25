@@ -5,8 +5,8 @@ import pandas as pd
 import pytest
 
 from dealer_gex.analytics import (
-    analyze, block_levels, block_type_behaviour, flow_books,
-    flow_type_breakdown, institutional_mask,
+    analyze, block_levels, block_oi_breakdown, block_type_behaviour,
+    block_type_breakdown, flow_books, flow_type_breakdown, institutional_mask,
 )
 from dealer_gex.parsing import classify_flow, parse_file
 
@@ -465,3 +465,98 @@ def test_report_includes_behaviour(real):
     assert "### Behaviour — did the tape follow?" in md
     assert "**What each type means**" in md
     assert "find the other side" in md
+
+
+# --- the open-interest view --------------------------------------------------
+
+def test_open_interest_is_max_per_contract_never_summed_over_prints():
+    """Three blocks on one 5,000-OI contract is 5,000 of standing book, not
+    15,000 — OI belongs to the contract, not the print."""
+    rows = [
+        (0, 700, "CALL", 700.0, 100, "A", 100_000, "FLR", "BLOCK"),
+        (1, 700, "CALL", 700.0, 200, "A", 200_000, "FLR", "BLOCK"),
+        (2, 700, "CALL", 700.0, 300, "A", 300_000, "FLR", "BLOCK"),
+    ]
+    p = parse_file(_behaviour_csv(rows)).prints
+    assert p["open_interest"].sum() == 60_000        # the naive number
+    oi = block_oi_breakdown(p).set_index("block_type")
+    assert oi.loc["floor block", "open_interest"] == 20_000    # one contract
+    assert oi.loc["floor block", "contracts_touched"] == 1
+    assert oi.loc["floor block", "traded"] == 600
+    assert oi.loc["floor block", "add_ratio"] == pytest.approx(600 / 20_000)
+
+
+def test_open_interest_sums_across_distinct_contracts():
+    rows = [
+        (0, 700, "CALL", 700.0, 100, "A", 100_000, "FLR", "BLOCK"),
+        (1, 710, "CALL", 700.0, 100, "A", 100_000, "FLR", "BLOCK"),
+        (2, 700, "PUT", 700.0, 100, "A", 100_000, "FLR", "BLOCK"),
+    ]
+    oi = block_oi_breakdown(parse_file(_behaviour_csv(rows)).prints)
+    row = oi.set_index("block_type").loc["floor block"]
+    assert row["contracts_touched"] == 3            # 700C, 710C, 700P
+    assert row["open_interest"] == 60_000
+
+
+def test_add_ratio_flags_a_position_being_built():
+    """Same premium, opposite meaning: heavy size on a thin strike is a new
+    position; the same size inside a crowded one is noise."""
+    rows = [
+        (0, 700, "CALL", 700.0, 5000, "A", 1_000_000, "FLR", "BLOCK"),
+        (1, 710, "CALL", 700.0, 5000, "A", 1_000_000, "AUTO", "BLOCK"),
+    ]
+    csv = _behaviour_csv(rows).decode()
+    csv = csv.replace('5000,"9,000","20,000",A,20.0%,0.010,"$1,000,000.00",FLR',
+                      '5000,"9,000","5,000",A,20.0%,0.010,"$1,000,000.00",FLR')
+    csv = csv.replace('5000,"9,000","20,000",A,20.0%,0.010,"$1,000,000.00",AUTO',
+                      '5000,"9,000","500,000",A,20.0%,0.010,"$1,000,000.00",AUTO')
+    oi = block_oi_breakdown(parse_file(csv.encode()).prints).set_index("block_type")
+    assert oi.loc["floor block", "add_ratio"] == pytest.approx(1.0)    # doubled it
+    assert oi.loc["auto block", "add_ratio"] == pytest.approx(0.01)    # noise
+    # ...and the OI ranking is the reverse of the premium ranking here
+    assert list(oi.index) == ["auto block", "floor block"]
+
+
+def test_oi_level_is_open_interest_weighted_not_premium_weighted():
+    """Where the standing book sits is not always where the premium went."""
+    rows = [
+        (0, 600, "CALL", 700.0, 10, "A", 5_000_000, "FLR", "BLOCK"),
+        (1, 800, "CALL", 700.0, 10, "A", 100, "FLR", "BLOCK"),
+    ]
+    csv = _behaviour_csv(rows).decode()
+    csv = csv.replace('10,"9,000","20,000",A,20.0%,0.010,"$5,000,000.00"',
+                      '10,"9,000","1,000",A,20.0%,0.010,"$5,000,000.00"')
+    csv = csv.replace('10,"9,000","20,000",A,20.0%,0.010,"$100.00"',
+                      '10,"9,000","99,000",A,20.0%,0.010,"$100.00"')
+    p = parse_file(csv.encode()).prints
+    oi = block_oi_breakdown(p, spot=700.0).set_index("block_type")
+    prem = block_type_breakdown(p, spot=700.0).set_index("block_type")
+    # premium is all at the 600 strike, open interest almost all at 800
+    assert prem.loc["floor block", "level"] == pytest.approx(600.0, abs=1.0)
+    assert oi.loc["floor block", "level"] == pytest.approx(798.0, abs=1.0)
+    assert oi.loc["floor block", "distance_pct"] == pytest.approx(14.0, abs=0.3)
+
+
+def test_opening_share_is_size_weighted(real):
+    oi = block_oi_breakdown(real.prints).set_index("block_type")
+    assert 0.0 <= oi["opening_share"].max() <= 1.0
+    assert oi["oi_share"].sum() == pytest.approx(1.0)
+
+
+def test_oi_breakdown_handles_missing_inputs():
+    assert block_oi_breakdown(None).empty
+    assert block_oi_breakdown(pd.DataFrame()).empty
+    assert block_oi_breakdown(pd.DataFrame({"is_block": [True]})).empty
+
+
+def test_report_carries_the_oi_table(real):
+    from dealer_gex.analytics import block_type_breakdown
+    from dealer_gex.report import build_markdown
+
+    a = analyze(real.chain, real.spots["QQQ"], real.asof)
+    md = build_markdown(a, ticker="QQQ",
+                        block_types=block_type_breakdown(real.prints),
+                        block_prints=real.prints)
+    assert "### By open interest — what the flow landed on" in md
+    assert "| Block type | Open interest | Contracts | Traded | Add |" in md
+    assert "never summed over" in md
