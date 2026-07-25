@@ -66,9 +66,9 @@ def _fmt_flow(x: float) -> str:
 
 
 def executive_summary(a: Analysis, master: pd.DataFrame | None = None,
-                      lean: dict | None = None, forecast=None) -> str:
+                      forecast=None) -> str:
     """One-paragraph TL;DR fusing regime, the top confluence level, and the
-    positioning lean — the single-glance read the rest of the page expands."""
+    expected move — the single-glance read the rest of the page expands."""
     regime = "long gamma (moves dampened, mean-reverting)" if a.regime == "long_gamma" \
         else "short gamma (moves amplified, trending)"
     bits = [f"Dealers are **{regime}**"]
@@ -92,14 +92,10 @@ def executive_summary(a: Analysis, master: pd.DataFrame | None = None,
             f"the model expects **±{forecast.predicted_sigma:,.2f}** next "
             f"session ({rich:.0%} of implied — the market is {verdict} it)"
         )
-    if lean is not None:
-        bits.append(f"positioning shows a **{lean['label'].lower()}** "
-                    f"({lean['confidence']} confidence)")
     return ". ".join(s[0].upper() + s[1:] for s in bits) + "."
 
 
-def build_playbook(a: Analysis, master: pd.DataFrame | None = None,
-                   lean: dict | None = None) -> list[str]:
+def build_playbook(a: Analysis, master: pd.DataFrame | None = None) -> list[str]:
     """Turn the day's numbers into a trading interpretation (markdown bullets)."""
     long_g = a.regime == "long_gamma"
     lines = []
@@ -196,19 +192,6 @@ def build_playbook(a: Analysis, master: pd.DataFrame | None = None,
         "into the close and ahead of expiry."
     )
 
-    if lean is not None and lean["has_flow"]:
-        strong = [c for c in lean["components"]
-                  if c[0].startswith(("Order-flow", "Block"))]
-        detail = "; ".join(
-            f"{n.split('(')[0].strip().lower()} {'bullish' if v > 8 else 'bearish' if v < -8 else 'neutral'}"
-            for n, v, _ in strong) if strong else ""
-        lines.append(
-            f"**Positioning lean: {lean['label']}** (score {lean['score']:+.0f}, "
-            f"{lean['confidence']} confidence"
-            + (f" — {detail}" if detail else "") + "). A tiebreaker on the levels "
-            "above, not an entry trigger: news and live flow override it."
-        )
-
     if a.weight_mode == "volume":
         lines.append(
             "**Volume-weighted (intraday) view** — levels reflect today's traded "
@@ -232,7 +215,7 @@ def build_markdown(a: Analysis, ticker: str = "",
                    block_books: dict | None = None,
                    block_lvls: pd.DataFrame | None = None,
                    master: pd.DataFrame | None = None,
-                   dq: dict | None = None, lean: dict | None = None,
+                   dq: dict | None = None,
                    dark_lvls: pd.DataFrame | None = None,
                    forecast=None,
                    flow_types: pd.DataFrame | None = None,
@@ -244,7 +227,7 @@ def build_markdown(a: Analysis, ticker: str = "",
     lines = [
         f"# {label}Dealer Positioning Report — {a.asof:%Y-%m-%d}",
         "",
-        f"**TL;DR** — {executive_summary(a, master, lean, forecast)}",
+        f"**TL;DR** — {executive_summary(a, master, forecast)}",
         "",
         f"## Verdict: {title}",
         "",
@@ -254,22 +237,6 @@ def build_markdown(a: Analysis, ticker: str = "",
 
     if dq is not None and dq["level"] != "high":
         lines += [f"> **Data quality: {dq['level']}.** {' '.join(dq['notes'])}", ""]
-
-    if lean is not None:
-        lines += [
-            "## Directional lean",
-            "",
-            f"**{lean['label']}** (score {lean['score']:+.0f}, "
-            f"{lean['confidence']} confidence) — a *lean*, not a signal: which "
-            "way positioning tilts, not where price will go.",
-            "",
-            "| Ingredient | Tilt | Reads |",
-            "|---|---|---|",
-        ]
-        for name, val, note in lean["components"]:
-            tilt = "bullish" if val > 8 else "bearish" if val < -8 else "neutral"
-            lines.append(f"| {name} | {val:+.0f} ({tilt}) | {note} |")
-        lines.append("")
 
     if forecast is not None and forecast.baseline_pct is not None:
         f = forecast
@@ -351,7 +318,7 @@ def build_markdown(a: Analysis, ticker: str = "",
         "## Trading interpretation",
         "",
     ]
-    for bullet in build_playbook(a, master=master, lean=lean):
+    for bullet in build_playbook(a, master=master):
         lines.append(f"- {bullet}")
 
     # The confluence "Master levels" table supersedes the flat price-sorted

@@ -607,7 +607,8 @@ BLOCK_TIER_NOTE = {
 }
 
 
-def block_type_breakdown(prints: pd.DataFrame) -> pd.DataFrame:
+def block_type_breakdown(prints: pd.DataFrame,
+                         spot: float | None = None) -> pd.DataFrame:
     """Block prints only, split by *how they printed*.
 
     A file can tag thousands of prints BLOCK and mean very different things
@@ -615,13 +616,20 @@ def block_type_breakdown(prints: pd.DataFrame) -> pd.DataFrame:
     are both "blocks". This ranks the block book by execution mechanism and
     tags each row with the tier that says how much it means.
 
+    ``level`` is the premium-weighted strike each type traded at — where
+    that money actually sat — and ``distance_pct`` places it against
+    ``spot``. ``ref_price`` is the premium-weighted underlying price when
+    those prints hit, which is the spot the trades were struck against and
+    can differ from the current spot.
+
     Columns: block_type, tier, mechanism, tied, spread_leg, prints,
     contracts, premium, median_premium, avg_premium, net_contracts,
-    direction, premium_share.
+    direction, premium_share, level, ref_price, distance_pct.
     """
     cols = ["block_type", "tier", "mechanism", "tied", "spread_leg", "prints",
             "contracts", "premium", "median_premium", "avg_premium",
-            "net_contracts", "direction", "premium_share"]
+            "net_contracts", "direction", "premium_share", "level",
+            "ref_price", "distance_pct"]
     if prints is None or prints.empty or "is_block" not in prints:
         return pd.DataFrame(columns=cols)
     b = prints[prints["is_block"].fillna(False)].copy()
@@ -639,6 +647,11 @@ def block_type_breakdown(prints: pd.DataFrame) -> pd.DataFrame:
         if c not in b:
             b[c] = default
 
+    # premium-weighted strike / reference price: where this type's money sat
+    b["_w"] = b["premium"].where(b["premium"] > 0, 0.0)
+    b["_wk"] = b["_w"] * pd.to_numeric(b["strike"], errors="coerce")
+    b["_wr"] = b["_w"] * pd.to_numeric(b.get("ref_price", np.nan), errors="coerce")
+
     g = b.groupby("flow_type", dropna=False).agg(
         tier=("block_tier", "first"),
         mechanism=("mechanism", "first"),
@@ -649,7 +662,16 @@ def block_type_breakdown(prints: pd.DataFrame) -> pd.DataFrame:
         premium=("premium", "sum"),
         median_premium=("premium", "median"),
         net_contracts=("signed_size", "sum"),
+        _w=("_w", "sum"), _wk=("_wk", "sum"), _wr=("_wr", "sum"),
     ).reset_index().rename(columns={"flow_type": "block_type"})
+
+    with np.errstate(invalid="ignore", divide="ignore"):
+        g["level"] = np.where(g["_w"] > 0, g["_wk"] / g["_w"], np.nan)
+        g["ref_price"] = np.where(g["_w"] > 0, g["_wr"] / g["_w"], np.nan)
+    ref = float(spot) if spot else float(np.nanmedian(g["ref_price"])) \
+        if np.isfinite(g["ref_price"]).any() else np.nan
+    g["distance_pct"] = ((g["level"] / ref - 1.0) * 100.0
+                         if ref and np.isfinite(ref) else np.nan)
 
     g["avg_premium"] = np.where(g["prints"] > 0, g["premium"] / g["prints"], 0.0)
     total = float(g["premium"].sum())
@@ -895,87 +917,6 @@ def block_campaigns(day_prints: list[tuple[date, pd.DataFrame]],
         ["days", "premium"], ascending=[False, False]
     ).head(top_n).reset_index(drop=True)
     return df
-
-
-def _imbalance(sub: pd.DataFrame) -> float | None:
-    """Net signed / gross directed size for a set of prints, in [-1, 1].
-    Convention-free: it reads who was the aggressor (ask vs bid), not any
-    long-calls/short-puts assumption. None when nothing is directed."""
-    if sub is None or sub.empty or "signed_size" not in sub:
-        return None
-    gross = float(sub["signed_size"].abs().sum())
-    if gross <= 0:
-        return None
-    return float(np.clip(sub["signed_size"].sum() / gross, -1.0, 1.0))
-
-
-def directional_lean(a: "Analysis", prints: pd.DataFrame | None = None) -> dict:
-    """A single **positioning lean** (-100 bearish … +100 bullish) fusing the
-    genuinely directional ingredients: order-flow aggressor imbalance, block
-    (institutional) flow direction, signed-flow customer delta, and max-pain
-    gravitation into expiry. This is a *lean*, not a trade signal — it says
-    which way positioning tilts, not where price will go. Convention-based
-    OI delta is deliberately excluded (it isn't directional).
-
-    Returns {score, label, confidence, components:[(name, value, note)],
-    has_flow}.
-    """
-    comps: list[tuple] = []  # (name, value[-100,100], weight, note, is_flow)
-    total_oi = float(a.by_strike[["call_oi", "put_oi"]].to_numpy().sum())
-
-    if prints is not None and len(prints):
-        allimb = _imbalance(prints)
-        if allimb is not None:
-            comps.append(("Order-flow aggressor", allimb * 100, 0.30,
-                          "net buy vs sell across all directed prints", True))
-        inst = institutional_mask(prints)
-        if len(inst) and inst.any():
-            binb = _imbalance(prints[inst])
-            if binb is not None:
-                comps.append(("Block (institutional) flow", binb * 100, 0.30,
-                              "net direction of negotiated size", True))
-
-    if a.weight_mode == "flow":
-        cd = -a.dex  # customer delta = opposite of dealer inventory
-        scale = 0.25 * a.spot * max(total_oi, 1.0) * 100 * a.multiplier
-        comps.append(("Customer net delta", float(np.tanh(cd / scale)) * 100, 0.25,
-                      "directional exposure from signed trades", True))
-
-    denom = a.expected_move if a.expected_move else a.spot * 0.01
-    mp = float(np.clip((a.max_pain - a.spot) / denom, -1.0, 1.0)) * 100
-    comps.append(("Max-pain pull", mp, 0.15,
-                  "into-expiry gravitation toward max pain", False))
-
-    wsum = sum(c[2] for c in comps)
-    score = sum(c[1] * c[2] for c in comps) / wsum if wsum else 0.0
-
-    flow_comps = [c for c in comps if c[4]]
-    strong_flow = [c for c in flow_comps if c[0].startswith(("Order-flow", "Block"))]
-    if not flow_comps:
-        confidence = "low"          # only max-pain pull — weak, expiry-only
-    elif len(strong_flow) >= 2:
-        confidence = "high" if (strong_flow[0][1] >= 0) == (strong_flow[1][1] >= 0) else "medium"
-    else:
-        confidence = "medium"
-
-    if score > 40:
-        label = "Bullish lean"
-    elif score > 15:
-        label = "Mild bullish lean"
-    elif score >= -15:
-        label = "Balanced — no clear lean"
-    elif score >= -40:
-        label = "Mild bearish lean"
-    else:
-        label = "Bearish lean"
-
-    return {
-        "score": round(float(score), 1),
-        "label": label,
-        "confidence": confidence,
-        "components": [(c[0], round(c[1], 1), c[3]) for c in comps],
-        "has_flow": bool(flow_comps),
-    }
 
 
 def data_quality(a: "Analysis", prints: pd.DataFrame | None = None) -> dict:

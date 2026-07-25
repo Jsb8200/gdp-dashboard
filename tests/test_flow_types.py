@@ -292,3 +292,48 @@ def test_report_ranks_block_types_by_tier(real):
     assert "| **negotiated** |" in md and "| **fragment** |" in md
     assert "tied cross block spread (stock-tied)" in md
     assert "Read premium, not print count" in md
+
+
+def test_block_types_carry_where_the_money_sat(real):
+    """Premium-weighted strike per type, placed against spot — a $25M block
+    5% out is a different trade from the same size at the money."""
+    from dealer_gex.analytics import block_type_breakdown
+
+    spot = real.spots["QQQ"]
+    br = block_type_breakdown(real.prints, spot).set_index("block_type")
+    # the two floor prints: 17,000x 710P at $25.058M and 2,100x 775P at
+    # $14.0847M are separate types, so each level is its own strike
+    assert br.loc["floor block spread", "level"] == pytest.approx(710.0)
+    assert br.loc["floor block", "level"] == pytest.approx(775.0)
+    assert br.loc["floor block", "distance_pct"] == pytest.approx(
+        (775.0 / spot - 1) * 100)
+    # ref_price is the underlying when those prints hit, not the current spot
+    assert br.loc["floor block", "ref_price"] == pytest.approx(708.40)
+
+    # a type spanning two strikes gets the premium-weighted blend
+    legs = br.loc["auto block leg"]
+    assert legs["level"] == pytest.approx(715.0)     # both legs at 715
+
+
+def test_block_level_is_premium_weighted_not_a_plain_mean():
+    from dealer_gex.analytics import block_type_breakdown
+
+    csv = REAL_CSV.replace(
+        "7,2026-07-08T14:30:00.700Z,QQQ,2026-07-17,$715.00,CALL,$708.00,10,"
+        '"4,000","11,000",B,18.0%,0.011,"$435.00",SPRD_LEG_AUTO,BLOCK,No,No,No',
+        "7,2026-07-08T14:30:00.700Z,QQQ,2026-07-17,$600.00,CALL,$708.00,10,"
+        '"4,000","11,000",B,18.0%,0.011,"$435.00",SPRD_LEG_AUTO,BLOCK,No,No,No')
+    br = block_type_breakdown(parse_file(csv.encode()).prints).set_index("block_type")
+    lvl = br.loc["auto block leg", "level"]
+    assert lvl == pytest.approx((715 * 60000 + 600 * 435) / 60435)
+    assert lvl > 714                       # the $435 leg barely moves it
+    assert lvl != pytest.approx(657.5)     # not the unweighted mean
+
+
+def test_block_level_without_a_spot_falls_back_to_reference_price():
+    from dealer_gex.analytics import block_type_breakdown
+
+    pf = parse_file(REAL_CSV.encode())
+    br = block_type_breakdown(pf.prints)          # no spot passed
+    assert br["level"].notna().all()
+    assert br["distance_pct"].notna().all()       # measured off the ref prices

@@ -15,9 +15,9 @@ import streamlit as st
 from dealer_gex.analytics import (
     Analysis, analyze, block_levels, confluence_levels, darkpool_levels,
     BLOCK_TIER_NOTE, block_tier_summary, block_type_breakdown, data_quality,
-    directional_lean, flow_books, flow_type_breakdown, fmt_dollars,
-    institutional_mask, intraday_flow, level_hit_rate, magnet_levels,
-    oi_levels, oi_walls, tuned_layer_weights,
+    flow_books, flow_type_breakdown, fmt_dollars, institutional_mask,
+    intraday_flow, level_hit_rate, magnet_levels, oi_levels, oi_walls,
+    tuned_layer_weights,
 )
 
 _CONF_ICON = {"high": "🟢", "medium": "🟡", "low": "🔴"}
@@ -114,8 +114,7 @@ def _main_bundle(chain, spot, asof, rate, weight, multiplier, prints, dark):
                                blk_lvls if not blk_lvls.empty else None,
                                dark_lvls if not dark_lvls.empty else None)
     dq = data_quality(a, prints)
-    lean = directional_lean(a, prints)
-    return a, magnets, oi_lvls, blk_books, blk_lvls, dark_lvls, master, dq, lean
+    return a, magnets, oi_lvls, blk_books, blk_lvls, dark_lvls, master, dq
 
 
 def _manual_mapping_ui(name: str, file_bytes: bytes) -> pd.DataFrame | None:
@@ -519,51 +518,6 @@ def oi_levels_section(a: Analysis, levels: pd.DataFrame) -> None:
         )
 
 
-def lean_section(lean: dict) -> None:
-    st.subheader("🧭 Directional lean")
-    score = lean["score"]
-    # diverging meter: 0 centered, bearish left (red) / bullish right (green)
-    pos = 50 + score / 2  # 0..100
-    tilt = C["good_text"] if score >= 0 else C["critical"]
-    st.markdown(
-        f"""<div style="margin:0.2rem 0 0.6rem;">
-          <div style="display:flex; justify-content:space-between;
-               font-size:0.8rem; color:{C['muted']};">
-            <span>◄ Bearish</span><span>Balanced</span><span>Bullish ►</span></div>
-          <div style="position:relative; height:12px; border-radius:6px;
-               background:linear-gradient(90deg,
-                 {C['critical']}33 0%, {C['muted']}22 50%, {C['good_text']}33 100%);
-               margin-top:4px;">
-            <div style="position:absolute; left:50%; top:-3px; width:1px; height:18px;
-                 background:{C['muted']};"></div>
-            <div style="position:absolute; left:{pos:.1f}%; top:-4px;
-                 transform:translateX(-50%); width:12px; height:20px; border-radius:4px;
-                 background:{tilt};"></div>
-          </div>
-          <div style="margin-top:0.5rem; font-size:1.1rem; font-weight:700; color:{tilt};">
-            {lean['label']} &nbsp;<span style="color:{C['muted']};
-              font-weight:400; font-size:0.85rem;">score {score:+.0f} ·
-              {_CONF_ICON[lean['confidence']]} {lean['confidence']} confidence</span>
-          </div>
-        </div>""",
-        unsafe_allow_html=True,
-    )
-    comp = pd.DataFrame(
-        [(n, f"{v:+.0f}", ("🟢 bullish" if v > 8 else "🔴 bearish" if v < -8 else "⚪ neutral"), note)
-         for n, v, note in lean["components"]],
-        columns=["Ingredient", "Tilt", "Lean", "What it reads"],
-    )
-    st.dataframe(comp, use_container_width=True, hide_index=True)
-    caveat = (
-        "A **lean, not a signal** — it says which way *positioning* tilts, "
-        "not which way price will go. News and real order flow override it. "
-    )
-    if not lean["has_flow"]:
-        caveat += ("Only max-pain gravitation is available here (no trade-"
-                   "direction data) — treat as weak.")
-    st.caption(caveat)
-
-
 def confluence_section(a: Analysis, master: pd.DataFrame, dq: dict) -> None:
     st.subheader("🎯 Master levels (confluence)")
     if dq["level"] != "high":
@@ -654,15 +608,16 @@ _TIER_ICON = {"negotiated": "🤝", "facilitated": "📣", "electronic": "⚡",
               "fragment": "🧩"}
 
 
-def block_type_section(prints: pd.DataFrame) -> None:
+def block_type_section(prints: pd.DataFrame, spot: float) -> None:
     """Blocks only, split by *how they printed* — the distinction that
     decides whether a 'block' is someone finding a counterparty for size or
     one leg of an auto-executed spread."""
-    br = block_type_breakdown(prints)
+    br = block_type_breakdown(prints, spot)
     if br.empty:
         return
     tiers = block_tier_summary(br)
-    st.markdown("**Block types — what the block book is actually made of:**")
+    st.markdown(f"**Block types — what the block book is actually made of** "
+                f"(spot **{spot:,.2f}**):")
 
     cols = st.columns(max(len(tiers), 1))
     for col, (_, t) in zip(cols, tiers.iterrows()):
@@ -682,6 +637,10 @@ def block_type_section(prints: pd.DataFrame) -> None:
     view["Contracts"] = view["contracts"].map(lambda x: f"{x:,.0f}")
     view["Prints"] = view["prints"].map(lambda x: f"{x:,.0f}")
     view["Median print"] = view["median_premium"].map(fmt_dollars)
+    view["Level"] = view["level"].map(
+        lambda x: f"{x:,.2f}" if pd.notna(x) else "—")
+    view["vs spot"] = view["distance_pct"].map(
+        lambda x: f"{x:+.1f}%" if pd.notna(x) else "—")
     view["Net"] = [
         f"{'🟢' if r['direction'] == 'bought' else '🔴' if r['direction'] == 'sold' else '⚪'} "
         f"{r['direction']} ({r['net_contracts']:+,.0f})"
@@ -689,7 +648,8 @@ def block_type_section(prints: pd.DataFrame) -> None:
     ]
     view["Share"] = view["premium_share"] * 100
     st.dataframe(
-        view[["Type", "Premium", "Contracts", "Prints", "Median print", "Net", "Share"]],
+        view[["Type", "Premium", "Contracts", "Prints", "Median print",
+              "Level", "vs spot", "Net", "Share"]],
         use_container_width=True, hide_index=True,
         column_config={"Share": st.column_config.ProgressColumn(
             "% block premium", min_value=0, max_value=100, format="%.1f%%")},
@@ -704,7 +664,10 @@ def block_type_section(prints: pd.DataFrame) -> None:
         "premium, so read premium, not prints. 🔗 marks **stock-tied** "
         "(delta-hedged) prints: a volatility trade, not a directional one — "
         "its delta is neutralized by the accompanying stock. Levels and the "
-        "block book exclude fragments by default."
+        "block book exclude fragments by default. **Level** is the "
+        "premium-weighted strike that type traded at — where the money "
+        "actually sat — and **vs spot** places it against the current "
+        "underlying price."
     )
 
 
@@ -752,7 +715,7 @@ def block_section(a: Analysis, prints: pd.DataFrame, books: dict,
                   lvls: pd.DataFrame) -> None:
     st.subheader("🧱 Block intelligence (smart vs fast money)")
 
-    block_type_section(prints)
+    block_type_section(prints, a.spot)
     with st.expander("All flow types (sweeps, splits, everything else)"):
         flow_type_table(prints)
 
@@ -1075,13 +1038,13 @@ def notable_flow_section(prints: pd.DataFrame, spot: float) -> None:
 
 
 def playbook_section(a: Analysis, master: pd.DataFrame | None = None,
-                     lean: dict | None = None) -> None:
+                     ) -> None:
     st.subheader("Trading interpretation")
     left, right = st.columns([3, 2])
     with left:
         # escape $ so st.markdown doesn't read paired dollars as LaTeX math
         st.markdown("\n".join(
-            f"- {b}" for b in build_playbook(a, master=master, lean=lean)
+            f"- {b}" for b in build_playbook(a, master=master)
         ).replace("$", "\\$"))
     with right:
         ladder = key_ladder(a).copy()
@@ -1112,7 +1075,7 @@ def report_section(a: Analysis, ticker: str, hist: pd.DataFrame | None = None,
                    blk_books: dict | None = None,
                    blk_lvls: pd.DataFrame | None = None,
                    master: pd.DataFrame | None = None,
-                   dq: dict | None = None, lean: dict | None = None,
+                   dq: dict | None = None,
                    dark_lvls: pd.DataFrame | None = None,
                    forecast: ExpectedMoveForecast | None = None,
                    flow_types: pd.DataFrame | None = None,
@@ -1120,7 +1083,7 @@ def report_section(a: Analysis, ticker: str, hist: pd.DataFrame | None = None,
     st.subheader("Report")
     md = build_markdown(a, ticker=ticker, history=hist,
                         block_books=blk_books, block_lvls=blk_lvls,
-                        master=master, dq=dq, lean=lean, dark_lvls=dark_lvls,
+                        master=master, dq=dq, dark_lvls=dark_lvls,
                         forecast=forecast, flow_types=flow_types,
                         block_types=block_types)
     stem = f"dealer-positioning-{a.asof:%Y%m%d}"
@@ -1390,7 +1353,6 @@ def main() -> None:
         magnets, oi_lvls, blk_books, blk_lvls, dark_lvls, master = _derive(
             a, merged_prints, dark_t)
         dq = data_quality(a, merged_prints)
-        lean = directional_lean(a, merged_prints)
         # validate prior levels, then tune the latest master by what held
         hr_detail = hr_summary = None
         tuned_w: dict = {}
@@ -1406,7 +1368,7 @@ def main() -> None:
             forecast = forecast_expected_move(fc_days)
     else:
         try:
-            a, magnets, oi_lvls, blk_books, blk_lvls, dark_lvls, master, dq, lean = _main_bundle(
+            a, magnets, oi_lvls, blk_books, blk_lvls, dark_lvls, master, dq = _main_bundle(
                 chain, spot, asof, rate, weight, multiplier, merged_prints, dark_t)
         except ValueError as exc:
             st.error(f"{exc} — check the as-of date against the chain's expiries.")
@@ -1424,14 +1386,13 @@ def main() -> None:
     # --- render ---
     verdict_banner(a)
     st.markdown("**TL;DR** — "
-                + executive_summary(a, master, lean, forecast).replace("$", "\\$"))
+                + executive_summary(a, master, forecast).replace("$", "\\$"))
     if zero_dte:
         st.caption(f"⏱️ 0DTE mode: {a.n_contracts:,} contracts expiring {a.asof} — "
                    "this is the gamma that binds into today's close.")
     metrics_row(a, zero_dte)
 
     confluence_section(a, master, dq)
-    lean_section(lean)
 
     if hist is not None and len(hist) >= 2:
         history_section(hist)
@@ -1463,9 +1424,9 @@ def main() -> None:
         intraday_timeline_section(merged_prints)
         notable_flow_section(merged_prints, a.spot)
 
-    playbook_section(a, master, lean)
+    playbook_section(a, master)
     tables(a)
-    report_section(a, ticker, hist, blk_books, blk_lvls, master, dq, lean,
+    report_section(a, ticker, hist, blk_books, blk_lvls, master, dq,
                    dark_lvls, forecast,
                    flow_type_breakdown(merged_prints) if merged_prints is not None else None,
                    block_type_breakdown(merged_prints) if merged_prints is not None else None)

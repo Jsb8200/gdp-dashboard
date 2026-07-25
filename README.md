@@ -55,9 +55,8 @@ history** instead.
 | Output | Meaning |
 |---|---|
 | **Verdict** | Dealers **long gamma** → buy dips / sell rips (stabilizing, mean-reverting) vs **short gamma** → sell weakness / buy strength (destabilizing, trending) |
-| **TL;DR** | One-line synthesis of regime, top level, expected move, and lean |
+| **TL;DR** | One-line synthesis of regime, top level, and expected move |
 | **Master levels (confluence)** | Every level system fused into one 0-100 ranking; a level confirmed by more independent systems ranks higher, with a high/medium/low confidence flag |
-| **Directional lean** | A -100…+100 *positioning* tilt from order-flow, block, and max-pain ingredients — a lean, not a signal |
 
 **Levels (all pinpoint, not strike-rounded)**
 
@@ -87,7 +86,10 @@ history** instead.
   QuantData export the fragments are ~60% of block *prints* and ~3% of block
   *premium*, so they are excluded from levels and the block book by default.
   Stock-tied (delta-hedged) prints are flagged 🔗 — a volatility position, not
-  a directional one — and cancelled/busted prints are dropped outright.
+  a directional one — and cancelled/busted prints are dropped outright. Each
+  type carries the **premium-weighted strike it traded at** and that level's
+  distance from spot: a $25M block 5% out is a different trade from the same
+  size at the money.
 - **Conviction filter** — rebuild *every* level from flagged prints only
   (sweeps / blocks / floor / cross / auto / splits / golden / unusual /
   opening).
