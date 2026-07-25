@@ -7,9 +7,9 @@ import html
 import pandas as pd
 
 from dealer_gex.analytics import (
-    Analysis, block_behaviour_note, block_dominance, block_oi_breakdown,
-    block_tier_summary, block_type_behaviour, fmt_dollars, magnet_levels,
-    oi_levels, oi_walls,
+    Analysis, block_behaviour_note, block_dominance, block_dte_breakdown,
+    block_oi_breakdown, block_tier_summary, block_type_behaviour, fmt_dollars,
+    magnet_levels, oi_levels, oi_walls,
 )
 
 
@@ -515,6 +515,40 @@ def build_markdown(a: Analysis, ticker: str = "",
                 "inside a crowded strike. **DTE** is open-interest-weighted — "
                 "the horizon of the book rather than of the money. A contract "
                 "touched by two types counts under both.",
+            ]
+
+        dte_bd = (block_dte_breakdown(block_prints, a.spot)
+                  if block_prints is not None and not block_prints.empty
+                  else None)
+        if dte_bd is not None and not dte_bd.empty:
+            lines += [
+                "",
+                "### By expiration — where in time the size sits",
+                "",
+                "| Horizon | Premium | % | Prints | Contracts | Open interest "
+                "| Add | Opening | Level | Owned by |",
+                "|---|---|---|---|---|---|---|---|---|---|",
+            ]
+            for _, r in dte_bd.iterrows():
+                add = "—" if pd.isna(r["add_ratio"]) else f"{r['add_ratio']:.0%}"
+                opn = "—" if pd.isna(r["opening_share"]) else f"{r['opening_share']:.0%}"
+                lvl = "—" if pd.isna(r["level"]) else f"{r['level']:,.2f}"
+                oi_v = "—" if pd.isna(r["open_interest"]) else f"{r['open_interest']:,.0f}"
+                own = r["top_type"] or "—"
+                if own != "—" and pd.notna(r["top_share"]):
+                    own += f" ({r['top_share']:.0%})"
+                lines.append(
+                    f"| {r['horizon']} ({r['dte_range']}d) "
+                    f"| {fmt_dollars(r['premium'])} "
+                    f"| {r['premium_share'] * 100:.0f}% | {r['prints']:,.0f} "
+                    f"| {r['contracts']:,.0f} | {oi_v} | {add} | {opn} "
+                    f"| {lvl} | {own} |"
+                )
+            lines += [
+                "",
+                "In tenor order, not size order. Watch the count-versus-money "
+                "split: 0DTE usually carries most of the prints and least of "
+                "the premium.",
             ]
 
         bh = block_type_behaviour_from(block_types, block_prints)

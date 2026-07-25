@@ -121,6 +121,13 @@ history** instead.
   open interest: past ~50% the type is building a position rather than trading
   inside a crowded strike), **opening** share, and the OI-weighted strike —
   where the book sits, which is not always where the premium went.
+- **Block types by expiration** — a separate table reading the block book as a
+  *term structure*: one row per horizon bucket, in tenor order rather than size
+  order, with premium, prints, contracts, open interest, add ratio, opening
+  share, the premium-weighted level and the type that owns each bucket. The
+  count-versus-money split is the thing to watch — on a real export 0DTE holds
+  52% of block prints and 5% of block premium, while the monthly bucket holds
+  15% of prints and 37% of premium.
 - **Block type behaviour** — what each type means for dealer hedging (a floor
   print leaves a dealer with a real hedging obligation; a cross may leave the
   bank flat; a stock-tied print has already hedged its delta), and whether the
@@ -191,7 +198,7 @@ estimate — this is positioning analysis, **not trading advice**.
 
 ```
 pip install pytest
-python -m pytest tests/                 # 137 tests
+python -m pytest tests/                 # 144 tests
 python scripts/make_sample_chain.py     # regenerate the bundled sample chain
 ```
 

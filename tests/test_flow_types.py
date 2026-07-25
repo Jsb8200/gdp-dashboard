@@ -5,9 +5,9 @@ import pandas as pd
 import pytest
 
 from dealer_gex.analytics import (
-    analyze, block_dominance, block_levels, block_oi_breakdown,
-    block_type_behaviour, block_type_breakdown, flow_books,
-    flow_type_breakdown, institutional_mask,
+    analyze, block_dominance, block_dte_breakdown, block_levels,
+    block_oi_breakdown, block_type_behaviour, block_type_breakdown,
+    flow_books, flow_type_breakdown, institutional_mask,
 )
 from dealer_gex.parsing import classify_flow, parse_file
 
@@ -794,3 +794,92 @@ def test_report_shows_dte_in_both_block_tables(real):
     assert "| Median print | DTE | Level |" in md
     assert "| Add | Opening | DTE | Level |" in md
     assert "open-interest-weighted" in md
+
+
+# --- the term-structure table ------------------------------------------------
+
+def test_dte_table_is_in_tenor_order_not_size_order():
+    """A term structure read biggest-first is not a term structure."""
+    rows = [
+        (0, 700, "CALL", 700.0, 10, "A", 1_000, "FLR", "BLOCK"),
+        (1, 700, "CALL", 700.0, 10, "A", 50_000_000, "FLR", "BLOCK"),
+    ]
+    csv = _behaviour_csv(rows).decode()
+    csv = csv.replace("2026-08-21,$700.00,CALL,$700.00,10,\"9,000\",\"20,000\",A,20.0%,0.010,\"$1,000.00\"",
+                      "2026-07-08,$700.00,CALL,$700.00,10,\"9,000\",\"20,000\",A,20.0%,0.010,\"$1,000.00\"")
+    d = block_dte_breakdown(parse_file(csv.encode()).prints)
+    assert list(d["horizon"]) == ["0DTE", "monthly"]      # not $50M first
+    assert d.iloc[0]["premium"] == 1_000.0
+    assert list(d["dte_range"]) == ["0", "8–45"]
+
+
+def test_dte_table_counts_open_interest_once_per_contract():
+    """Three prints on one contract inside a bucket contribute its book
+    once, same rule as the per-type table."""
+    rows = [
+        (0, 700, "CALL", 700.0, 100, "A", 100_000, "FLR", "BLOCK"),
+        (1, 700, "CALL", 700.0, 100, "A", 100_000, "AUTO", "BLOCK"),
+        (2, 710, "CALL", 700.0, 100, "A", 100_000, "COB", "BLOCK"),
+    ]
+    d = block_dte_breakdown(parse_file(_behaviour_csv(rows)).prints)
+    row = d.set_index("horizon").loc["monthly"]
+    assert row["prints"] == 3
+    assert row["open_interest"] == 40_000          # 700C and 710C, once each
+    assert row["contracts"] == 300
+    assert row["add_ratio"] == pytest.approx(300 / 40_000)
+
+
+def test_dte_table_names_who_owns_each_bucket():
+    rows = [
+        (0, 700, "CALL", 700.0, 10, "A", 9_000_000, "FLR", "BLOCK"),
+        (1, 700, "CALL", 700.0, 10, "A", 1_000_000, "AUTO", "BLOCK"),
+    ]
+    d = block_dte_breakdown(parse_file(_behaviour_csv(rows)).prints)
+    row = d.set_index("horizon").loc["monthly"]
+    assert row["top_type"] == "FLR single leg block"
+    assert row["top_share"] == pytest.approx(0.9)
+
+
+def test_dte_table_splits_print_count_from_premium(real):
+    """The split the table exists to show: near-dated buckets can hold most
+    of the prints and least of the money."""
+    d = block_dte_breakdown(real.prints).set_index("horizon")
+    assert set(d.index) <= {"0DTE", "weekly", "monthly", "quarterly", "LEAP"}
+    assert d["premium_share"].sum() == pytest.approx(1.0)
+    # every bucket that exists is ranked and labelled
+    assert (d["dte_range"] != "").all()
+
+
+def test_dte_table_direction_and_level_are_per_bucket():
+    rows = [
+        (0, 800, "CALL", 700.0, 100, "A", 1_000_000, "FLR", "BLOCK"),
+        (1, 600, "PUT", 700.0, 100, "A", 1_000_000, "FLR", "BLOCK"),
+    ]
+    csv = _behaviour_csv(rows).decode().replace(
+        "2026-08-21,$600.00,PUT", "2027-01-15,$600.00,PUT")
+    d = block_dte_breakdown(parse_file(csv.encode()).prints,
+                            spot=700.0).set_index("horizon")
+    assert d.loc["monthly", "level"] == pytest.approx(800.0)
+    assert d.loc["monthly", "distance_pct"] == pytest.approx(14.3, abs=0.1)
+    assert d.loc["LEAP", "level"] == pytest.approx(600.0)
+    assert d.loc["LEAP", "distance_pct"] == pytest.approx(-14.3, abs=0.1)
+    assert d.loc["monthly", "direction"] == "bought"
+
+
+def test_dte_table_handles_missing_inputs():
+    assert block_dte_breakdown(None).empty
+    assert block_dte_breakdown(pd.DataFrame()).empty
+    p = parse_file(FLOW_CSV.encode()).prints.drop(columns=["dte"])
+    assert block_dte_breakdown(p).empty
+
+
+def test_report_carries_the_expiration_table(real):
+    from dealer_gex.report import build_markdown
+
+    a = analyze(real.chain, real.spots["QQQ"], real.asof)
+    md = build_markdown(a, ticker="QQQ",
+                        block_types=block_type_breakdown(real.prints, a.spot),
+                        block_prints=real.prints)
+    assert "### By expiration — where in time the size sits" in md
+    assert "| Horizon | Premium | % | Prints |" in md
+    assert "In tenor order, not size order" in md

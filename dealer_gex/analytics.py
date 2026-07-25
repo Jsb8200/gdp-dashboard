@@ -991,6 +991,105 @@ def block_type_behaviour(prints: pd.DataFrame, horizon_min: int = 30,
     return out[cols].reset_index(drop=True)
 
 
+#: Bucket order for the term-structure view, near-dated first.
+HORIZON_ORDER = ["0DTE", "weekly", "monthly", "quarterly", "LEAP"]
+HORIZON_RANGE = {"0DTE": "0", "weekly": "1–7", "monthly": "8–45",
+                 "quarterly": "46–180", "LEAP": "181+"}
+
+
+def block_dte_breakdown(prints: pd.DataFrame,
+                        spot: float | None = None) -> pd.DataFrame:
+    """Block flow by **when it expires**, near-dated first.
+
+    The per-type tables answer "what is this type's horizon"; this answers
+    the other direction — how the block book is distributed across tenor,
+    and which type owns each bucket. Rows are ordered by horizon rather
+    than by size, because a term structure read out of order is not a term
+    structure.
+
+    Open interest follows the same max-per-contract rule as
+    ``block_oi_breakdown``, so a contract traded by several prints in one
+    bucket contributes its book once.
+
+    Columns: horizon, dte_range, prints, contracts, premium,
+    premium_share, open_interest, add_ratio, opening_share, net_contracts,
+    direction, level, distance_pct, top_type, top_share.
+    """
+    cols = ["horizon", "dte_range", "prints", "contracts", "premium",
+            "premium_share", "open_interest", "add_ratio", "opening_share",
+            "net_contracts", "direction", "level", "distance_pct",
+            "top_type", "top_share"]
+    if prints is None or prints.empty or "is_block" not in prints:
+        return pd.DataFrame(columns=cols)
+    b = prints[prints["is_block"].fillna(False)].copy()
+    if b.empty or "dte" not in b:
+        return pd.DataFrame(columns=cols)
+
+    b["_dte"] = pd.to_numeric(b["dte"], errors="coerce")
+    b = b[b["_dte"].notna()]
+    if b.empty:
+        return pd.DataFrame(columns=cols)
+    b["horizon"] = [horizon_label(d) for d in b["_dte"]]
+    b = b[b["horizon"] != ""]
+    if b.empty:
+        return pd.DataFrame(columns=cols)
+
+    b["premium"] = pd.to_numeric(b.get("premium", 0.0), errors="coerce").fillna(0.0)
+    b["size"] = pd.to_numeric(b.get("size", 0.0), errors="coerce").fillna(0.0)
+    b["signed_size"] = pd.to_numeric(b.get("signed_size", 0.0),
+                                     errors="coerce").fillna(0.0)
+    b["open_interest"] = pd.to_numeric(b.get("open_interest", 0.0),
+                                       errors="coerce").fillna(0.0)
+    b["_open_sz"] = b["size"] * b.get("is_opening", False).astype(float)
+    b["_wk"] = b["premium"] * pd.to_numeric(b["strike"], errors="coerce")
+
+    g = b.groupby("horizon", dropna=False).agg(
+        prints=("premium", "size"),
+        contracts=("size", "sum"),
+        premium=("premium", "sum"),
+        net_contracts=("signed_size", "sum"),
+        opening=("_open_sz", "sum"),
+        _wk=("_wk", "sum"),
+    ).reset_index()
+
+    # open interest: max per contract inside each bucket, then summed
+    ckeys = ["horizon"] + [c for c in ("ticker", "expiry", "strike", "type")
+                           if c in b]
+    per = b.groupby(ckeys, dropna=False)["open_interest"].max().reset_index()
+    g = g.merge(per.groupby("horizon")["open_interest"].sum().reset_index(),
+                on="horizon", how="left")
+
+    total = float(g["premium"].sum())
+    g["premium_share"] = g["premium"] / total if total > 0 else 0.0
+    with np.errstate(invalid="ignore", divide="ignore"):
+        g["add_ratio"] = np.where(g["open_interest"] > 0,
+                                  g["contracts"] / g["open_interest"], np.nan)
+        g["opening_share"] = np.where(g["contracts"] > 0,
+                                      g["opening"] / g["contracts"], np.nan)
+        g["level"] = np.where(g["premium"] > 0, g["_wk"] / g["premium"], np.nan)
+    ref = float(spot) if spot else np.nan
+    g["distance_pct"] = ((g["level"] / ref - 1.0) * 100.0
+                         if np.isfinite(ref) else np.nan)
+    tilt = np.where(g["contracts"] > 0, g["net_contracts"] / g["contracts"], 0.0)
+    g["direction"] = np.where(tilt > 0.15, "bought",
+                       np.where(tilt < -0.15, "sold", "two-way"))
+
+    # who owns each bucket
+    if "flow_type" in b:
+        owner = b.groupby(["horizon", "flow_type"])["premium"].sum().reset_index()
+        idx = owner.groupby("horizon")["premium"].idxmax()
+        top = owner.loc[idx].set_index("horizon")
+        g["top_type"] = g["horizon"].map(top["flow_type"])
+        g["top_share"] = (g["horizon"].map(top["premium"]) / g["premium"]).where(
+            g["premium"] > 0)
+    else:
+        g["top_type"], g["top_share"] = "", np.nan
+
+    g["dte_range"] = g["horizon"].map(HORIZON_RANGE).fillna("")
+    g["_rank"] = g["horizon"].map({h: i for i, h in enumerate(HORIZON_ORDER)})
+    return g.sort_values("_rank")[cols].reset_index(drop=True)
+
+
 def block_dominance(prints: pd.DataFrame, spot: float | None = None,
                     min_share: float = 0.05) -> dict:
     """Which block type is actually running this book.

@@ -14,8 +14,8 @@ import streamlit as st
 
 from dealer_gex.analytics import (
     Analysis, analyze, block_levels, confluence_levels, darkpool_levels,
-    BLOCK_TIER_NOTE, block_dominance, block_oi_breakdown, block_tier_summary,
-    block_type_behaviour, block_type_breakdown, data_quality,
+    BLOCK_TIER_NOTE, block_dominance, block_dte_breakdown, block_oi_breakdown,
+    block_tier_summary, block_type_behaviour, block_type_breakdown, data_quality,
     flow_books, flow_type_breakdown, fmt_dollars, institutional_mask,
     intraday_flow, level_hit_rate, magnet_levels, oi_levels, oi_walls,
     tuned_layer_weights,
@@ -773,6 +773,65 @@ def block_oi_section(prints: pd.DataFrame, spot: float,
     )
 
 
+_HORIZON_ICON = {"0DTE": "⚡", "weekly": "📆", "monthly": "🗓️",
+                 "quarterly": "📈", "LEAP": "🏔️"}
+
+
+def block_dte_section(prints: pd.DataFrame, spot: float) -> None:
+    """Block flow by tenor — the term structure of the block book."""
+    d = block_dte_breakdown(prints, spot)
+    if d.empty:
+        return
+    st.markdown("**Block types by expiration — where in time the size sits:**")
+    view = d.copy()
+    view["Horizon"] = [
+        f"{_HORIZON_ICON.get(r['horizon'], '')} {r['horizon']} "
+        f"({r['dte_range']}d)" for _, r in d.iterrows()
+    ]
+    view["Premium"] = view["premium"].map(fmt_dollars)
+    view["Prints"] = view["prints"].map(lambda x: f"{x:,.0f}")
+    view["Contracts"] = view["contracts"].map(lambda x: f"{x:,.0f}")
+    view["Open interest"] = view["open_interest"].map(
+        lambda x: "—" if pd.isna(x) else f"{x:,.0f}")
+    view["Add"] = view["add_ratio"].map(
+        lambda x: "—" if pd.isna(x) else f"{x:.0%}")
+    view["Opening"] = view["opening_share"].map(
+        lambda x: "—" if pd.isna(x) else f"{x:.0%}")
+    view["Level"] = view["level"].map(
+        lambda x: "—" if pd.isna(x) else f"{x:,.2f}")
+    view["vs spot"] = view["distance_pct"].map(
+        lambda x: "—" if pd.isna(x) else f"{x:+.1f}%")
+    view["Net"] = [
+        f"{'🟢' if r['direction'] == 'bought' else '🔴' if r['direction'] == 'sold' else '⚪'} "
+        f"{r['direction']}" for _, r in d.iterrows()
+    ]
+    view["Owned by"] = [
+        "—" if not r["top_type"] else
+        f"{r['top_type']}" + ("" if pd.isna(r["top_share"])
+                              else f" ({r['top_share']:.0%})")
+        for _, r in d.iterrows()
+    ]
+    view["Share"] = view["premium_share"] * 100
+    st.dataframe(
+        view[["Horizon", "Premium", "Prints", "Contracts", "Open interest",
+              "Add", "Opening", "Level", "vs spot", "Net", "Owned by", "Share"]],
+        use_container_width=True, hide_index=True,
+        column_config={"Share": st.column_config.ProgressColumn(
+            "% block premium", min_value=0, max_value=100, format="%.1f%%")},
+    )
+    st.caption(
+        "Rows are in tenor order, not size order — a term structure read out "
+        "of order is not a term structure. The per-type tables above say what "
+        "*a type's* horizon is; this says how the block book is spread across "
+        "time and who owns each bucket. Watch the count-versus-money split: "
+        "0DTE typically carries most of the prints and least of the premium. "
+        "**Add** is traded size over the open interest in that bucket, "
+        "**Opening** the share flagged as opening rather than closing, and "
+        "**Level** the premium-weighted strike — near-dated flow clusters at "
+        "spot, long-dated flow does not have to."
+    )
+
+
 def block_behaviour_section(prints: pd.DataFrame) -> None:
     """What each block type means, and what the tape actually did after it."""
     bh = block_type_behaviour(prints)
@@ -876,6 +935,7 @@ def block_section(a: Analysis, prints: pd.DataFrame, books: dict,
     dom = block_dominance_banner(prints, a.spot)
     block_type_section(prints, a.spot, dom)
     block_oi_section(prints, a.spot, dom)
+    block_dte_section(prints, a.spot)
     block_behaviour_section(prints)
     with st.expander("All flow types (sweeps, splits, everything else)"):
         flow_type_table(prints)
