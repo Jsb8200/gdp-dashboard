@@ -74,9 +74,19 @@ history** instead.
 - **Net GEX / DEX / vanna / charm** — dollar hedging demand per 1% move, dealer
   delta inventory, and forced re-hedging from IV drops and time decay.
 - **Block intelligence** — the blocks-only vs sweeps-only books side by side
-  (smart vs fast money) with an automatic aligned/divergent verdict.
+  (smart vs fast money) with an automatic aligned/divergent verdict, plus a
+  floor-only book when the file distinguishes floor prints.
 - **Conviction filter** — rebuild *every* level from flagged prints only
-  (sweeps / blocks / splits / golden / unusual / opening).
+  (sweeps / blocks / floor / cross / auto / splits / golden / unusual /
+  opening).
+- **Consolidated flow by type** — premium, contracts, prints, average size and
+  net direction per *precise* execution type: `floor block` 🏛️🧱, `auto sweep`
+  ⚡🌊, `cross` 🔁, `block`, `sweep`… Venue (floor / auto / cross) and shape
+  (block / sweep / split / multi) are read as **separate axes**, so a
+  floor-negotiated block is never averaged in with the electronic default.
+  Floor and cross prints count as institutional size; plain `auto` does not.
+  A code the mapping doesn't know keeps its raw text instead of being silently
+  bucketed.
 - **Notable flow** — the largest premium prints with flags.
 - **Intraday timeline** — cumulative signed flow through the session, split by
   blocks vs sweeps: *when* and *who*.
@@ -127,7 +137,7 @@ estimate — this is positioning analysis, **not trading advice**.
 
 ```
 pip install pytest
-python -m pytest tests/                 # 84 tests
+python -m pytest tests/                 # 99 tests
 python scripts/make_sample_chain.py     # regenerate the bundled sample chain
 ```
 

@@ -487,7 +487,7 @@ def block_levels(prints: pd.DataFrame, spot: float, top_n: int = 5) -> pd.DataFr
     """
     empty = pd.DataFrame(columns=["level", "side", "direction", "strength",
                                   "premium", "distance_pct", "anchor_strike"])
-    b = prints[prints["is_block"] & prints["strike"].notna()].copy()
+    b = prints[institutional_mask(prints) & prints["strike"].notna()].copy()
     b = b[b["strike"].between(spot * 0.90, spot * 1.10) & (b["premium"] > 0)]
     if b.empty:
         return empty
@@ -545,14 +545,88 @@ def block_levels(prints: pd.DataFrame, spot: float, top_n: int = 5) -> pd.DataFr
     return df
 
 
+def flow_type_breakdown(prints: pd.DataFrame, min_share: float = 0.0) -> pd.DataFrame:
+    """Consolidated premium and quantity per precise flow type.
+
+    One row per execution type as the file tagged it — ``floor block``,
+    ``auto sweep``, ``block``, ``cross``, or the raw code when it matched
+    nothing — so floor-negotiated size is never averaged in with the
+    electronic default.
+
+    Columns: flow_type, venue, shape, prints, contracts, premium,
+    avg_premium (per print), net_contracts (signed: + customer bought),
+    direction, premium_share, institutional.
+    """
+    cols = ["flow_type", "venue", "shape", "prints", "contracts", "premium",
+            "avg_premium", "net_contracts", "direction", "premium_share",
+            "institutional"]
+    if prints is None or prints.empty or "flow_type" not in prints:
+        return pd.DataFrame(columns=cols)
+
+    p = prints.copy()
+    p["premium"] = pd.to_numeric(p.get("premium", 0.0), errors="coerce").fillna(0.0)
+    p["size"] = pd.to_numeric(p.get("size", 0.0), errors="coerce").fillna(0.0)
+    signed = pd.to_numeric(p.get("signed_size", 0.0), errors="coerce").fillna(0.0)
+    p["signed_size"] = signed
+
+    grouped = p.groupby("flow_type", dropna=False).agg(
+        venue=("flow_venue", "first"),
+        shape=("flow_shape", "first"),
+        prints=("flow_type", "size"),
+        contracts=("size", "sum"),
+        premium=("premium", "sum"),
+        net_contracts=("signed_size", "sum"),
+        institutional=("is_institutional", "any"),
+    ).reset_index()
+
+    grouped["avg_premium"] = np.where(
+        grouped["prints"] > 0, grouped["premium"] / grouped["prints"], 0.0)
+    total = float(grouped["premium"].sum())
+    grouped["premium_share"] = grouped["premium"] / total if total > 0 else 0.0
+    # direction from signed size relative to the type's own traded size
+    tilt = np.where(grouped["contracts"] > 0,
+                    grouped["net_contracts"] / grouped["contracts"], 0.0)
+    grouped["direction"] = np.where(tilt > 0.15, "bought",
+                            np.where(tilt < -0.15, "sold", "two-way"))
+    out = grouped[cols].sort_values("premium", ascending=False).reset_index(drop=True)
+    return out[out["premium_share"] >= min_share] if min_share > 0 else out
+
+
+def institutional_mask(prints: pd.DataFrame, types: list[str] | None = None) -> pd.Series:
+    """Which prints count as institutional size.
+
+    Defaults to the parser's ``is_institutional`` (block-shaped, floor, or
+    cross prints). Pass ``types`` — display labels from
+    ``flow_type_breakdown`` — to override that with an explicit selection,
+    which is what the sidebar picker does.
+    """
+    if prints is None or prints.empty:
+        return pd.Series(dtype=bool)
+    if types is not None:
+        if "flow_type" not in prints:
+            return pd.Series(False, index=prints.index)
+        return prints["flow_type"].isin(types)
+    if "is_institutional" in prints:
+        return prints["is_institutional"].fillna(False)
+    if "is_block" in prints:
+        return prints["is_block"].fillna(False)
+    return pd.Series(False, index=prints.index)
+
+
 def flow_books(prints: pd.DataFrame, spot: float, asof: date, rate: float = 0.045,
                multiplier: float = DEFAULT_MULTIPLIER) -> dict[str, "Analysis"]:
     """Analyze the blocks-only and sweeps-only books separately (signed-flow
     weighting) — patient institutional size vs urgent aggressive flow."""
     from dealer_gex.parsing import ChainParseError, aggregate_prints
 
+    defs = [("blocks", institutional_mask(prints)), ("sweeps", prints["is_sweep"])]
+    # floor prints get their own book when the file distinguishes them: an
+    # upstairs-negotiated book reads differently from electronic size
+    if "is_floor" in prints and prints["is_floor"].any():
+        defs.append(("floor", prints["is_floor"]))
+
     books: dict[str, Analysis] = {}
-    for name, mask in (("blocks", prints["is_block"]), ("sweeps", prints["is_sweep"])):
+    for name, mask in defs:
         sub = prints[mask]
         if sub.empty or sub["signed_size"].abs().sum() == 0:
             continue
@@ -694,7 +768,7 @@ def block_campaigns(day_prints: list[tuple[date, pd.DataFrame]],
     for d, p in day_prints:
         if p is None or p.empty:
             continue
-        b = p[p["is_block"] & p["strike"].notna()].copy()
+        b = p[institutional_mask(p) & p["strike"].notna()].copy()
         if b.empty:
             continue
         b["day"] = d
@@ -760,8 +834,9 @@ def directional_lean(a: "Analysis", prints: pd.DataFrame | None = None) -> dict:
         if allimb is not None:
             comps.append(("Order-flow aggressor", allimb * 100, 0.30,
                           "net buy vs sell across all directed prints", True))
-        if "is_block" in prints and prints["is_block"].any():
-            binb = _imbalance(prints[prints["is_block"]])
+        inst = institutional_mask(prints)
+        if len(inst) and inst.any():
+            binb = _imbalance(prints[inst])
             if binb is not None:
                 comps.append(("Block (institutional) flow", binb * 100, 0.30,
                               "net direction of negotiated size", True))

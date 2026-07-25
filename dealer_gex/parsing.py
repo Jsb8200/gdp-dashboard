@@ -75,6 +75,72 @@ SYNONYMS = {
 def _yes(s: pd.Series) -> pd.Series:
     return s.astype(str).str.strip().str.upper().isin(["YES", "TRUE", "Y", "1"])
 
+
+# A consolidated-flow type mixes two independent things: *where/how* the
+# print executed (floor, electronic, cross) and *what shape* the order took
+# (block, sweep, split, multi-leg). "FLR BLOCK" is both, "AUTO" is only a
+# venue. Collapsing them into one flag loses the distinction that matters
+# most — a floor-negotiated block is upstairs institutional size, an
+# auto-executed print is just the electronic default.
+FLOW_VENUES = {
+    "floor": ("FLR", "FLOOR", "PIT", "OPENOUTCRY", "OPEN OUTCRY"),
+    "auto":  ("AUTO", "ELECTRONIC", "ELEC", "AUTOEX"),
+    "cross": ("CROSS", "XCRS", "QCC", "COMBOCROSS"),
+}
+FLOW_SHAPES = {
+    "block": ("BLOCK", "BLK"),
+    "sweep": ("SWEEP", "SWP"),
+    "split": ("SPLIT",),
+    "multi": ("MULTI", "MLEG", "MULTILEG", "COMBO", "SPREAD"),
+}
+#: Venues whose prints are negotiated size, not just an execution route.
+INSTITUTIONAL_VENUES = ("floor", "cross")
+
+
+def _has_any(s: pd.Series, needles: tuple[str, ...]) -> pd.Series:
+    hit = pd.Series(False, index=s.index)
+    for n in needles:
+        hit |= s.str.contains(n, na=False, regex=False)
+    return hit
+
+
+def classify_flow(consolidation) -> pd.DataFrame:
+    """Split a consolidated-flow type column into precise, orthogonal parts.
+
+    Returns a frame indexed like the input with:
+
+    * ``consolidation`` — the raw value, upper-cased and squeezed (never
+      dropped, so an unmapped code stays visible downstream);
+    * ``flow_venue`` — ``floor`` / ``auto`` / ``cross`` / ``""``;
+    * ``flow_shape`` — ``block`` / ``sweep`` / ``split`` / ``multi`` /
+      ``single``;
+    * ``flow_type`` — the display label, e.g. ``floor block``, ``auto
+      sweep``, ``block``, ``floor``. A value matching nothing keeps its raw
+      text rather than being silently bucketed as ``single``.
+    """
+    # fillna first: pandas 3 keeps NA through astype(str)
+    s = pd.Series(consolidation).fillna("").astype(str).str.upper()
+    s = s.str.replace(r"[_\-/|]+", " ", regex=True).str.strip()
+    s = s.replace({"NAN": "", "NONE": "", "NAT": ""})
+    squeezed = s.str.replace(" ", "", regex=False)
+
+    venue = pd.Series("", index=s.index, dtype=object)
+    for name, needles in FLOW_VENUES.items():
+        venue = venue.mask((venue == "") & _has_any(squeezed, needles), name)
+
+    shape = pd.Series("single", index=s.index, dtype=object)
+    for name, needles in FLOW_SHAPES.items():   # block beats sweep beats split
+        shape = shape.mask((shape == "single") & _has_any(squeezed, needles), name)
+
+    label = (venue + " " + shape.where(shape != "single", "")).str.strip()
+    # nothing recognized: show the raw code so unmapped vocabularies surface
+    unknown = (venue == "") & (shape == "single")
+    label = label.mask(unknown & (s != ""), s)
+    label = label.mask(unknown & (s == ""), "single")
+    return pd.DataFrame({"consolidation": s, "flow_venue": venue,
+                         "flow_shape": shape, "flow_type": label})
+
+
 _REQUIRED = ["expiry", "strike", "type", "open_interest", "iv"]
 
 
@@ -270,19 +336,31 @@ def _parse_trade_flow(raw: pd.DataFrame) -> ParsedFile:
         df["side"] = ""
     df["signed_size"] = sign * df["size"]
 
-    # conviction flags: sweeps come from the consolidation type, the rest
-    # from QuantData's Yes/No columns
+    # conviction flags: shape and venue come from the consolidation type,
+    # the rest from QuantData's Yes/No columns
     if "consolidation" in cols:
-        ctype = raw[cols["consolidation"]].astype(str).str.upper()
-        df["is_sweep"] = ctype.str.contains("SWEEP", na=False)
-        df["is_block"] = ctype.str.contains("BLOCK", na=False)
-        # SPLIT: one order worked across executions — between a sweep and a
-        # block; large patient flow, still conviction
-        df["is_split"] = ctype.str.contains("SPLIT", na=False)
+        kinds = classify_flow(raw[cols["consolidation"]])
     else:
-        df["is_sweep"] = False
-        df["is_block"] = False
-        df["is_split"] = False
+        kinds = classify_flow(pd.Series("", index=df.index))
+    kinds.index = df.index
+    df["consolidation"] = kinds["consolidation"]
+    df["flow_venue"] = kinds["flow_venue"]
+    df["flow_shape"] = kinds["flow_shape"]
+    df["flow_type"] = kinds["flow_type"]
+    df["is_sweep"] = kinds["flow_shape"] == "sweep"
+    df["is_block"] = kinds["flow_shape"] == "block"
+    # SPLIT: one order worked across executions — between a sweep and a
+    # block; large patient flow, still conviction
+    df["is_split"] = kinds["flow_shape"] == "split"
+    df["is_floor"] = kinds["flow_venue"] == "floor"
+    df["is_auto"] = kinds["flow_venue"] == "auto"
+    df["is_cross"] = kinds["flow_venue"] == "cross"
+    # Negotiated size, whatever it was tagged: a BLOCK-shaped print, or one
+    # that printed on the floor / as a cross. AUTO is deliberately excluded —
+    # electronic execution is the default route, not a size signal.
+    df["is_institutional"] = (
+        df["is_block"] | kinds["flow_venue"].isin(INSTITUTIONAL_VENUES)
+    )
     for flag in ("is_golden", "is_unusual", "is_opening"):
         df[flag] = _yes(raw[cols[flag]]) if flag in cols else False
 

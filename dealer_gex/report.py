@@ -231,7 +231,8 @@ def build_markdown(a: Analysis, ticker: str = "",
                    master: pd.DataFrame | None = None,
                    dq: dict | None = None, lean: dict | None = None,
                    dark_lvls: pd.DataFrame | None = None,
-                   forecast=None) -> str:
+                   forecast=None,
+                   flow_types: pd.DataFrame | None = None) -> str:
     title, body = regime_text(a.regime)
     label = f"{ticker.upper()} " if ticker else ""
     flip = f"{a.gamma_flip:,.2f}" if a.gamma_flip is not None else "no crossing in ±15% range"
@@ -406,7 +407,8 @@ def build_markdown(a: Analysis, ticker: str = "",
             "|---|---|---|---|---|---|---|",
         ]
         for name, label in (("blocks", "Blocks (institutional)"),
-                            ("sweeps", "Sweeps (urgent)")):
+                            ("sweeps", "Sweeps (urgent)"),
+                            ("floor", "Floor (negotiated)")):
             if name in block_books:
                 bk = block_books[name]
                 flip_v = f"{bk.gamma_flip:,.2f}" if bk.gamma_flip is not None else "—"
@@ -423,6 +425,28 @@ def build_markdown(a: Analysis, ticker: str = "",
                 "Books are **aligned** — higher-conviction read." if aligned else
                 "Books are **divergent** — patient block money and the urgent tape "
                 "disagree; favor blocks on swing horizon, sweeps intraday."
+            )
+
+    if flow_types is not None and not flow_types.empty:
+        lines += [
+            "",
+            "## Consolidated flow by type",
+            "",
+            "Premium and size per execution type as the file tagged it — floor "
+            "and cross prints are negotiated size, auto is the electronic "
+            "default route. ★ marks the types counted as institutional.",
+            "",
+            "| Type | Premium | Contracts | Prints | Avg / print | Net | % premium |",
+            "|---|---|---|---|---|---|---|",
+        ]
+        for _, r in flow_types.iterrows():
+            star = " ★" if r["institutional"] else ""
+            lines.append(
+                f"| {r['flow_type']}{star} | {fmt_dollars(r['premium'])} "
+                f"| {r['contracts']:,.0f} | {r['prints']:,.0f} "
+                f"| {fmt_dollars(r['avg_premium'])} "
+                f"| {r['direction']} ({r['net_contracts']:+,.0f}) "
+                f"| {r['premium_share'] * 100:.1f}% |"
             )
 
     if block_lvls is not None and not block_lvls.empty:

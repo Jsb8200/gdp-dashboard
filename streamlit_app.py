@@ -14,8 +14,9 @@ import streamlit as st
 
 from dealer_gex.analytics import (
     Analysis, analyze, block_levels, confluence_levels, darkpool_levels,
-    data_quality, directional_lean, flow_books, fmt_dollars, intraday_flow,
-    level_hit_rate, magnet_levels, oi_levels, oi_walls, tuned_layer_weights,
+    data_quality, directional_lean, flow_books, flow_type_breakdown,
+    fmt_dollars, institutional_mask, intraday_flow, level_hit_rate,
+    magnet_levels, oi_levels, oi_walls, tuned_layer_weights,
 )
 
 _CONF_ICON = {"high": "🟢", "medium": "🟡", "low": "🔴"}
@@ -104,7 +105,7 @@ def _main_bundle(chain, spot, asof, rate, weight, multiplier, prints, dark):
     magnets = magnet_levels(a)
     oi_lvls = oi_levels(a)
     blk_books, blk_lvls = {}, pd.DataFrame()
-    if prints is not None and "is_block" in prints and prints["is_block"].any():
+    if prints is not None and institutional_mask(prints).any():
         blk_books = flow_books(prints, a.spot, a.asof, rate, multiplier=multiplier)
         blk_lvls = block_levels(prints, a.spot)
     dark_lvls = darkpool_levels(dark, a.spot) if dark is not None else pd.DataFrame()
@@ -633,14 +634,74 @@ def history_section(hist: pd.DataFrame) -> None:
             )
 
 
+_VENUE_ICON = {"floor": "🏛️", "auto": "⚡", "cross": "🔁"}
+_SHAPE_ICON = {"block": "🧱", "sweep": "🌊", "split": "✂️", "multi": "🧬"}
+
+
+def _flow_label(row) -> str:
+    """Icons + the precise consolidated type of one print ('' if untyped)."""
+    label = row.get("flow_type", "")
+    if not label or label == "single":
+        return ""
+    venue, shape = row.get("flow_venue", ""), row.get("flow_shape", "single")
+    icons = f"{_VENUE_ICON.get(venue, '')}{_SHAPE_ICON.get(shape, '')}"
+    return f"{icons} {label}".strip()
+
+
+def flow_type_table(prints: pd.DataFrame) -> None:
+    """Consolidated premium and quantity per precise execution type —
+    floor vs auto vs block vs sweep, never averaged together."""
+    br = flow_type_breakdown(prints)
+    if br.empty:
+        return
+    st.markdown("**Consolidated flow by type** — premium and size per "
+                "execution type, as the file tagged it:")
+    view = br.copy()
+    view["Type"] = [
+        f"{_VENUE_ICON.get(r['venue'], '')}{_SHAPE_ICON.get(r['shape'], '')} "
+        f"{r['flow_type']}" + ("  ⭐" if r["institutional"] else "")
+        for _, r in br.iterrows()
+    ]  # venue+shape icons, then the file's own label
+    view["Premium"] = view["premium"].map(fmt_dollars)
+    view["Contracts"] = view["contracts"].map(lambda x: f"{x:,.0f}")
+    view["Prints"] = view["prints"].map(lambda x: f"{x:,.0f}")
+    view["Avg / print"] = view["avg_premium"].map(fmt_dollars)
+    view["Net"] = [
+        f"{'🟢' if r['direction'] == 'bought' else '🔴' if r['direction'] == 'sold' else '⚪'} "
+        f"{r['direction']} ({r['net_contracts']:+,.0f})"
+        for _, r in br.iterrows()
+    ]
+    view["Share"] = view["premium_share"] * 100
+    st.dataframe(
+        view[["Type", "Premium", "Contracts", "Prints", "Avg / print", "Net", "Share"]],
+        use_container_width=True, hide_index=True,
+        column_config={"Share": st.column_config.ProgressColumn(
+            "% premium", min_value=0, max_value=100, format="%.1f%%")},
+    )
+    st.caption(
+        "⭐ counts as institutional size — block-shaped, floor (🏛️), or cross "
+        "(🔁) prints. ⚡ auto is the electronic default route, not a size "
+        "signal, so it is excluded unless the print is also block-tagged. "
+        "**Net** is signed by side code: 🟢 customers net bought (dealers "
+        "pushed short), 🔴 net sold. A type your file uses that isn't mapped "
+        "here shows with its raw code rather than being silently bucketed."
+    )
+
+
 def block_section(a: Analysis, prints: pd.DataFrame, books: dict,
                   lvls: pd.DataFrame) -> None:
     st.subheader("🧱 Block intelligence (smart vs fast money)")
 
+    flow_type_table(prints)
+
     if books:
         rows = []
-        for name, label, mask in (("blocks", "🧱 Blocks (institutional)", prints["is_block"]),
-                                  ("sweeps", "🌊 Sweeps (urgent)", prints["is_sweep"])):
+        for name, label, mask in (
+            ("blocks", "🧱 Blocks (institutional)", institutional_mask(prints)),
+            ("sweeps", "🌊 Sweeps (urgent)", prints["is_sweep"]),
+            ("floor", "🏛️ Floor (negotiated)",
+             prints["is_floor"] if "is_floor" in prints else pd.Series(False, index=prints.index)),
+        ):
             if name not in books:
                 continue
             bk = books[name]
@@ -937,8 +998,8 @@ def notable_flow_section(prints: pd.DataFrame, spot: float) -> None:
         "Size": top["size"].map(lambda x: f"{x:,.0f}"),
         "Premium": top["premium"].map(fmt_dollars),
         "Flags": top.apply(lambda r: " ".join(filter(None, [
-            "🟡 golden" if r["is_golden"] else ("🌊 sweep" if r["is_sweep"] else ""),
-            "🧱 block" if r.get("is_block", False) else "",
+            "🟡 golden" if r["is_golden"] else "",
+            _flow_label(r),
             "🚨 unusual" if r["is_unusual"] else "",
             "🆕 opening" if r["is_opening"] else "",
         ])) or "—", axis=1),
@@ -991,12 +1052,13 @@ def report_section(a: Analysis, ticker: str, hist: pd.DataFrame | None = None,
                    master: pd.DataFrame | None = None,
                    dq: dict | None = None, lean: dict | None = None,
                    dark_lvls: pd.DataFrame | None = None,
-                   forecast: ExpectedMoveForecast | None = None) -> None:
+                   forecast: ExpectedMoveForecast | None = None,
+                   flow_types: pd.DataFrame | None = None) -> None:
     st.subheader("Report")
     md = build_markdown(a, ticker=ticker, history=hist,
                         block_books=blk_books, block_lvls=blk_lvls,
                         master=master, dq=dq, lean=lean, dark_lvls=dark_lvls,
-                        forecast=forecast)
+                        forecast=forecast, flow_types=flow_types)
     stem = f"dealer-positioning-{a.asof:%Y%m%d}"
     c1, c2, _ = st.columns([1, 1, 3])
     c1.download_button("Download report (.md)", md, file_name=f"{stem}.md",
@@ -1072,15 +1134,18 @@ def main() -> None:
     if all_prints:
         conv_picked = st.sidebar.multiselect(
             "Conviction filter (flow files)",
-            ["Sweeps", "Blocks", "Splits", "Golden sweeps", "Unusual", "Opening positions"],
+            ["Sweeps", "Blocks", "Floor", "Cross", "Auto", "Splits",
+             "Golden sweeps", "Unusual", "Opening positions"],
             help="Rebuild every level from flagged prints only. Sweeps = "
                  "urgent aggressive flow; blocks = large negotiated "
-                 "institutional trades; splits = one order worked across "
-                 "executions. Empty = all prints.",
+                 "institutional trades; floor/cross = negotiated off the "
+                 "electronic book; auto = electronic default route; splits = "
+                 "one order worked across executions. Empty = all prints.",
         )
 
     _conv_flags = {
         "Sweeps": "is_sweep", "Blocks": "is_block", "Splits": "is_split",
+        "Floor": "is_floor", "Cross": "is_cross", "Auto": "is_auto",
         "Golden sweeps": "is_golden", "Unusual": "is_unusual",
         "Opening positions": "is_opening",
     }
@@ -1194,7 +1259,7 @@ def main() -> None:
         magnets = magnet_levels(a)
         oi_lvls = oi_levels(a)
         blk_books, blk_lvls = {}, pd.DataFrame()
-        if prints is not None and prints["is_block"].any():
+        if prints is not None and institutional_mask(prints).any():
             blk_books = flow_books(prints, a.spot, a.asof, rate, multiplier=multiplier)
             blk_lvls = block_levels(prints, a.spot)
         dark_lvls = darkpool_levels(dark, a.spot) if dark is not None else pd.DataFrame()
@@ -1337,7 +1402,8 @@ def main() -> None:
     playbook_section(a, master, lean)
     tables(a)
     report_section(a, ticker, hist, blk_books, blk_lvls, master, dq, lean,
-                   dark_lvls, forecast)
+                   dark_lvls, forecast,
+                   flow_type_breakdown(merged_prints) if merged_prints is not None else None)
 
     with st.expander("Methodology & assumptions"):
         st.markdown(
