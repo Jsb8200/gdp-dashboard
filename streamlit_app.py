@@ -14,7 +14,7 @@ import streamlit as st
 
 from dealer_gex.analytics import (
     Analysis, analyze, block_levels, confluence_levels, darkpool_levels,
-    BLOCK_TIER_NOTE, block_oi_breakdown, block_tier_summary,
+    BLOCK_TIER_NOTE, block_dominance, block_oi_breakdown, block_tier_summary,
     block_type_behaviour, block_type_breakdown, data_quality,
     flow_books, flow_type_breakdown, fmt_dollars, institutional_mask,
     intraday_flow, level_hit_rate, magnet_levels, oi_levels, oi_walls,
@@ -609,7 +609,28 @@ _TIER_ICON = {"negotiated": "🤝", "facilitated": "📣", "electronic": "⚡",
               "fragment": "🧩"}
 
 
-def block_type_section(prints: pd.DataFrame, spot: float) -> None:
+def block_dominance_banner(prints: pd.DataFrame, spot: float) -> dict:
+    """Who is running the block book — named, with the evidence."""
+    d = block_dominance(prints, spot)
+    if not d:
+        return {}
+    icon = "🥇" if d["verdict"] == "clear" else "⚖️"
+    (st.success if d["verdict"] == "clear" else st.info)(
+        d["label"].replace("$", "\\$"), icon=icon)
+
+    cells = [("💰 Most premium", d["by_money"], lambda v: f"{v:.0%} of block $"),
+             ("📚 Most open interest", d["by_book"], lambda v: f"{v:.0%} of block OI"),
+             ("💥 Biggest book impact", d["by_impact"], lambda v: f"{v:.0%} of the OI it hit")]
+    cols = st.columns(len([c for c in cells if c[1]]) or 1)
+    for col, (label, v, fmt) in zip(cols, [c for c in cells if c[1]]):
+        crown = " 👑" if d["leader"] and v["block_type"] == d["leader"] else ""
+        col.metric(label, f"{_TIER_ICON.get(v['tier'], '')} {v['block_type']}{crown}",
+                   fmt(v["value"]), delta_color="off")
+    return d
+
+
+def block_type_section(prints: pd.DataFrame, spot: float,
+                       dom: dict | None = None) -> None:
     """Blocks only, split by *how they printed* — the distinction that
     decides whether a 'block' is someone finding a counterparty for size or
     one leg of an auto-executed spread."""
@@ -629,9 +650,13 @@ def block_type_section(prints: pd.DataFrame, spot: float) -> None:
                    delta_color="off", help=BLOCK_TIER_NOTE.get(t["tier"], ""))
 
     view = br.copy()
+    lead = (dom or {}).get("leader")
+    money = ((dom or {}).get("by_money") or {}).get("block_type")
     view["Type"] = [
         f"{_TIER_ICON.get(r['tier'], '')} {r['block_type']}"
         + ("  🔗" if r["tied"] else "")
+        + ("  👑" if r["block_type"] == lead else
+           "  💰" if r["block_type"] == money else "")
         for _, r in br.iterrows()
     ]
     view["Premium"] = view["premium"].map(fmt_dollars)
@@ -668,19 +693,29 @@ def block_type_section(prints: pd.DataFrame, spot: float) -> None:
         "block book exclude fragments by default. **Level** is the "
         "premium-weighted strike that type traded at — where the money "
         "actually sat — and **vs spot** places it against the current "
-        "underlying price."
+        "underlying price. 👑 is the type running the block book overall, "
+        "💰 the one with the most premium."
     )
 
 
-def block_oi_section(prints: pd.DataFrame, spot: float) -> None:
+def block_oi_section(prints: pd.DataFrame, spot: float,
+                     dom: dict | None = None) -> None:
     """The same block types against the standing book instead of premium."""
     oi = block_oi_breakdown(prints, spot)
     if oi.empty:
         return
     st.markdown("**Block types by open interest — what the flow landed on:**")
     view = oi.copy()
-    view["Type"] = [f"{_TIER_ICON.get(r['tier'], '')} {r['block_type']}"
-                    for _, r in oi.iterrows()]
+    lead = (dom or {}).get("leader")
+    book = ((dom or {}).get("by_book") or {}).get("block_type")
+    impact = ((dom or {}).get("by_impact") or {}).get("block_type")
+    view["Type"] = [
+        f"{_TIER_ICON.get(r['tier'], '')} {r['block_type']}"
+        + ("  👑" if r["block_type"] == lead else "")
+        + ("  📚" if r["block_type"] == book else "")
+        + ("  💥" if r["block_type"] == impact else "")
+        for _, r in oi.iterrows()
+    ]
     view["Open interest"] = view["open_interest"].map(lambda x: f"{x:,.0f}")
     view["Contracts"] = view["contracts_touched"].map(lambda x: f"{x:,.0f}")
     view["Traded"] = view["traded"].map(lambda x: f"{x:,.0f}")
@@ -711,7 +746,9 @@ def block_oi_section(prints: pd.DataFrame, spot: float) -> None:
         "opening rather than closing. **Level** is the OI-weighted strike — "
         "where the standing book sits, which is not always where the premium "
         "went. A contract touched by two block types counts under both, so "
-        "the shares describe composition, not a partition."
+        "the shares describe composition, not a partition. 👑 leads the block "
+        "book overall, 📚 holds the most open interest, 💥 moved the book it "
+        "touched the most."
     )
 
 
@@ -815,8 +852,9 @@ def block_section(a: Analysis, prints: pd.DataFrame, books: dict,
                   lvls: pd.DataFrame) -> None:
     st.subheader("🧱 Block intelligence (smart vs fast money)")
 
-    block_type_section(prints, a.spot)
-    block_oi_section(prints, a.spot)
+    dom = block_dominance_banner(prints, a.spot)
+    block_type_section(prints, a.spot, dom)
+    block_oi_section(prints, a.spot, dom)
     block_behaviour_section(prints)
     with st.expander("All flow types (sweeps, splits, everything else)"):
         flow_type_table(prints)

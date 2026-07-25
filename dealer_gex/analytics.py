@@ -950,6 +950,122 @@ def block_type_behaviour(prints: pd.DataFrame, horizon_min: int = 30,
     return out[cols].reset_index(drop=True)
 
 
+def block_dominance(prints: pd.DataFrame, spot: float | None = None,
+                    min_share: float = 0.05) -> dict:
+    """Which block type is actually running this book.
+
+    Judged on three independent lenses, because they disagree and the
+    disagreement is the information:
+
+    * **money** — share of block premium;
+    * **book** — share of block open interest;
+    * **impact** — traded size over the open interest it landed on, i.e.
+      how much the type moved the book it touched.
+
+    The impact lens only considers types holding at least ``min_share`` of
+    premium or open interest, so a two-print type with a 200% add ratio
+    cannot win on a rounding error. A type leading two of three lenses is
+    the leader; otherwise the book is called **split** and each lens
+    reports its own winner, because forcing a single name on a genuinely
+    divided book would be a made-up answer.
+
+    Returns ``{}`` when there are no blocks to rank.
+    """
+    prem = block_type_breakdown(prints, spot)
+    if prem.empty:
+        return {}
+    oi = block_oi_breakdown(prints, spot)
+
+    p_idx = prem.set_index("block_type")
+    o_idx = oi.set_index("block_type") if not oi.empty else pd.DataFrame()
+
+    def _top(frame, col):
+        if frame is None or frame.empty or col not in frame:
+            return None
+        s = frame[col].dropna()
+        if s.empty or s.max() <= 0:
+            return None
+        name = s.idxmax()
+        return {"block_type": str(name), "value": float(s.max()),
+                "tier": str(frame.loc[name, "tier"]) if "tier" in frame else ""}
+
+    by_money = _top(p_idx, "premium_share")
+    by_book = _top(o_idx, "oi_share")
+
+    # impact: only types that are materially present on either lens
+    big = None
+    if not o_idx.empty:
+        share = o_idx["oi_share"].reindex(p_idx.index).fillna(0.0)
+        keep = (p_idx["premium_share"] >= min_share) | (share >= min_share)
+        names = [n for n in p_idx.index[keep] if n in o_idx.index]
+        big = o_idx.loc[names] if names else None
+    by_impact = _top(big, "add_ratio")
+
+    lenses = {"money": by_money, "book": by_book, "impact": by_impact}
+    present = {k: v for k, v in lenses.items() if v}
+    if not present:
+        return {}
+    tally: dict[str, int] = {}
+    for v in present.values():
+        tally[v["block_type"]] = tally.get(v["block_type"], 0) + 1
+    leader, won = max(tally.items(), key=lambda kv: kv[1])
+    clear = won >= 2 and won > max(
+        [n for t, n in tally.items() if t != leader] or [0])
+
+    tiers = block_tier_summary(prem)
+    tier_leader = str(tiers.iloc[0]["tier"]) if not tiers.empty else ""
+    if not tiers.empty:
+        top_tier = tiers.loc[tiers["premium"].idxmax()]
+        tier_leader = str(top_tier["tier"])
+        tier_share = float(top_tier["premium_share"])
+    else:
+        tier_share = float("nan")
+
+    lead_tier = ""
+    if leader in p_idx.index and "tier" in p_idx:
+        lead_tier = str(p_idx.loc[leader, "tier"])
+
+    return {
+        "leader": leader if clear else None,
+        "leader_tier": lead_tier if clear else "",
+        "verdict": "clear" if clear else "split",
+        "lenses_won": won, "lenses": len(present),
+        "by_money": by_money, "by_book": by_book, "by_impact": by_impact,
+        "tier_leader": tier_leader, "tier_share": tier_share,
+        "label": _dominance_label(leader if clear else None, present,
+                                  tier_leader, tier_share),
+    }
+
+
+_LENS_WORD = {"money": "premium", "book": "open interest", "impact": "book impact"}
+
+
+def _dominance_label(leader: str | None, present: dict, tier_leader: str,
+                     tier_share: float) -> str:
+    """One line naming who runs the block book."""
+    def _fmt(lens, v):
+        val = (f"{v['value']:.0%}" if lens != "impact"
+               else f"{v['value']:.0%} add")
+        return f"{_LENS_WORD[lens]} ({val})"
+
+    if leader:
+        won = [_fmt(k, v) for k, v in present.items()
+               if v["block_type"] == leader]
+        lost = [f"{v['block_type']} on {_LENS_WORD[k]}"
+                for k, v in present.items() if v["block_type"] != leader]
+        text = f"**{leader}** dominates — leads on " + " and ".join(won)
+        if lost:
+            text += "; " + ", ".join(lost) + " leads the rest"
+    else:
+        parts = [f"**{v['block_type']}** on {_LENS_WORD[k]}"
+                 for k, v in present.items()]
+        text = "Split book — " + ", ".join(parts)
+    if tier_leader and np.isfinite(tier_share):
+        text += (f". {tier_leader.title()} size is {tier_share:.0%} of block "
+                 "premium")
+    return text + "."
+
+
 def institutional_mask(prints: pd.DataFrame, types: list[str] | None = None,
                        drop_fragments: bool = True) -> pd.Series:
     """Which prints count as institutional size.

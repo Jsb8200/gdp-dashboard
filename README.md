@@ -90,6 +90,13 @@ history** instead.
   type carries the **premium-weighted strike it traded at** and that level's
   distance from spot: a $25M block 5% out is a different trade from the same
   size at the money.
+- **Who is dominant** — one label naming the block type running the book,
+  judged on three independent lenses: 💰 most premium, 📚 most open interest,
+  💥 biggest book impact (traded size over the OI it landed on). A type leading
+  two of three is crowned 👑 in every table; when all three disagree the book is
+  called **split** and each lens reports its own winner rather than forcing a
+  name onto a divided book. The impact lens ignores types below 5% of premium
+  or OI, so two prints with a 200% add ratio can't win on a rounding error.
 - **Block types by open interest** — the same types measured against the
   *standing book* instead of premium, which reorders them completely. Open
   interest belongs to the contract, not the print, so it is a max per contract
@@ -168,7 +175,7 @@ estimate — this is positioning analysis, **not trading advice**.
 
 ```
 pip install pytest
-python -m pytest tests/                 # 120 tests
+python -m pytest tests/                 # 126 tests
 python scripts/make_sample_chain.py     # regenerate the bundled sample chain
 ```
 

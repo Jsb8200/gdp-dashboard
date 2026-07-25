@@ -7,8 +7,9 @@ import html
 import pandas as pd
 
 from dealer_gex.analytics import (
-    Analysis, block_behaviour_note, block_oi_breakdown, block_tier_summary,
-    block_type_behaviour, fmt_dollars, magnet_levels, oi_levels, oi_walls,
+    Analysis, block_behaviour_note, block_dominance, block_oi_breakdown,
+    block_tier_summary, block_type_behaviour, fmt_dollars, magnet_levels,
+    oi_levels, oi_walls,
 )
 
 
@@ -27,6 +28,7 @@ def block_type_behaviour_from(block_types: pd.DataFrame,
     out["sample"] = "thin"
     out["behaviour"] = [block_behaviour_note(r) for _, r in block_types.iterrows()]
     return out
+
 
 _REGIME_TEXT = {
     "long_gamma": (
@@ -418,10 +420,32 @@ def build_markdown(a: Analysis, ticker: str = "",
 
     if block_types is not None and not block_types.empty:
         tiers = block_tier_summary(block_types)
+        dom = (block_dominance(block_prints, a.spot)
+               if block_prints is not None and not block_prints.empty else {})
         lines += [
             "",
             "## Block types (how the size printed)",
             "",
+        ]
+        if dom:
+            lines += [f"**Who is dominant:** {dom['label']}", ""]
+            lines += [
+                "| Lens | Leader | Reading |",
+                "|---|---|---|",
+            ]
+            for key, lens, fmt in (
+                ("by_money", "Most premium", lambda v: f"{v:.0%} of block premium"),
+                ("by_book", "Most open interest", lambda v: f"{v:.0%} of block OI"),
+                ("by_impact", "Biggest book impact",
+                 lambda v: f"traded {v:.0%} of the open interest it landed on"),
+            ):
+                v = dom.get(key)
+                if v:
+                    crown = " 👑" if v["block_type"] == dom.get("leader") else ""
+                    lines.append(
+                        f"| {lens} | {v['block_type']}{crown} | {fmt(v['value'])} |")
+            lines.append("")
+        lines += [
             "| Tier | Premium | % | Prints | Reading |",
             "|---|---|---|---|---|",
         ]

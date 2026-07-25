@@ -5,8 +5,9 @@ import pandas as pd
 import pytest
 
 from dealer_gex.analytics import (
-    analyze, block_levels, block_oi_breakdown, block_type_behaviour,
-    block_type_breakdown, flow_books, flow_type_breakdown, institutional_mask,
+    analyze, block_dominance, block_levels, block_oi_breakdown,
+    block_type_behaviour, block_type_breakdown, flow_books,
+    flow_type_breakdown, institutional_mask,
 )
 from dealer_gex.parsing import classify_flow, parse_file
 
@@ -560,3 +561,96 @@ def test_report_carries_the_oi_table(real):
     assert "### By open interest — what the flow landed on" in md
     assert "| Block type | Open interest | Contracts | Traded | Add |" in md
     assert "never summed over" in md
+
+
+# --- who is dominant ---------------------------------------------------------
+
+def test_dominance_names_a_leader_that_wins_two_lenses():
+    """One type with the premium and the book impact, another with the raw
+    open interest: two of three lenses is a clear leader."""
+    rows = [
+        (0, 700, "CALL", 700.0, 5000, "A", 20_000_000, "FLR", "BLOCK"),
+        (1, 710, "CALL", 700.0, 100, "A", 100_000, "AUTO", "BLOCK"),
+    ]
+    csv = _behaviour_csv(rows).decode()
+    csv = csv.replace('5000,"9,000","20,000",A,20.0%,0.010,"$20,000,000.00",FLR',
+                      '5000,"9,000","5,000",A,20.0%,0.010,"$20,000,000.00",FLR')
+    csv = csv.replace('100,"9,000","20,000",A,20.0%,0.010,"$100,000.00",AUTO',
+                      '100,"9,000","900,000",A,20.0%,0.010,"$100,000.00",AUTO')
+    d = block_dominance(parse_file(csv.encode()).prints, spot=700.0)
+    assert d["verdict"] == "clear"
+    assert d["leader"] == "floor block"
+    assert d["lenses_won"] == 2
+    assert d["by_money"]["block_type"] == "floor block"
+    assert d["by_impact"]["block_type"] == "floor block"
+    assert d["by_book"]["block_type"] == "auto block"     # the loser's lens
+    assert "dominates" in d["label"] and "floor block" in d["label"]
+    assert "auto block on open interest" in d["label"]
+
+
+def test_dominance_calls_a_split_book_split():
+    """Three types, one lens each — no leader, and saying otherwise would be
+    inventing one."""
+    rows = [
+        (0, 700, "CALL", 700.0, 100, "A", 9_000_000, "FLR", "BLOCK"),
+        (1, 710, "CALL", 700.0, 100, "A", 1_000_000, "AUTO", "BLOCK"),
+        (2, 720, "CALL", 700.0, 9000, "A", 1_000_000, "COB", "BLOCK"),
+    ]
+    csv = _behaviour_csv(rows).decode()
+    csv = csv.replace('100,"9,000","20,000",A,20.0%,0.010,"$9,000,000.00",FLR',
+                      '100,"9,000","50,000",A,20.0%,0.010,"$9,000,000.00",FLR')
+    csv = csv.replace('100,"9,000","20,000",A,20.0%,0.010,"$1,000,000.00",AUTO',
+                      '100,"9,000","900,000",A,20.0%,0.010,"$1,000,000.00",AUTO')
+    csv = csv.replace('9000,"9,000","20,000",A,20.0%,0.010,"$1,000,000.00",COB',
+                      '9000,"9,000","50,000",A,20.0%,0.010,"$1,000,000.00",COB')
+    d = block_dominance(parse_file(csv.encode()).prints, spot=700.0)
+    assert d["verdict"] == "split"
+    assert d["leader"] is None
+    assert d["label"].startswith("Split book —")
+    assert len({d[k]["block_type"] for k in ("by_money", "by_book", "by_impact")}) == 3
+
+
+def test_a_tiny_type_cannot_win_impact_on_a_rounding_error():
+    """Two prints with a 200% add ratio should not out-rank the book."""
+    rows = [
+        (0, 700, "CALL", 700.0, 50_000, "A", 50_000_000, "COB", "BLOCK"),
+        (1, 710, "CALL", 700.0, 200, "A", 1_000, "FLR", "BLOCK"),
+    ]
+    csv = _behaviour_csv(rows).decode()
+    csv = csv.replace('50000,"9,000","20,000",A,20.0%,0.010,"$50,000,000.00",COB',
+                      '50000,"9,000","500,000",A,20.0%,0.010,"$50,000,000.00",COB')
+    csv = csv.replace('200,"9,000","20,000",A,20.0%,0.010,"$1,000.00",FLR',
+                      '200,"9,000","100",A,20.0%,0.010,"$1,000.00",FLR')
+    p = parse_file(csv.encode()).prints
+    oi = block_oi_breakdown(p).set_index("block_type")
+    assert oi.loc["floor block", "add_ratio"] == pytest.approx(2.0)   # 200%
+    d = block_dominance(p, spot=700.0)
+    assert d["by_impact"]["block_type"] == "cob block"   # the floor type is too small
+    assert d["leader"] == "cob block"
+
+
+def test_dominance_label_reports_the_leading_tier(real):
+    d = block_dominance(real.prints, real.spots["QQQ"])
+    assert d["tier_leader"] == "negotiated"
+    assert "Negotiated size is" in d["label"]
+    assert d["label"].endswith(".")
+
+
+def test_dominance_is_empty_without_blocks():
+    assert block_dominance(None) == {}
+    assert block_dominance(pd.DataFrame()) == {}
+    sweeps = parse_file(FLOW_CSV.encode()).prints
+    assert block_dominance(sweeps[~sweeps["is_block"]]) == {}
+
+
+def test_report_names_who_is_dominant(real):
+    from dealer_gex.report import build_markdown
+
+    a = analyze(real.chain, real.spots["QQQ"], real.asof)
+    md = build_markdown(a, ticker="QQQ",
+                        block_types=block_type_breakdown(real.prints, a.spot),
+                        block_prints=real.prints)
+    assert "**Who is dominant:**" in md
+    assert "| Lens | Leader | Reading |" in md
+    assert "Most premium" in md and "Biggest book impact" in md
+    assert "👑" in md
