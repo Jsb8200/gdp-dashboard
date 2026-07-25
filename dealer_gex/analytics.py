@@ -592,6 +592,25 @@ def flow_type_breakdown(prints: pd.DataFrame, min_share: float = 0.0) -> pd.Data
     return out[out["premium_share"] >= min_share] if min_share > 0 else out
 
 
+#: Horizon buckets for a weighted days-to-expiration.
+HORIZON_BUCKETS = ((1, "0DTE"), (8, "weekly"), (46, "monthly"),
+                   (181, "quarterly"), (float("inf"), "LEAP"))
+
+
+def horizon_label(dte) -> str:
+    """Name the horizon a days-to-expiration falls in."""
+    try:
+        d = float(dte)
+    except (TypeError, ValueError):
+        return ""
+    if not np.isfinite(d) or d < 0:
+        return ""
+    for edge, name in HORIZON_BUCKETS:
+        if d < edge:
+            return name
+    return "LEAP"
+
+
 #: Block tiers, most meaningful first — see parsing.BLOCK_TIERS.
 BLOCK_TIER_ORDER = ["negotiated", "facilitated", "electronic", "fragment"]
 BLOCK_TIER_NOTE = {
@@ -629,7 +648,7 @@ def block_type_breakdown(prints: pd.DataFrame,
     cols = ["block_type", "code", "tier", "mechanism", "tied", "spread_leg",
             "prints", "contracts", "premium", "median_premium", "avg_premium",
             "net_contracts", "direction", "premium_share", "level",
-            "ref_price", "distance_pct"]
+            "ref_price", "distance_pct", "dte", "dte_median", "horizon"]
     if prints is None or prints.empty or "is_block" not in prints:
         return pd.DataFrame(columns=cols)
     b = prints[prints["is_block"].fillna(False)].copy()
@@ -652,6 +671,8 @@ def block_type_breakdown(prints: pd.DataFrame,
     b["_w"] = b["premium"].where(b["premium"] > 0, 0.0)
     b["_wk"] = b["_w"] * pd.to_numeric(b["strike"], errors="coerce")
     b["_wr"] = b["_w"] * pd.to_numeric(b.get("ref_price", np.nan), errors="coerce")
+    b["_dte"] = pd.to_numeric(b.get("dte", np.nan), errors="coerce")
+    b["_wd"] = b["_w"] * b["_dte"]
 
     g = b.groupby("flow_type", dropna=False).agg(
         code=("trade_type", lambda s: " / ".join(sorted(set(s.astype(str))
@@ -666,11 +687,16 @@ def block_type_breakdown(prints: pd.DataFrame,
         median_premium=("premium", "median"),
         net_contracts=("signed_size", "sum"),
         _w=("_w", "sum"), _wk=("_wk", "sum"), _wr=("_wr", "sum"),
+        _wd=("_wd", "sum"), dte_median=("_dte", "median"),
     ).reset_index().rename(columns={"flow_type": "block_type"})
 
     with np.errstate(invalid="ignore", divide="ignore"):
         g["level"] = np.where(g["_w"] > 0, g["_wk"] / g["_w"], np.nan)
         g["ref_price"] = np.where(g["_w"] > 0, g["_wr"] / g["_w"], np.nan)
+        # premium-weighted DTE: where the money's horizon is, which is not
+        # the median print's horizon when the size sits further out
+        g["dte"] = np.where(g["_w"] > 0, g["_wd"] / g["_w"], np.nan)
+    g["horizon"] = [horizon_label(d) for d in g["dte"]]
     ref = float(spot) if spot else float(np.nanmedian(g["ref_price"])) \
         if np.isfinite(g["ref_price"]).any() else np.nan
     g["distance_pct"] = ((g["level"] / ref - 1.0) * 100.0
@@ -710,7 +736,7 @@ def block_oi_breakdown(prints: pd.DataFrame,
     """
     cols = ["block_type", "code", "tier", "contracts_touched", "open_interest",
             "traded", "add_ratio", "opening_share", "oi_share", "level",
-            "distance_pct"]
+            "distance_pct", "dte", "horizon"]
     if prints is None or prints.empty or "is_block" not in prints:
         return pd.DataFrame(columns=cols)
     b = prints[prints["is_block"].fillna(False)].copy()
@@ -738,9 +764,13 @@ def block_oi_breakdown(prints: pd.DataFrame,
         traded=("size", "sum"),
         opening=("_open_sz", "sum"),
         code=("trade_type", "first"),
+        dte=("dte", "median") if "dte" in b else ("open_interest", "size"),
     ).reset_index()
+    if "dte" not in b:
+        per["dte"] = np.nan
     per["_wk"] = per["open_interest"] * pd.to_numeric(
         per.get("strike", np.nan), errors="coerce")
+    per["_wd"] = per["open_interest"] * pd.to_numeric(per["dte"], errors="coerce")
 
     g = per.groupby(["flow_type", "block_tier"], dropna=False).agg(
         code=("code", lambda s: " / ".join(sorted(set(s.astype(str))
@@ -749,7 +779,7 @@ def block_oi_breakdown(prints: pd.DataFrame,
         open_interest=("open_interest", "sum"),
         traded=("traded", "sum"),
         opening=("opening", "sum"),
-        _wk=("_wk", "sum"),
+        _wk=("_wk", "sum"), _wd=("_wd", "sum"),
     ).reset_index().rename(columns={"flow_type": "block_type",
                                     "block_tier": "tier"})
 
@@ -760,6 +790,9 @@ def block_oi_breakdown(prints: pd.DataFrame,
                                       g["opening"] / g["traded"], np.nan)
         g["level"] = np.where(g["open_interest"] > 0,
                               g["_wk"] / g["open_interest"], np.nan)
+        g["dte"] = np.where(g["open_interest"] > 0,
+                            g["_wd"] / g["open_interest"], np.nan)
+    g["horizon"] = [horizon_label(d) for d in g["dte"]]
     total = float(g["open_interest"].sum())
     g["oi_share"] = g["open_interest"] / total if total > 0 else 0.0
     ref = float(spot) if spot else np.nan

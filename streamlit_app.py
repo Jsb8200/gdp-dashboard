@@ -664,6 +664,14 @@ def block_type_section(prints: pd.DataFrame, spot: float,
     view["Contracts"] = view["contracts"].map(lambda x: f"{x:,.0f}")
     view["Prints"] = view["prints"].map(lambda x: f"{x:,.0f}")
     view["Median print"] = view["median_premium"].map(fmt_dollars)
+    view["DTE"] = [
+        "—" if pd.isna(r["dte"]) else
+        f"{r['dte']:,.0f}" + (f" · {r['horizon']}" if r["horizon"] else "")
+        + (f"  (med {r['dte_median']:,.0f})"
+           if pd.notna(r["dte_median"]) and abs(r["dte_median"] - r["dte"]) >= 5
+           else "")
+        for _, r in br.iterrows()
+    ]
     view["Level"] = view["level"].map(
         lambda x: f"{x:,.2f}" if pd.notna(x) else "—")
     view["vs spot"] = view["distance_pct"].map(
@@ -676,7 +684,7 @@ def block_type_section(prints: pd.DataFrame, spot: float,
     view["Share"] = view["premium_share"] * 100
     st.dataframe(
         view[["Type", "Code", "Premium", "Contracts", "Prints",
-              "Median print", "Level", "vs spot", "Net", "Share"]],
+              "Median print", "DTE", "Level", "vs spot", "Net", "Share"]],
         use_container_width=True, hide_index=True,
         column_config={"Share": st.column_config.ProgressColumn(
             "% block premium", min_value=0, max_value=100, format="%.1f%%")},
@@ -694,9 +702,13 @@ def block_type_section(prints: pd.DataFrame, spot: float,
         "block book exclude fragments by default. **Level** is the "
         "premium-weighted strike that type traded at — where the money "
         "actually sat — and **vs spot** places it against the current "
-        "underlying price. **Code** is the export's own `Trade Type` value, so "
-        "every row traces back to the CSV. 👑 is the type running the block "
-        "book overall, 💰 the one with the most premium."
+        "underlying price. **DTE** is premium-weighted — where the *money's* "
+        "horizon is — with the median print's DTE alongside when the two "
+        "disagree by five days or more: a type whose median print is 0DTE but "
+        "whose premium sits at 120 days is two different flows sharing a "
+        "label. **Code** is the export's own `Trade Type` value, so every row "
+        "traces back to the CSV. 👑 is the type running the block book "
+        "overall, 💰 the one with the most premium."
     )
 
 
@@ -726,6 +738,11 @@ def block_oi_section(prints: pd.DataFrame, spot: float,
         lambda x: "—" if pd.isna(x) else f"{x:.0%}")
     view["Opening"] = view["opening_share"].map(
         lambda x: "—" if pd.isna(x) else f"{x:.0%}")
+    view["DTE"] = [
+        "—" if pd.isna(r["dte"]) else
+        f"{r['dte']:,.0f}" + (f" · {r['horizon']}" if r["horizon"] else "")
+        for _, r in oi.iterrows()
+    ]
     view["Level"] = view["level"].map(
         lambda x: f"{x:,.2f}" if pd.notna(x) else "—")
     view["vs spot"] = view["distance_pct"].map(
@@ -733,7 +750,7 @@ def block_oi_section(prints: pd.DataFrame, spot: float,
     view["Share"] = view["oi_share"] * 100
     st.dataframe(
         view[["Type", "Code", "Open interest", "Contracts", "Traded", "Add",
-              "Opening", "Level", "vs spot", "Share"]],
+              "Opening", "DTE", "Level", "vs spot", "Share"]],
         use_container_width=True, hide_index=True,
         column_config={"Share": st.column_config.ProgressColumn(
             "% block OI", min_value=0, max_value=100, format="%.1f%%")},
@@ -748,10 +765,11 @@ def block_oi_section(prints: pd.DataFrame, spot: float,
         "that was already there. **Opening** is the size the file flagged as "
         "opening rather than closing. **Level** is the OI-weighted strike — "
         "where the standing book sits, which is not always where the premium "
-        "went. A contract touched by two block types counts under both, so "
-        "the shares describe composition, not a partition. 👑 leads the block "
-        "book overall, 📚 holds the most open interest, 💥 moved the book it "
-        "touched the most."
+        "went. **DTE** here is open-interest-weighted — the horizon of the "
+        "book, not of the money. A contract touched by two block types counts "
+        "under both, so the shares describe composition, not a partition. "
+        "👑 leads the block book overall, 📚 holds the most open interest, "
+        "💥 moved the book it touched the most."
     )
 
 

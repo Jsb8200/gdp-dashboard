@@ -457,15 +457,20 @@ def build_markdown(a: Analysis, ticker: str = "",
             )
         lines += [
             "",
-            "| Block type | Premium | Contracts | Prints | Median print | Net | % |",
-            "|---|---|---|---|---|---|---|",
+            "| Block type | Premium | Contracts | Prints | Median print "
+            "| DTE | Level | Net | % |",
+            "|---|---|---|---|---|---|---|---|---|",
         ]
         for _, r in block_types.iterrows():
             tied = " (stock-tied)" if r["tied"] else ""
+            dte = ("—" if pd.isna(r["dte"]) else
+                   f"{r['dte']:,.0f} ({r['horizon']})" if r["horizon"]
+                   else f"{r['dte']:,.0f}")
+            lvl = "—" if pd.isna(r["level"]) else f"{r['level']:,.2f}"
             lines.append(
                 f"| {r['block_type']}{tied} | {fmt_dollars(r['premium'])} "
                 f"| {r['contracts']:,.0f} | {r['prints']:,.0f} "
-                f"| {fmt_dollars(r['median_premium'])} "
+                f"| {fmt_dollars(r['median_premium'])} | {dte} | {lvl} "
                 f"| {r['direction']} ({r['net_contracts']:+,.0f}) "
                 f"| {r['premium_share'] * 100:.1f}% |"
             )
@@ -485,17 +490,21 @@ def build_markdown(a: Analysis, ticker: str = "",
                 "",
                 "### By open interest — what the flow landed on",
                 "",
-                "| Block type | Open interest | Contracts | Traded | Add | Opening | Level |",
-                "|---|---|---|---|---|---|---|",
+                "| Block type | Open interest | Contracts | Traded | Add "
+                "| Opening | DTE | Level |",
+                "|---|---|---|---|---|---|---|---|",
             ]
             for _, r in oi_bd.iterrows():
                 add = "—" if pd.isna(r["add_ratio"]) else f"{r['add_ratio']:.0%}"
                 opn = "—" if pd.isna(r["opening_share"]) else f"{r['opening_share']:.0%}"
                 lvl = "—" if pd.isna(r["level"]) else f"{r['level']:,.2f}"
+                dte = ("—" if pd.isna(r["dte"]) else
+                       f"{r['dte']:,.0f} ({r['horizon']})" if r["horizon"]
+                       else f"{r['dte']:,.0f}")
                 lines.append(
                     f"| {r['block_type']} | {r['open_interest']:,.0f} "
                     f"| {r['contracts_touched']:,.0f} | {r['traded']:,.0f} "
-                    f"| {add} | {opn} | {lvl} |"
+                    f"| {add} | {opn} | {dte} | {lvl} |"
                 )
             lines += [
                 "",
@@ -503,8 +512,9 @@ def build_markdown(a: Analysis, ticker: str = "",
                 "per contract summed across contracts — never summed over "
                 "prints. **Add** is traded size over that open interest: past "
                 "~50% the type is building a position rather than trading "
-                "inside a crowded strike. A contract touched by two types "
-                "counts under both.",
+                "inside a crowded strike. **DTE** is open-interest-weighted — "
+                "the horizon of the book rather than of the money. A contract "
+                "touched by two types counts under both.",
             ]
 
         bh = block_type_behaviour_from(block_types, block_prints)

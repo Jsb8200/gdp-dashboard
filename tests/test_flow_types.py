@@ -710,3 +710,87 @@ def test_an_unknown_code_still_gets_a_readable_label():
     p = parse_file(csv.encode())
     labels = dict(zip(p.prints["trade_type"], p.prints["flow_type"]))
     assert labels["MYSTERY FLR"] == "floor block"      # compositional fallback
+
+
+# --- days to expiration ------------------------------------------------------
+
+def test_dte_is_read_from_the_export_when_it_has_a_column(real):
+    assert real.prints["dte"].notna().all()
+    by_code = real.prints.set_index("trade_type")["dte"]
+    assert by_code.loc["FLR"] == 9        # 2026-07-08 -> 2026-07-17
+
+
+def test_dte_is_derived_from_the_expiry_when_there_is_no_column(flow):
+    """A file without a DTE column still gets one, from expiry minus the
+    print's own date — not from today."""
+    assert flow.prints["dte"].notna().all()
+    assert (flow.prints["dte"] == 38).all()   # 2026-07-14 -> 2026-08-21
+
+
+def test_premium_weighted_dte_is_not_the_median_print():
+    """Ten 0DTE lottery tickets and one big long-dated block: the median
+    print says 0, the money says months out. Both get reported."""
+    rows = [
+        (0, 700, "CALL", 700.0, 5000, "A", 10_000_000, "FLR", "BLOCK"),
+        (1, 700, "CALL", 700.0, 1, "A", 1_000, "FLR", "BLOCK"),
+        (2, 700, "CALL", 700.0, 1, "A", 1_000, "FLR", "BLOCK"),
+    ]
+    csv = _behaviour_csv(rows).decode().replace(
+        "2026-08-21,$700.00,CALL,$700.00,5000", "2027-01-15,$700.00,CALL,$700.00,5000")
+    br = block_type_breakdown(parse_file(csv.encode()).prints).set_index("block_type")
+    r = br.loc["FLR single leg block"]
+    assert r["dte_median"] == pytest.approx(44)       # most prints are near-dated
+    assert r["dte"] > 180                             # the premium is not
+    assert r["horizon"] == "LEAP"
+
+
+def test_horizon_buckets_name_the_tenor():
+    from dealer_gex.analytics import horizon_label
+
+    assert horizon_label(0) == "0DTE"
+    assert horizon_label(1) == "weekly" and horizon_label(7) == "weekly"
+    assert horizon_label(8) == "monthly" and horizon_label(45) == "monthly"
+    assert horizon_label(46) == "quarterly" and horizon_label(180) == "quarterly"
+    assert horizon_label(181) == "LEAP" and horizon_label(892) == "LEAP"
+    assert horizon_label(float("nan")) == "" and horizon_label(None) == ""
+    assert horizon_label(-1) == ""
+
+
+def test_oi_table_weights_dte_by_open_interest_not_premium():
+    """The book's horizon and the money's horizon are different questions."""
+    rows = [
+        (0, 700, "CALL", 700.0, 10, "A", 9_000_000, "FLR", "BLOCK"),
+        (1, 800, "CALL", 700.0, 10, "A", 1_000, "FLR", "BLOCK"),
+    ]
+    csv = _behaviour_csv(rows).decode()
+    csv = csv.replace('10,"9,000","20,000",A,20.0%,0.010,"$9,000,000.00"',
+                      '10,"9,000","1,000",A,20.0%,0.010,"$9,000,000.00"')
+    csv = csv.replace('2026-08-21,$800.00,CALL,$700.00,10,"9,000","20,000"',
+                      '2027-01-15,$800.00,CALL,$700.00,10,"9,000","999,000"')
+    p = parse_file(csv.encode()).prints
+    prem = block_type_breakdown(p).set_index("block_type")
+    oi = block_oi_breakdown(p).set_index("block_type")
+    # premium sits in the near-dated strike, open interest in the far one
+    assert prem.loc["FLR single leg block", "horizon"] == "monthly"
+    assert oi.loc["FLR single leg block", "horizon"] == "LEAP"
+
+
+def test_dte_separates_near_dated_flow_from_structural_positions(real):
+    """The point of the column: same tier, opposite horizons."""
+    br = block_type_breakdown(real.prints).set_index("block_type")
+    assert br.loc["auto multi leg block", "dte"] == 9         # nine days out
+    assert br.loc["auto multi leg block", "horizon"] == "monthly"
+    assert br.loc["tied multi cross block", "dte"] == 72      # months out
+    assert br.loc["tied multi cross block", "horizon"] == "quarterly"
+
+
+def test_report_shows_dte_in_both_block_tables(real):
+    from dealer_gex.report import build_markdown
+
+    a = analyze(real.chain, real.spots["QQQ"], real.asof)
+    md = build_markdown(a, ticker="QQQ",
+                        block_types=block_type_breakdown(real.prints, a.spot),
+                        block_prints=real.prints)
+    assert "| Median print | DTE | Level |" in md
+    assert "| Add | Opening | DTE | Level |" in md
+    assert "open-interest-weighted" in md

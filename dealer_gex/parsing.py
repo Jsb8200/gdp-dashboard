@@ -67,6 +67,8 @@ SYNONYMS = {
     "premium": ["premiumprice", "premium", "totalpremium"],
     "consolidation": ["consolidationtype", "consolidation"],
     "trade_type": ["tradetype", "executiontype", "tradekind"],
+    "dte": ["daysuntilexpiration", "dte", "daystoexpiration", "daystoexpiry",
+            "daysleft", "daystoexp"],
     "is_golden": ["isgoldensweep", "goldensweep"],
     "is_unusual": ["isunusual", "unusual"],
     "is_opening": ["isopeningposition", "openingposition", "isopening"],
@@ -428,6 +430,10 @@ def _parse_trade_flow(raw: pd.DataFrame) -> ParsedFile:
         "ref_price": _to_num(raw[cols["underlying_price"]]) if "underlying_price" in cols else float("nan"),
         "premium": _to_num(raw[cols["premium"]]).fillna(0) if "premium" in cols else 0.0,
     })
+    # days to expiration: the file's own column when it has one, otherwise
+    # derived from the expiry — a print's horizon is as much a part of what it
+    # says as its size
+    df["dte"] = _to_num(raw[cols["dte"]]) if "dte" in cols else float("nan")
     if "side" in cols:
         side = raw[cols["side"]].astype(str).str.strip().str.upper()
         sign = side.map({"A": 1.0, "AA": 1.0, "B": -1.0, "BB": -1.0}).fillna(0.0)
@@ -515,6 +521,12 @@ def _parse_trade_flow(raw: pd.DataFrame) -> ParsedFile:
                             utc=True, format="ISO8601")
              if "trade_time" in cols else pd.Series(pd.NaT, index=df.index))
     df["trade_time"] = ttime
+    # no DTE column: derive it from the expiry and the print's own date
+    if df["dte"].isna().any():
+        exp = pd.to_datetime(df["expiry"], errors="coerce", format="mixed")
+        stamp = pd.to_datetime(ttime, errors="coerce", utc=True).dt.tz_localize(None)
+        derived = (exp.dt.normalize() - stamp.dt.normalize()).dt.days
+        df["dte"] = df["dte"].fillna(derived)
     df = df.sort_values("trade_time", na_position="first").reset_index(drop=True)
 
     chain = aggregate_prints(df)

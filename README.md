@@ -97,6 +97,15 @@ history** instead.
   type carries the **premium-weighted strike it traded at** and that level's
   distance from spot: a $25M block 5% out is a different trade from the same
   size at the money.
+- **Horizon (DTE)** — days to expiration per type, **premium-weighted** in the
+  premium table (where the money's horizon is) and **OI-weighted** in the open-
+  interest table (the book's horizon), bucketed 0DTE / weekly / monthly /
+  quarterly / LEAP. The median print's DTE shows alongside whenever the two
+  disagree by five days or more, because they often do: on a real export one
+  type medians at 2 days while its premium sits 52 days out — a day-trading
+  tape and a structural position sharing one label. Read from the file's own
+  `Days Until Expiration` column, or derived from the expiry and the print's
+  own date when there isn't one.
 - **Who is dominant** — one label naming the block type running the book,
   judged on three independent lenses: 💰 most premium, 📚 most open interest,
   💥 biggest book impact (traded size over the OI it landed on). A type leading
@@ -182,7 +191,7 @@ estimate — this is positioning analysis, **not trading advice**.
 
 ```
 pip install pytest
-python -m pytest tests/                 # 130 tests
+python -m pytest tests/                 # 137 tests
 python scripts/make_sample_chain.py     # regenerate the bundled sample chain
 ```
 
