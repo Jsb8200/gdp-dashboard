@@ -14,9 +14,10 @@ import streamlit as st
 
 from dealer_gex.analytics import (
     Analysis, analyze, block_levels, confluence_levels, darkpool_levels,
-    data_quality, directional_lean, flow_books, flow_type_breakdown,
-    fmt_dollars, institutional_mask, intraday_flow, level_hit_rate,
-    magnet_levels, oi_levels, oi_walls, tuned_layer_weights,
+    BLOCK_TIER_NOTE, block_tier_summary, block_type_breakdown, data_quality,
+    directional_lean, flow_books, flow_type_breakdown, fmt_dollars,
+    institutional_mask, intraday_flow, level_hit_rate, magnet_levels,
+    oi_levels, oi_walls, tuned_layer_weights,
 )
 
 _CONF_ICON = {"high": "🟢", "medium": "🟡", "low": "🔴"}
@@ -634,7 +635,8 @@ def history_section(hist: pd.DataFrame) -> None:
             )
 
 
-_VENUE_ICON = {"floor": "🏛️", "auto": "⚡", "cross": "🔁"}
+_VENUE_ICON = {"floor": "🏛️", "auto": "⚡", "cross": "🔁", "cob": "📚",
+               "cob auction": "📣", "auction": "📣", "iso": "🏃"}
 _SHAPE_ICON = {"block": "🧱", "sweep": "🌊", "split": "✂️", "multi": "🧬"}
 
 
@@ -646,6 +648,64 @@ def _flow_label(row) -> str:
     venue, shape = row.get("flow_venue", ""), row.get("flow_shape", "single")
     icons = f"{_VENUE_ICON.get(venue, '')}{_SHAPE_ICON.get(shape, '')}"
     return f"{icons} {label}".strip()
+
+
+_TIER_ICON = {"negotiated": "🤝", "facilitated": "📣", "electronic": "⚡",
+              "fragment": "🧩"}
+
+
+def block_type_section(prints: pd.DataFrame) -> None:
+    """Blocks only, split by *how they printed* — the distinction that
+    decides whether a 'block' is someone finding a counterparty for size or
+    one leg of an auto-executed spread."""
+    br = block_type_breakdown(prints)
+    if br.empty:
+        return
+    tiers = block_tier_summary(br)
+    st.markdown("**Block types — what the block book is actually made of:**")
+
+    cols = st.columns(max(len(tiers), 1))
+    for col, (_, t) in zip(cols, tiers.iterrows()):
+        col.metric(f"{_TIER_ICON.get(t['tier'], '')} {t['tier'].title()}",
+                   fmt_dollars(t["premium"]),
+                   f"{t['premium_share']:.0%} of block premium · "
+                   f"{t['prints']:,.0f} prints",
+                   delta_color="off", help=BLOCK_TIER_NOTE.get(t["tier"], ""))
+
+    view = br.copy()
+    view["Type"] = [
+        f"{_TIER_ICON.get(r['tier'], '')} {r['block_type']}"
+        + ("  🔗" if r["tied"] else "")
+        for _, r in br.iterrows()
+    ]
+    view["Premium"] = view["premium"].map(fmt_dollars)
+    view["Contracts"] = view["contracts"].map(lambda x: f"{x:,.0f}")
+    view["Prints"] = view["prints"].map(lambda x: f"{x:,.0f}")
+    view["Median print"] = view["median_premium"].map(fmt_dollars)
+    view["Net"] = [
+        f"{'🟢' if r['direction'] == 'bought' else '🔴' if r['direction'] == 'sold' else '⚪'} "
+        f"{r['direction']} ({r['net_contracts']:+,.0f})"
+        for _, r in br.iterrows()
+    ]
+    view["Share"] = view["premium_share"] * 100
+    st.dataframe(
+        view[["Type", "Premium", "Contracts", "Prints", "Median print", "Net", "Share"]],
+        use_container_width=True, hide_index=True,
+        column_config={"Share": st.column_config.ProgressColumn(
+            "% block premium", min_value=0, max_value=100, format="%.1f%%")},
+    )
+    st.caption(
+        "🤝 **negotiated** (floor, cross) is the block flow that means the "
+        "most — size someone had to find a counterparty for, off the public "
+        "book. 📣 **facilitated** (complex-order book, auction) is real size "
+        "worked publicly for price improvement. ⚡ **electronic** is the "
+        "default route. 🧩 **fragment** is one leg of a spread package — it "
+        "can dominate the *print count* while carrying a few percent of "
+        "premium, so read premium, not prints. 🔗 marks **stock-tied** "
+        "(delta-hedged) prints: a volatility trade, not a directional one — "
+        "its delta is neutralized by the accompanying stock. Levels and the "
+        "block book exclude fragments by default."
+    )
 
 
 def flow_type_table(prints: pd.DataFrame) -> None:
@@ -692,7 +752,9 @@ def block_section(a: Analysis, prints: pd.DataFrame, books: dict,
                   lvls: pd.DataFrame) -> None:
     st.subheader("🧱 Block intelligence (smart vs fast money)")
 
-    flow_type_table(prints)
+    block_type_section(prints)
+    with st.expander("All flow types (sweeps, splits, everything else)"):
+        flow_type_table(prints)
 
     if books:
         rows = []
@@ -1053,12 +1115,14 @@ def report_section(a: Analysis, ticker: str, hist: pd.DataFrame | None = None,
                    dq: dict | None = None, lean: dict | None = None,
                    dark_lvls: pd.DataFrame | None = None,
                    forecast: ExpectedMoveForecast | None = None,
-                   flow_types: pd.DataFrame | None = None) -> None:
+                   flow_types: pd.DataFrame | None = None,
+                   block_types: pd.DataFrame | None = None) -> None:
     st.subheader("Report")
     md = build_markdown(a, ticker=ticker, history=hist,
                         block_books=blk_books, block_lvls=blk_lvls,
                         master=master, dq=dq, lean=lean, dark_lvls=dark_lvls,
-                        forecast=forecast, flow_types=flow_types)
+                        forecast=forecast, flow_types=flow_types,
+                        block_types=block_types)
     stem = f"dealer-positioning-{a.asof:%Y%m%d}"
     c1, c2, _ = st.columns([1, 1, 3])
     c1.download_button("Download report (.md)", md, file_name=f"{stem}.md",
@@ -1403,7 +1467,8 @@ def main() -> None:
     tables(a)
     report_section(a, ticker, hist, blk_books, blk_lvls, master, dq, lean,
                    dark_lvls, forecast,
-                   flow_type_breakdown(merged_prints) if merged_prints is not None else None)
+                   flow_type_breakdown(merged_prints) if merged_prints is not None else None,
+                   block_type_breakdown(merged_prints) if merged_prints is not None else None)
 
     with st.expander("Methodology & assumptions"):
         st.markdown(

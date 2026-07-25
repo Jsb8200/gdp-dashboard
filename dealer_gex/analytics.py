@@ -592,13 +592,103 @@ def flow_type_breakdown(prints: pd.DataFrame, min_share: float = 0.0) -> pd.Data
     return out[out["premium_share"] >= min_share] if min_share > 0 else out
 
 
-def institutional_mask(prints: pd.DataFrame, types: list[str] | None = None) -> pd.Series:
+#: Block tiers, most meaningful first — see parsing.BLOCK_TIERS.
+BLOCK_TIER_ORDER = ["negotiated", "facilitated", "electronic", "fragment"]
+BLOCK_TIER_NOTE = {
+    "negotiated": "Agreed upstairs, off the public book — floor and cross "
+                  "prints. The size someone had to find a counterparty for.",
+    "facilitated": "Exposed to the complex-order book or an auction for price "
+                   "improvement — real size, publicly worked.",
+    "electronic": "Routed the default electronic way. Size, but no evidence "
+                  "anyone negotiated it.",
+    "fragment": "One leg of a spread package. The premium here is a fraction "
+                "of a trade whose other legs are elsewhere in the file — not "
+                "an outright position.",
+}
+
+
+def block_type_breakdown(prints: pd.DataFrame) -> pd.DataFrame:
+    """Block prints only, split by *how they printed*.
+
+    A file can tag thousands of prints BLOCK and mean very different things
+    by it: a floor-negotiated cross and one leg of an auto-executed spread
+    are both "blocks". This ranks the block book by execution mechanism and
+    tags each row with the tier that says how much it means.
+
+    Columns: block_type, tier, mechanism, tied, spread_leg, prints,
+    contracts, premium, median_premium, avg_premium, net_contracts,
+    direction, premium_share.
+    """
+    cols = ["block_type", "tier", "mechanism", "tied", "spread_leg", "prints",
+            "contracts", "premium", "median_premium", "avg_premium",
+            "net_contracts", "direction", "premium_share"]
+    if prints is None or prints.empty or "is_block" not in prints:
+        return pd.DataFrame(columns=cols)
+    b = prints[prints["is_block"].fillna(False)].copy()
+    if b.empty:
+        return pd.DataFrame(columns=cols)
+
+    b["premium"] = pd.to_numeric(b.get("premium", 0.0), errors="coerce").fillna(0.0)
+    b["size"] = pd.to_numeric(b.get("size", 0.0), errors="coerce").fillna(0.0)
+    b["signed_size"] = pd.to_numeric(b.get("signed_size", 0.0),
+                                     errors="coerce").fillna(0.0)
+    if "flow_type" not in b:
+        b["flow_type"] = "block"
+    for c, default in (("block_tier", ""), ("mechanism", ""),
+                       ("is_tied", False), ("is_spread_leg", False)):
+        if c not in b:
+            b[c] = default
+
+    g = b.groupby("flow_type", dropna=False).agg(
+        tier=("block_tier", "first"),
+        mechanism=("mechanism", "first"),
+        tied=("is_tied", "any"),
+        spread_leg=("is_spread_leg", "any"),
+        prints=("flow_type", "size"),
+        contracts=("size", "sum"),
+        premium=("premium", "sum"),
+        median_premium=("premium", "median"),
+        net_contracts=("signed_size", "sum"),
+    ).reset_index().rename(columns={"flow_type": "block_type"})
+
+    g["avg_premium"] = np.where(g["prints"] > 0, g["premium"] / g["prints"], 0.0)
+    total = float(g["premium"].sum())
+    g["premium_share"] = g["premium"] / total if total > 0 else 0.0
+    tilt = np.where(g["contracts"] > 0, g["net_contracts"] / g["contracts"], 0.0)
+    g["direction"] = np.where(tilt > 0.15, "bought",
+                       np.where(tilt < -0.15, "sold", "two-way"))
+    return g[cols].sort_values("premium", ascending=False).reset_index(drop=True)
+
+
+def block_tier_summary(breakdown: pd.DataFrame) -> pd.DataFrame:
+    """Roll a ``block_type_breakdown`` up to one row per tier, ranked by how
+    much the tier means rather than by how many prints it has."""
+    cols = ["tier", "prints", "contracts", "premium", "premium_share", "note"]
+    if breakdown is None or breakdown.empty:
+        return pd.DataFrame(columns=cols)
+    g = breakdown.groupby("tier", dropna=False).agg(
+        prints=("prints", "sum"), contracts=("contracts", "sum"),
+        premium=("premium", "sum"),
+    ).reset_index()
+    total = float(g["premium"].sum())
+    g["premium_share"] = g["premium"] / total if total > 0 else 0.0
+    g["note"] = g["tier"].map(BLOCK_TIER_NOTE).fillna("")
+    g["_rank"] = g["tier"].map(
+        {t: i for i, t in enumerate(BLOCK_TIER_ORDER)}).fillna(len(BLOCK_TIER_ORDER))
+    return g.sort_values("_rank")[cols].reset_index(drop=True)
+
+
+def institutional_mask(prints: pd.DataFrame, types: list[str] | None = None,
+                       drop_fragments: bool = True) -> pd.Series:
     """Which prints count as institutional size.
 
     Defaults to the parser's ``is_institutional`` (block-shaped, floor, or
-    cross prints). Pass ``types`` — display labels from
-    ``flow_type_breakdown`` — to override that with an explicit selection,
-    which is what the sidebar picker does.
+    cross prints) minus spread legs: a leg of a package is not an outright
+    position, and in a real export legs can be most of the block prints
+    while carrying a few percent of block premium. Pass
+    ``drop_fragments=False`` to keep them, or ``types`` — display labels
+    from the breakdowns — to select explicitly, which is what the sidebar
+    picker does.
     """
     if prints is None or prints.empty:
         return pd.Series(dtype=bool)
@@ -607,10 +697,14 @@ def institutional_mask(prints: pd.DataFrame, types: list[str] | None = None) -> 
             return pd.Series(False, index=prints.index)
         return prints["flow_type"].isin(types)
     if "is_institutional" in prints:
-        return prints["is_institutional"].fillna(False)
-    if "is_block" in prints:
-        return prints["is_block"].fillna(False)
-    return pd.Series(False, index=prints.index)
+        m = prints["is_institutional"].fillna(False)
+    elif "is_block" in prints:
+        m = prints["is_block"].fillna(False)
+    else:
+        return pd.Series(False, index=prints.index)
+    if drop_fragments and "is_spread_leg" in prints:
+        m = m & ~prints["is_spread_leg"].fillna(False)
+    return m
 
 
 def flow_books(prints: pd.DataFrame, spot: float, asof: date, rate: float = 0.045,

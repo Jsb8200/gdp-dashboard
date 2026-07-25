@@ -189,3 +189,106 @@ def test_report_lists_every_type_with_its_premium(flow):
     assert "PHLX SPECIAL" in md                          # unmapped, still shown
     assert "$200.00K" in md                              # premium per type
     assert "Consolidated flow by type" not in build_markdown(a, ticker="XSP")
+
+
+# --- QuantData's real two-column vocabulary ----------------------------------
+#
+# Live exports put the *shape* in Consolidation Type (SWEEP / BLOCK / SPLIT)
+# and the *mechanism* in a separate Trade Type column, with SPRD_/SPRD_LEG_
+# and TIED_ prefixes modifying it.
+REAL_CSV = """Trade ID,Trade Time,Ticker,Expiration Date,Strike Price,Contract Type,Reference Price,Size,Volume,Open Interest,Side Code,Implied Volatility,Gamma,Premium Price,Trade Type,Consolidation Type,Is Golden Sweep,Is Unusual,Is Opening Position
+1,2026-07-08T13:30:00.100Z,QQQ,2026-08-21,$710.00,PUT,$708.60,17000,"20,000","30,000",A,22.0%,0.009,"$25,058,000.00",SPRD_FLR,BLOCK,No,Yes,No
+2,2026-07-08T13:40:00.200Z,QQQ,2026-09-18,$645.00,CALL,$708.50,3000,"5,000","12,000",B,20.0%,0.006,"$25,350,000.00",SPRD_TIED_CROSS,BLOCK,No,Yes,No
+3,2026-07-08T13:50:00.300Z,QQQ,2026-07-17,$775.00,PUT,$708.40,2100,"3,000","9,000",B,25.0%,0.004,"$14,084,700.00",FLR,BLOCK,No,Yes,No
+4,2026-07-08T14:00:00.400Z,QQQ,2026-07-17,$700.00,CALL,$708.30,500,"9,000","20,000",A,19.0%,0.012,"$1,000,000.00",COB,BLOCK,No,No,No
+5,2026-07-08T14:10:00.500Z,QQQ,2026-07-17,$700.00,CALL,$708.20,300,"9,000","20,000",A,19.0%,0.012,"$600,000.00",COB_AUCT,BLOCK,No,No,No
+6,2026-07-08T14:20:00.600Z,QQQ,2026-07-17,$715.00,CALL,$708.10,50,"4,000","11,000",A,18.0%,0.011,"$60,000.00",SPRD_LEG_AUTO,BLOCK,No,No,No
+7,2026-07-08T14:30:00.700Z,QQQ,2026-07-17,$715.00,CALL,$708.00,10,"4,000","11,000",B,18.0%,0.011,"$435.00",SPRD_LEG_AUTO,BLOCK,No,No,No
+8,2026-07-08T14:40:00.800Z,QQQ,2026-07-17,$690.00,PUT,$707.90,224,"139,409","2,393",BB,27.5%,0.096,"$32,916.00",AUTO,SWEEP,No,No,No
+9,2026-07-08T14:50:00.900Z,QQQ,2026-07-17,$690.00,PUT,$707.80,100,"139,409","2,393",A,27.5%,0.096,"$15,000.00",ISO,SWEEP,No,No,No
+10,2026-07-08T15:00:00.000Z,QQQ,2026-07-17,$705.00,CALL,$707.70,900,"6,000","14,000",A,18.5%,0.012,"$4,704,000.00",CANCEL,BLOCK,No,Yes,No
+"""
+
+
+@pytest.fixture(scope="module")
+def real():
+    pf = parse_file(REAL_CSV.encode())
+    assert pf.prints is not None
+    return pf
+
+
+def test_mechanism_is_read_from_its_own_column(real):
+    """FLR/AUTO/CROSS live in Trade Type, not Consolidation Type — reading
+    only the latter left every one of these prints untyped."""
+    p = real.prints.sort_values("trade_time").reset_index(drop=True)
+    assert list(p["mechanism"]) == [
+        "floor", "cross", "floor", "cob", "cob auction", "auto", "auto",
+        "auto", "iso",
+    ]
+    assert list(p["flow_shape"]) == ["block"] * 7 + ["sweep", "sweep"]
+    assert list(p["flow_type"])[:5] == [
+        "floor block spread", "tied cross block spread", "floor block",
+        "cob block", "cob auction block",
+    ]
+
+
+def test_spread_legs_tied_and_packages_are_flagged(real):
+    p = real.prints.set_index("trade_id" if "trade_id" in real.prints else
+                              real.prints.index)
+    p = real.prints.sort_values("trade_time").reset_index(drop=True)
+    assert list(p["is_spread"]) == [True, True, False, False, False, True,
+                                    True, False, False]
+    assert list(p["is_spread_leg"]) == [False, False, False, False, False,
+                                        True, True, False, False]
+    assert list(p["is_tied"]) == [False, True, False, False, False, False,
+                                  False, False, False]
+    assert p.loc[1, "flow_type"] == "tied cross block spread"   # package, tied
+    assert p.loc[5, "flow_type"] == "auto block leg"           # one leg only
+
+
+def test_cancelled_prints_are_dropped(real):
+    """A busted $4.7M block would otherwise top the notable-flow table."""
+    assert len(real.prints) == 9                      # 10 rows, one CANCEL
+    assert "CANCEL" not in set(real.prints["trade_type"])
+    assert real.prints["premium"].max() < 25_400_000  # the cancel is gone
+
+
+def test_block_tiers_rank_by_what_the_print_means(real):
+    from dealer_gex.analytics import block_tier_summary, block_type_breakdown
+
+    br = block_type_breakdown(real.prints)
+    assert list(br["block_type"]) == [
+        "tied cross block spread", "floor block spread", "floor block",
+        "cob block", "cob auction block", "auto block leg",
+    ]                                                  # ranked by premium
+    tied = br.set_index("block_type").loc["tied cross block spread"]
+    assert tied["tied"] and tied["tier"] == "negotiated"
+    assert br.set_index("block_type").loc["auto block leg", "tier"] == "fragment"
+
+    tiers = block_tier_summary(br)
+    assert list(tiers["tier"]) == ["negotiated", "facilitated", "fragment"]
+    assert tiers.iloc[0]["premium_share"] > 0.95       # negotiated dominates
+    # the fragments are 2 of 7 block prints but a rounding error of premium
+    frag = tiers.set_index("tier").loc["fragment"]
+    assert frag["prints"] == 2 and frag["premium_share"] < 0.001
+
+
+def test_spread_legs_are_kept_out_of_the_block_book_by_default(real):
+    p = real.prints
+    default = institutional_mask(p)
+    kept = institutional_mask(p, drop_fragments=False)
+    assert int(kept.sum() - default.sum()) == 2        # the two SPRD_LEG rows
+    assert not default[p["is_spread_leg"]].any()
+
+
+def test_report_ranks_block_types_by_tier(real):
+    from dealer_gex.analytics import block_type_breakdown
+    from dealer_gex.report import build_markdown
+
+    a = analyze(real.chain, real.spots["QQQ"], real.asof)
+    md = build_markdown(a, ticker="QQQ",
+                        block_types=block_type_breakdown(real.prints))
+    assert "## Block types (how the size printed)" in md
+    assert "| **negotiated** |" in md and "| **fragment** |" in md
+    assert "tied cross block spread (stock-tied)" in md
+    assert "Read premium, not print count" in md

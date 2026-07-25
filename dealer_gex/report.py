@@ -6,7 +6,10 @@ import html
 
 import pandas as pd
 
-from dealer_gex.analytics import Analysis, fmt_dollars, magnet_levels, oi_levels, oi_walls
+from dealer_gex.analytics import (
+    Analysis, block_tier_summary, fmt_dollars, magnet_levels, oi_levels,
+    oi_walls,
+)
 
 _REGIME_TEXT = {
     "long_gamma": (
@@ -232,7 +235,8 @@ def build_markdown(a: Analysis, ticker: str = "",
                    dq: dict | None = None, lean: dict | None = None,
                    dark_lvls: pd.DataFrame | None = None,
                    forecast=None,
-                   flow_types: pd.DataFrame | None = None) -> str:
+                   flow_types: pd.DataFrame | None = None,
+                   block_types: pd.DataFrame | None = None) -> str:
     title, body = regime_text(a.regime)
     label = f"{ticker.upper()} " if ticker else ""
     flip = f"{a.gamma_flip:,.2f}" if a.gamma_flip is not None else "no crossing in ±15% range"
@@ -426,6 +430,43 @@ def build_markdown(a: Analysis, ticker: str = "",
                 "Books are **divergent** — patient block money and the urgent tape "
                 "disagree; favor blocks on swing horizon, sweeps intraday."
             )
+
+    if block_types is not None and not block_types.empty:
+        tiers = block_tier_summary(block_types)
+        lines += [
+            "",
+            "## Block types (how the size printed)",
+            "",
+            "| Tier | Premium | % | Prints | Reading |",
+            "|---|---|---|---|---|",
+        ]
+        for _, t in tiers.iterrows():
+            lines.append(
+                f"| **{t['tier']}** | {fmt_dollars(t['premium'])} "
+                f"| {t['premium_share'] * 100:.0f}% | {t['prints']:,.0f} "
+                f"| {t['note']} |"
+            )
+        lines += [
+            "",
+            "| Block type | Premium | Contracts | Prints | Median print | Net | % |",
+            "|---|---|---|---|---|---|---|",
+        ]
+        for _, r in block_types.iterrows():
+            tied = " (stock-tied)" if r["tied"] else ""
+            lines.append(
+                f"| {r['block_type']}{tied} | {fmt_dollars(r['premium'])} "
+                f"| {r['contracts']:,.0f} | {r['prints']:,.0f} "
+                f"| {fmt_dollars(r['median_premium'])} "
+                f"| {r['direction']} ({r['net_contracts']:+,.0f}) "
+                f"| {r['premium_share'] * 100:.1f}% |"
+            )
+        lines += [
+            "",
+            "Read premium, not print count: spread *legs* are fragments of a "
+            "package and can be most of the prints while carrying a few "
+            "percent of the premium. Stock-tied prints are delta-hedged on "
+            "the trade — a volatility position, not a directional one.",
+        ]
 
     if flow_types is not None and not flow_types.empty:
         lines += [

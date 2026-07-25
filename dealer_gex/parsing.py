@@ -66,6 +66,7 @@ SYNONYMS = {
     "trade_id": ["tradeid"],
     "premium": ["premiumprice", "premium", "totalpremium"],
     "consolidation": ["consolidationtype", "consolidation"],
+    "trade_type": ["tradetype", "executiontype", "tradekind"],
     "is_golden": ["isgoldensweep", "goldensweep"],
     "is_unusual": ["isunusual", "unusual"],
     "is_opening": ["isopeningposition", "openingposition", "isopening"],
@@ -104,6 +105,77 @@ def _has_any(s: pd.Series, needles: tuple[str, ...]) -> pd.Series:
     return hit
 
 
+# QuantData splits the two axes across two columns: *Consolidation Type* is
+# the shape (SWEEP / BLOCK / SPLIT) and *Trade Type* is the mechanism —
+# AUTO, FLR, CROSS, COB, AUCT, ISO — with two modifying prefixes:
+#
+#   SPRD_ / SPRD_LEG_  the print is a package, or one leg of one
+#   TIED_              the print is stock-tied, i.e. delta-hedged on the trade
+#
+# A leg of a spread is not an outright bet, and a tied print is a volatility
+# bet whose delta is neutralized by the accompanying stock — so both change
+# what a "block" means, and both have to survive parsing.
+TRADE_MECHANISMS = {   # first match wins, so compound codes come first
+    "floor":       ("FLR", "FLOOR", "PIT", "OPENOUTCRY"),
+    "cross":       ("CROSS", "XCRS", "QCC", "FACILITATION"),
+    "cob auction": ("COBAUCT", "COMPLEXAUCT"),
+    "cob":         ("COB", "COMPLEX"),
+    "auction":     ("AUCT", "AUCTION", "PIM", "AIM", "SOLICIT"),
+    "iso":         ("ISO", "INTERMARKET"),
+    "auto":        ("AUTO", "ELECTRONIC", "ELEC"),
+}
+#: How much a block of each mechanism actually says, most meaningful first.
+BLOCK_TIERS = {
+    "negotiated": ("floor", "cross"),   # agreed upstairs, off the public book
+    "facilitated": ("cob", "cob auction", "auction"),  # worked for price improvement
+    "electronic": ("auto", "iso"),      # the default route
+}
+CANCEL_CODES = ("CANCEL", "CXL", "BUST")
+
+
+def _clean_codes(values) -> pd.Series:
+    s = pd.Series(values).fillna("").astype(str).str.upper()
+    s = s.str.replace(r"[_\-/|]+", " ", regex=True).str.strip()
+    return s.replace({"NAN": "", "NONE": "", "NAT": ""})
+
+
+def classify_trade_type(trade_type) -> pd.DataFrame:
+    """Split an execution-mechanism column into its independent parts.
+
+    Returns ``trade_type`` (raw), ``mechanism`` (floor / cross / cob /
+    auction / iso / auto / ""), ``is_spread``, ``is_spread_leg``,
+    ``is_tied``, ``is_cancelled`` and ``block_tier`` (negotiated /
+    facilitated / electronic / fragment / cancelled / "").
+
+    A spread *leg* is its own tier: ``SPRD_LEG_AUTO`` prints are fragments
+    of a package — in a real export they can be the majority of block
+    prints while carrying ~1% of block premium, so counting them as
+    outright blocks buries the trades that matter.
+    """
+    s = _clean_codes(trade_type)
+    squeezed = s.str.replace(" ", "", regex=False)
+
+    mechanism = pd.Series("", index=s.index, dtype=object)
+    for name, needles in TRADE_MECHANISMS.items():
+        mechanism = mechanism.mask((mechanism == "") & _has_any(squeezed, needles), name)
+
+    is_spread_leg = squeezed.str.startswith("SPRDLEG", na=False)
+    is_spread = squeezed.str.startswith("SPRD", na=False)
+    is_tied = squeezed.str.contains("TIED", na=False, regex=False)
+    is_cancelled = _has_any(squeezed, CANCEL_CODES)
+
+    tier = pd.Series("", index=s.index, dtype=object)
+    for name, mechs in BLOCK_TIERS.items():
+        tier = tier.mask((tier == "") & mechanism.isin(mechs), name)
+    tier = tier.mask(is_spread_leg, "fragment")
+    tier = tier.mask(is_cancelled, "cancelled")
+    return pd.DataFrame({
+        "trade_type": s, "mechanism": mechanism, "is_spread": is_spread,
+        "is_spread_leg": is_spread_leg, "is_tied": is_tied,
+        "is_cancelled": is_cancelled, "block_tier": tier,
+    })
+
+
 def classify_flow(consolidation) -> pd.DataFrame:
     """Split a consolidated-flow type column into precise, orthogonal parts.
 
@@ -118,10 +190,7 @@ def classify_flow(consolidation) -> pd.DataFrame:
       sweep``, ``block``, ``floor``. A value matching nothing keeps its raw
       text rather than being silently bucketed as ``single``.
     """
-    # fillna first: pandas 3 keeps NA through astype(str)
-    s = pd.Series(consolidation).fillna("").astype(str).str.upper()
-    s = s.str.replace(r"[_\-/|]+", " ", regex=True).str.strip()
-    s = s.replace({"NAN": "", "NONE": "", "NAT": ""})
+    s = _clean_codes(consolidation)
     squeezed = s.str.replace(" ", "", regex=False)
 
     venue = pd.Series("", index=s.index, dtype=object)
@@ -344,23 +413,60 @@ def _parse_trade_flow(raw: pd.DataFrame) -> ParsedFile:
         kinds = classify_flow(pd.Series("", index=df.index))
     kinds.index = df.index
     df["consolidation"] = kinds["consolidation"]
-    df["flow_venue"] = kinds["flow_venue"]
     df["flow_shape"] = kinds["flow_shape"]
-    df["flow_type"] = kinds["flow_type"]
     df["is_sweep"] = kinds["flow_shape"] == "sweep"
     df["is_block"] = kinds["flow_shape"] == "block"
     # SPLIT: one order worked across executions — between a sweep and a
     # block; large patient flow, still conviction
     df["is_split"] = kinds["flow_shape"] == "split"
-    df["is_floor"] = kinds["flow_venue"] == "floor"
-    df["is_auto"] = kinds["flow_venue"] == "auto"
-    df["is_cross"] = kinds["flow_venue"] == "cross"
+
+    # The mechanism lives in its own column when the export has one (this is
+    # where FLR / AUTO / CROSS actually are); otherwise fall back to whatever
+    # the consolidation column carried.
+    if "trade_type" in cols:
+        mech = classify_trade_type(raw[cols["trade_type"]])
+    else:
+        mech = classify_trade_type(pd.Series("", index=df.index))
+        mech["mechanism"] = kinds["flow_venue"].to_numpy()
+        mech["block_tier"] = [
+            next((t for t, ms in BLOCK_TIERS.items() if m in ms), "")
+            for m in kinds["flow_venue"]
+        ]
+    mech.index = df.index
+    df["trade_type"] = mech["trade_type"]
+    df["mechanism"] = mech["mechanism"]
+    df["flow_venue"] = mech["mechanism"]
+    df["is_spread"] = mech["is_spread"]
+    df["is_spread_leg"] = mech["is_spread_leg"]
+    df["is_tied"] = mech["is_tied"]
+    df["block_tier"] = mech["block_tier"]
+    df["is_floor"] = mech["mechanism"] == "floor"
+    df["is_auto"] = mech["mechanism"] == "auto"
+    df["is_cross"] = mech["mechanism"] == "cross"
+
+    # display label: how it printed + its shape, e.g. "floor block", "auto sweep"
+    parts = kinds["flow_shape"].where(kinds["flow_shape"] != "single", "")
+    label = (mech["mechanism"] + " " + parts).str.strip()
+    label = label.mask(mech["is_spread"] & ~mech["is_spread_leg"], label + " spread")
+    label = label.mask(mech["is_spread_leg"], label + " leg")
+    label = label.mask(mech["is_tied"], "tied " + label)
+    df["flow_type"] = label.where(label != "", kinds["flow_type"])
+
     # Negotiated size, whatever it was tagged: a BLOCK-shaped print, or one
     # that printed on the floor / as a cross. AUTO is deliberately excluded —
     # electronic execution is the default route, not a size signal.
     df["is_institutional"] = (
-        df["is_block"] | kinds["flow_venue"].isin(INSTITUTIONAL_VENUES)
+        (df["is_block"] | mech["mechanism"].isin(INSTITUTIONAL_VENUES))
+        & ~mech["is_cancelled"]
     )
+
+    # Cancelled/busted prints never happened — drop them rather than let
+    # them inflate block premium (they are large and rare, so they land
+    # straight in the "biggest prints" table if kept).
+    cancelled = mech["is_cancelled"]
+    if cancelled.any():
+        df = df[~cancelled]
+        raw = raw.loc[df.index]
     for flag in ("is_golden", "is_unusual", "is_opening"):
         df[flag] = _yes(raw[cols[flag]]) if flag in cols else False
 

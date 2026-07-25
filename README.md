@@ -36,7 +36,10 @@ Four file shapes are auto-detected — no configuration:
 - **Trade-level order flow** (QuantData "Options Order Flow") — one row per
   print. Prints are collapsed to a correct per-contract chain (open interest is
   taken as a max, never summed), ticker/spot/date are inferred, and the ask/bid
-  side codes power the signed-flow, block, and conviction features.
+  side codes power the signed-flow, block, and conviction features. Both type
+  columns are read: `Consolidation Type` (SWEEP / BLOCK / SPLIT — the shape)
+  and `Trade Type` (AUTO, FLR, CROSS, COB, AUCT, ISO, with `SPRD_`/`SPRD_LEG_`
+  and `TIED_` prefixes — the mechanism).
 - **Dark-pool / equity blocks** — price + size per print, no strike. Used as a
   confluence *overlay* on an options analysis (upload alongside a chain).
 
@@ -76,6 +79,15 @@ history** instead.
 - **Block intelligence** — the blocks-only vs sweeps-only books side by side
   (smart vs fast money) with an automatic aligned/divergent verdict, plus a
   floor-only book when the file distinguishes floor prints.
+- **Block types** — a "block" can mean very different things. Block prints are
+  split by *how they printed* and ranked into tiers: 🤝 **negotiated** (floor,
+  cross — size someone had to find a counterparty for), 📣 **facilitated**
+  (complex-order book, auction — real size worked publicly), ⚡ **electronic**
+  (the default route), 🧩 **fragment** (one leg of a spread package). On a real
+  QuantData export the fragments are ~60% of block *prints* and ~3% of block
+  *premium*, so they are excluded from levels and the block book by default.
+  Stock-tied (delta-hedged) prints are flagged 🔗 — a volatility position, not
+  a directional one — and cancelled/busted prints are dropped outright.
 - **Conviction filter** — rebuild *every* level from flagged prints only
   (sweeps / blocks / floor / cross / auto / splits / golden / unusual /
   opening).
@@ -137,7 +149,7 @@ estimate — this is positioning analysis, **not trading advice**.
 
 ```
 pip install pytest
-python -m pytest tests/                 # 99 tests
+python -m pytest tests/                 # 105 tests
 python scripts/make_sample_chain.py     # regenerate the bundled sample chain
 ```
 
