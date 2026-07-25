@@ -1090,6 +1090,109 @@ def block_dte_breakdown(prints: pd.DataFrame,
     return g.sort_values("_rank")[cols].reset_index(drop=True)
 
 
+#: Tenor windows for the focused block view. Cumulative, not exclusive:
+#: "weekly" is everything expiring within ten days, 0DTE included, because
+#: what is in play this week is the question — not what is in play only in
+#: the second half of it.
+BLOCK_WINDOWS = {"0DTE": 0, "Weekly": 10, "Monthly": 45}
+
+
+def block_window_breakdown(prints: pd.DataFrame, max_dte: int,
+                           spot: float | None = None) -> pd.DataFrame:
+    """Block types expiring within ``max_dte`` days, premium and book in one
+    table.
+
+    The term-structure table splits the whole book across every tenor; this
+    is the opposite move — pick the window you are trading and see only the
+    types living in it, with the premium and open-interest columns side by
+    side rather than in two places.
+
+    ``share`` is the type's share of premium *within the window*, and
+    ``share_of_book`` its share of all block premium, so a window that is
+    a rounding error against the whole book cannot look dominant.
+
+    Columns: block_type, code, tier, prints, contracts, premium, share,
+    share_of_book, open_interest, add_ratio, opening_share, dte, level,
+    distance_pct, net_contracts, direction.
+    """
+    cols = ["block_type", "code", "tier", "prints", "contracts", "premium",
+            "share", "share_of_book", "open_interest", "add_ratio",
+            "opening_share", "dte", "level", "distance_pct", "net_contracts",
+            "direction"]
+    if prints is None or prints.empty or "is_block" not in prints:
+        return pd.DataFrame(columns=cols)
+    blocks = prints[prints["is_block"].fillna(False)]
+    if blocks.empty or "dte" not in blocks:
+        return pd.DataFrame(columns=cols)
+
+    dte = pd.to_numeric(blocks["dte"], errors="coerce")
+    window = blocks[dte.notna() & (dte >= 0) & (dte <= float(max_dte))]
+    if window.empty:
+        return pd.DataFrame(columns=cols)
+
+    prem = block_type_breakdown(window, spot)
+    oi = block_oi_breakdown(window, spot)
+    if prem.empty:
+        return pd.DataFrame(columns=cols)
+
+    out = prem[["block_type", "code", "tier", "prints", "contracts", "premium",
+                "premium_share", "dte", "level", "distance_pct",
+                "net_contracts", "direction"]].rename(
+        columns={"premium_share": "share"})
+    if not oi.empty:
+        out = out.merge(
+            oi[["block_type", "open_interest", "add_ratio", "opening_share"]],
+            on="block_type", how="left")
+    else:
+        for c in ("open_interest", "add_ratio", "opening_share"):
+            out[c] = np.nan
+
+    book = pd.to_numeric(blocks.get("premium", 0.0), errors="coerce").fillna(0.0).sum()
+    out["share_of_book"] = out["premium"] / book if book > 0 else np.nan
+    return out[cols].sort_values("premium", ascending=False).reset_index(drop=True)
+
+
+def block_window_summary(prints: pd.DataFrame,
+                         windows: dict | None = None) -> pd.DataFrame:
+    """One row per tenor window: how much of the block book is in play
+    inside it, and which type owns it.
+
+    Windows are cumulative, so the rows nest rather than partition — the
+    monthly row contains the weekly row contains 0DTE. That is what a
+    trader means by "what is in play this week", and the column names say
+    so rather than implying a split.
+    """
+    cols = ["window", "max_dte", "prints", "contracts", "premium",
+            "share_of_book", "top_type", "top_share"]
+    windows = windows or BLOCK_WINDOWS
+    if prints is None or prints.empty or "is_block" not in prints:
+        return pd.DataFrame(columns=cols)
+    blocks = prints[prints["is_block"].fillna(False)]
+    if blocks.empty or "dte" not in blocks:
+        return pd.DataFrame(columns=cols)
+    book = pd.to_numeric(blocks.get("premium", 0.0), errors="coerce").fillna(0.0).sum()
+
+    rows = []
+    for name, max_dte in windows.items():
+        w = block_window_breakdown(blocks, max_dte)
+        if w.empty:
+            rows.append({"window": name, "max_dte": max_dte, "prints": 0,
+                         "contracts": 0.0, "premium": 0.0,
+                         "share_of_book": 0.0, "top_type": "", "top_share": np.nan})
+            continue
+        prem = float(w["premium"].sum())
+        top = w.iloc[0]
+        rows.append({
+            "window": name, "max_dte": max_dte,
+            "prints": int(w["prints"].sum()),
+            "contracts": float(w["contracts"].sum()), "premium": prem,
+            "share_of_book": prem / book if book > 0 else np.nan,
+            "top_type": str(top["block_type"]),
+            "top_share": float(top["premium"] / prem) if prem > 0 else np.nan,
+        })
+    return pd.DataFrame(rows, columns=cols)
+
+
 def block_dominance(prints: pd.DataFrame, spot: float | None = None,
                     min_share: float = 0.05) -> dict:
     """Which block type is actually running this book.

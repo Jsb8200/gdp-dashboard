@@ -14,8 +14,10 @@ import streamlit as st
 
 from dealer_gex.analytics import (
     Analysis, analyze, block_levels, confluence_levels, darkpool_levels,
-    BLOCK_TIER_NOTE, block_dominance, block_dte_breakdown, block_oi_breakdown,
-    block_tier_summary, block_type_behaviour, block_type_breakdown, data_quality,
+    BLOCK_TIER_NOTE, BLOCK_WINDOWS, block_dominance, block_dte_breakdown,
+    block_oi_breakdown, block_tier_summary, block_type_behaviour,
+    block_type_breakdown, block_window_breakdown, block_window_summary,
+    data_quality,
     flow_books, flow_type_breakdown, fmt_dollars, institutional_mask,
     intraday_flow, level_hit_rate, magnet_levels, oi_levels, oi_walls,
     tuned_layer_weights,
@@ -832,6 +834,87 @@ def block_dte_section(prints: pd.DataFrame, spot: float) -> None:
     )
 
 
+_WINDOW_ICON = {"0DTE": "⚡", "Weekly": "📆", "Monthly": "🗓️"}
+
+
+def block_window_section(prints: pd.DataFrame, spot: float) -> None:
+    """One tenor window at a time: the block types actually in play."""
+    summary = block_window_summary(prints)
+    if summary.empty or summary["premium"].max() <= 0:
+        return
+    st.markdown("**Block types in play — pick the window you are trading:**")
+
+    labels = {
+        name: f"{_WINDOW_ICON.get(name, '')} {name}"
+               + ("" if max_dte == 0 else f" (0–{max_dte}d)")
+        for name, max_dte in BLOCK_WINDOWS.items()
+    }
+    choice = st.segmented_control(
+        "Expiration window", list(labels.values()), default=labels["Weekly"],
+        key="block_window", label_visibility="collapsed",
+    )
+    name = next((k for k, v in labels.items() if v == choice), "Weekly")
+    max_dte = BLOCK_WINDOWS[name]
+
+    row = summary.set_index("window").loc[name]
+    cols = st.columns(3)
+    cols[0].metric(f"{_WINDOW_ICON.get(name, '')} {name} premium",
+                   fmt_dollars(row["premium"]),
+                   f"{row['share_of_book']:.0%} of the block book",
+                   delta_color="off")
+    cols[1].metric("Prints", f"{row['prints']:,.0f}",
+                   f"{row['contracts']:,.0f} contracts", delta_color="off")
+    cols[2].metric("Owned by", row["top_type"] or "—",
+                   "—" if pd.isna(row["top_share"])
+                   else f"{row['top_share']:.0%} of the window",
+                   delta_color="off")
+
+    w = block_window_breakdown(prints, max_dte, spot)
+    if w.empty:
+        st.info(f"No block prints expiring within {max_dte} days.")
+        return
+    view = w.copy()
+    view["Type"] = [f"{_TIER_ICON.get(r['tier'], '')} {r['block_type']}"
+                    for _, r in w.iterrows()]
+    view["Code"] = view["code"]
+    view["Premium"] = view["premium"].map(fmt_dollars)
+    view["Prints"] = view["prints"].map(lambda x: f"{x:,.0f}")
+    view["Contracts"] = view["contracts"].map(lambda x: f"{x:,.0f}")
+    view["Open interest"] = view["open_interest"].map(
+        lambda x: "—" if pd.isna(x) else f"{x:,.0f}")
+    view["Add"] = view["add_ratio"].map(
+        lambda x: "—" if pd.isna(x) else f"{x:.0%}")
+    view["DTE"] = view["dte"].map(lambda x: "—" if pd.isna(x) else f"{x:,.1f}")
+    view["Level"] = view["level"].map(
+        lambda x: "—" if pd.isna(x) else f"{x:,.2f}")
+    view["vs spot"] = view["distance_pct"].map(
+        lambda x: "—" if pd.isna(x) else f"{x:+.1f}%")
+    view["Net"] = [
+        f"{'🟢' if r['direction'] == 'bought' else '🔴' if r['direction'] == 'sold' else '⚪'} "
+        f"{r['direction']}" for _, r in w.iterrows()
+    ]
+    view["Share"] = view["share"] * 100
+    st.dataframe(
+        view[["Type", "Code", "Premium", "Prints", "Contracts",
+              "Open interest", "Add", "DTE", "Level", "vs spot", "Net",
+              "Share"]],
+        use_container_width=True, hide_index=True,
+        column_config={"Share": st.column_config.ProgressColumn(
+            f"% of {name.lower()}", min_value=0, max_value=100, format="%.1f%%")},
+    )
+    st.caption(
+        f"Everything expiring within **{max_dte} day(s)**, 0DTE included — the "
+        "windows are cumulative, so *Weekly* contains 0DTE and *Monthly* "
+        "contains both. **Share** is of this window; the metric above it is "
+        "the window's share of the whole block book, so a window that is a "
+        "rounding error cannot look dominant. Premium and open interest sit "
+        "side by side here rather than in two tables, because inside one "
+        "tenor the comparison is the point: a type trading more than the "
+        "standing book (**Add** over 100%) in a ten-day window is building a "
+        "position that has to resolve fast."
+    )
+
+
 def block_behaviour_section(prints: pd.DataFrame) -> None:
     """What each block type means, and what the tape actually did after it."""
     bh = block_type_behaviour(prints)
@@ -936,6 +1019,7 @@ def block_section(a: Analysis, prints: pd.DataFrame, books: dict,
     block_type_section(prints, a.spot, dom)
     block_oi_section(prints, a.spot, dom)
     block_dte_section(prints, a.spot)
+    block_window_section(prints, a.spot)
     block_behaviour_section(prints)
     with st.expander("All flow types (sweeps, splits, everything else)"):
         flow_type_table(prints)

@@ -128,6 +128,16 @@ history** instead.
   count-versus-money split is the thing to watch — on a real export 0DTE holds
   52% of block prints and 5% of block premium, while the monthly bucket holds
   15% of prints and 37% of premium.
+- **In play by window** — a separate table with a **0DTE / Weekly (0–10d) /
+  Monthly (0–45d)** toggle, showing only the block types living in the tenor
+  you are trading, with premium and open interest side by side rather than in
+  two tables. Windows are **cumulative** — weekly contains 0DTE, monthly
+  contains both — because "what is in play this week" includes today. Share is
+  of the window; the metric above it is the window's share of the whole block
+  book, so a window that is a rounding error can't look dominant. On a real
+  export the weekly window surfaces a type trading **111% of the standing
+  book** 8% above spot, net sold — a position that has to resolve inside ten
+  days.
 - **Block type behaviour** — what each type means for dealer hedging (a floor
   print leaves a dealer with a real hedging obligation; a cross may leave the
   bank flat; a stock-tied print has already hedged its delta), and whether the
@@ -198,7 +208,7 @@ estimate — this is positioning analysis, **not trading advice**.
 
 ```
 pip install pytest
-python -m pytest tests/                 # 144 tests
+python -m pytest tests/                 # 151 tests
 python scripts/make_sample_chain.py     # regenerate the bundled sample chain
 ```
 

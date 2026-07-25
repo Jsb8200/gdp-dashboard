@@ -7,7 +7,8 @@ import pytest
 from dealer_gex.analytics import (
     analyze, block_dominance, block_dte_breakdown, block_levels,
     block_oi_breakdown, block_type_behaviour, block_type_breakdown,
-    flow_books, flow_type_breakdown, institutional_mask,
+    block_window_breakdown, block_window_summary, flow_books,
+    flow_type_breakdown, institutional_mask,
 )
 from dealer_gex.parsing import classify_flow, parse_file
 
@@ -883,3 +884,96 @@ def test_report_carries_the_expiration_table(real):
     assert "### By expiration — where in time the size sits" in md
     assert "| Horizon | Premium | % | Prints |" in md
     assert "In tenor order, not size order" in md
+
+
+# --- tenor windows -----------------------------------------------------------
+
+def test_windows_are_cumulative_not_exclusive():
+    """"What is in play this week" includes today. Weekly contains 0DTE and
+    monthly contains both — the rows nest rather than partition."""
+    rows = [
+        (0, 700, "CALL", 700.0, 10, "A", 1_000_000, "FLR", "BLOCK"),   # 0DTE
+        (1, 700, "CALL", 700.0, 10, "A", 2_000_000, "AUTO", "BLOCK"),  # 44d
+    ]
+    csv = _behaviour_csv(rows).decode().replace(
+        '2026-08-21,$700.00,CALL,$700.00,10,"9,000","20,000",A,20.0%,0.010,"$1,000,000.00"',
+        '2026-07-08,$700.00,CALL,$700.00,10,"9,000","20,000",A,20.0%,0.010,"$1,000,000.00"')
+    p = parse_file(csv.encode()).prints
+    w = block_window_summary(p).set_index("window")
+    assert w.loc["0DTE", "premium"] == 1_000_000.0
+    assert w.loc["Weekly", "premium"] == 1_000_000.0      # the 44d print is out
+    assert w.loc["Monthly", "premium"] == 3_000_000.0     # both are in
+    assert w.loc["Monthly", "prints"] == 2
+
+
+def test_weekly_window_is_zero_to_ten_days_inclusive():
+    from dealer_gex.analytics import BLOCK_WINDOWS
+
+    assert BLOCK_WINDOWS == {"0DTE": 0, "Weekly": 10, "Monthly": 45}
+    rows = [(i, 700, "CALL", 700.0, 10, "A", 1_000, "FLR", "BLOCK")
+            for i in range(2)]
+    csv = _behaviour_csv(rows).decode()
+    # one print at exactly 10 days, one at 11
+    csv = csv.replace("2026-08-21,$700.00,CALL,$700.00,10,\"9,000\",\"20,000\",A,20.0%,0.010,\"$1,000.00\",FLR,BLOCK\n"
+                      "2,2026-07-08T13:01:00.000Z,QQQ,2026-08-21",
+                      "2026-07-18,$700.00,CALL,$700.00,10,\"9,000\",\"20,000\",A,20.0%,0.010,\"$1,000.00\",FLR,BLOCK\n"
+                      "2,2026-07-08T13:01:00.000Z,QQQ,2026-07-19")
+    p = parse_file(csv.encode()).prints
+    assert sorted(p["dte"]) == [10, 11]
+    w = block_window_breakdown(p, 10)
+    assert w["prints"].sum() == 1            # the 11-day print is excluded
+
+
+def test_window_share_is_of_the_window_and_of_the_whole_book():
+    """A type owning a tiny window must not read as owning the book."""
+    rows = [
+        (0, 700, "CALL", 700.0, 10, "A", 100_000, "FLR", "BLOCK"),      # 0DTE
+        (1, 700, "CALL", 700.0, 10, "A", 9_900_000, "AUTO", "BLOCK"),   # 44d
+    ]
+    csv = _behaviour_csv(rows).decode().replace(
+        '2026-08-21,$700.00,CALL,$700.00,10,"9,000","20,000",A,20.0%,0.010,"$100,000.00"',
+        '2026-07-08,$700.00,CALL,$700.00,10,"9,000","20,000",A,20.0%,0.010,"$100,000.00"')
+    p = parse_file(csv.encode()).prints
+    w = block_window_breakdown(p, 0).set_index("block_type")
+    r = w.loc["FLR single leg block"]
+    assert r["share"] == pytest.approx(1.0)             # all of the 0DTE window
+    assert r["share_of_book"] == pytest.approx(0.01)    # 1% of the block book
+
+
+def test_window_table_carries_premium_and_book_side_by_side(real):
+    w = block_window_breakdown(real.prints, 45, real.spots["QQQ"])
+    assert not w.empty
+    for c in ("premium", "open_interest", "add_ratio", "dte", "level",
+              "distance_pct", "direction", "code"):
+        assert c in w.columns
+    assert (w["dte"] <= 45).all()
+    assert w["premium"].is_monotonic_decreasing
+
+
+def test_window_summary_names_the_owner_of_each_window(real):
+    w = block_window_summary(real.prints).set_index("window")
+    assert list(w.index) == ["0DTE", "Weekly", "Monthly"]
+    monthly = w.loc["Monthly"]
+    assert monthly["top_type"]
+    assert 0 < monthly["top_share"] <= 1
+    assert 0 < monthly["share_of_book"] <= 1
+
+
+def test_window_helpers_handle_missing_inputs():
+    assert block_window_breakdown(None, 10).empty
+    assert block_window_summary(None).empty
+    assert block_window_summary(pd.DataFrame()).empty
+    p = parse_file(FLOW_CSV.encode()).prints
+    assert block_window_breakdown(p, 0).empty        # nothing expires today
+
+
+def test_report_lists_the_windows(real):
+    from dealer_gex.report import build_markdown
+
+    a = analyze(real.chain, real.spots["QQQ"], real.asof)
+    md = build_markdown(a, ticker="QQQ",
+                        block_types=block_type_breakdown(real.prints, a.spot),
+                        block_prints=real.prints)
+    assert "### In play by window" in md
+    assert "| Window | Premium | % of block book |" in md
+    assert "the rows nest" in md

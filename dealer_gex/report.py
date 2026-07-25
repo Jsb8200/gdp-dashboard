@@ -8,8 +8,8 @@ import pandas as pd
 
 from dealer_gex.analytics import (
     Analysis, block_behaviour_note, block_dominance, block_dte_breakdown,
-    block_oi_breakdown, block_tier_summary, block_type_behaviour, fmt_dollars,
-    magnet_levels, oi_levels, oi_walls,
+    block_oi_breakdown, block_tier_summary, block_type_behaviour,
+    block_window_summary, fmt_dollars, magnet_levels, oi_levels, oi_walls,
 )
 
 
@@ -550,6 +550,33 @@ def build_markdown(a: Analysis, ticker: str = "",
                 "split: 0DTE usually carries most of the prints and least of "
                 "the premium.",
             ]
+
+        win = (block_window_summary(block_prints)
+               if block_prints is not None and not block_prints.empty else None)
+        if win is not None and not win.empty and win["premium"].max() > 0:
+            lines += [
+                "",
+                "### In play by window",
+                "",
+                "Cumulative, so the rows nest: *Weekly* contains 0DTE and "
+                "*Monthly* contains both.",
+                "",
+                "| Window | Premium | % of block book | Prints | Contracts | Owned by |",
+                "|---|---|---|---|---|---|",
+            ]
+            for _, r in win.iterrows():
+                own = r["top_type"] or "—"
+                if own != "—" and pd.notna(r["top_share"]):
+                    own += f" ({r['top_share']:.0%})"
+                share = ("—" if pd.isna(r["share_of_book"])
+                         else f"{r['share_of_book'] * 100:.0f}%")
+                span = "0d" if r["max_dte"] == 0 else f"0–{r['max_dte']:.0f}d"
+                lines.append(
+                    f"| {r['window']} ({span}) | {fmt_dollars(r['premium'])} "
+                    f"| {share} | {r['prints']:,.0f} | {r['contracts']:,.0f} "
+                    f"| {own} |"
+                )
+            lines.append("")
 
         bh = block_type_behaviour_from(block_types, block_prints)
         if bh is not None and not bh.empty:
