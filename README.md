@@ -19,6 +19,11 @@ streamlit run streamlit_app.py
 
 Switch the sidebar to **Upload CSV** to analyze your own data.
 
+To host it on [Streamlit Community Cloud](https://share.streamlit.io): point a
+new app at this repo with `streamlit_app.py` as the main file. `requirements.txt`
+and `packages.txt` (`libgomp1`, the OpenMP runtime LightGBM links against) are
+picked up automatically. No secrets or API keys — the app reads uploads only.
+
 ## Input data
 
 Four file shapes are auto-detected — no configuration:
