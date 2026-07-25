@@ -78,6 +78,13 @@ history** instead.
 - **Block intelligence** — the blocks-only vs sweeps-only books side by side
   (smart vs fast money) with an automatic aligned/divergent verdict, plus a
   floor-only book when the file distinguishes floor prints.
+- **The platform's own names** — the export's `Trade Type` codes are not the
+  names the QuantData UI shows: `SPRD_FLR` is **M2M FLR**, `FLR` is **FLR
+  single leg**, `SPRD_TIED_CROSS` is a **tied multi cross**. Rows are labelled
+  the way they appear on the screen the data came from, with the raw code in
+  its own **Code** column so every row traces back to the CSV. An unmapped
+  vocabulary still reads sensibly — it falls back to a compositional
+  description (`floor block spread`) instead of the bare code.
 - **Block types** — a "block" can mean very different things. Block prints are
   split by *how they printed* and ranked into tiers: 🤝 **negotiated** (floor,
   cross — size someone had to find a counterparty for), 📣 **facilitated**
@@ -175,7 +182,7 @@ estimate — this is positioning analysis, **not trading advice**.
 
 ```
 pip install pytest
-python -m pytest tests/                 # 126 tests
+python -m pytest tests/                 # 130 tests
 python scripts/make_sample_chain.py     # regenerate the bundled sample chain
 ```
 

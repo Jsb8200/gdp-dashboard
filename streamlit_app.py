@@ -659,6 +659,7 @@ def block_type_section(prints: pd.DataFrame, spot: float,
            "  💰" if r["block_type"] == money else "")
         for _, r in br.iterrows()
     ]
+    view["Code"] = view["code"]
     view["Premium"] = view["premium"].map(fmt_dollars)
     view["Contracts"] = view["contracts"].map(lambda x: f"{x:,.0f}")
     view["Prints"] = view["prints"].map(lambda x: f"{x:,.0f}")
@@ -674,8 +675,8 @@ def block_type_section(prints: pd.DataFrame, spot: float,
     ]
     view["Share"] = view["premium_share"] * 100
     st.dataframe(
-        view[["Type", "Premium", "Contracts", "Prints", "Median print",
-              "Level", "vs spot", "Net", "Share"]],
+        view[["Type", "Code", "Premium", "Contracts", "Prints",
+              "Median print", "Level", "vs spot", "Net", "Share"]],
         use_container_width=True, hide_index=True,
         column_config={"Share": st.column_config.ProgressColumn(
             "% block premium", min_value=0, max_value=100, format="%.1f%%")},
@@ -693,8 +694,9 @@ def block_type_section(prints: pd.DataFrame, spot: float,
         "block book exclude fragments by default. **Level** is the "
         "premium-weighted strike that type traded at — where the money "
         "actually sat — and **vs spot** places it against the current "
-        "underlying price. 👑 is the type running the block book overall, "
-        "💰 the one with the most premium."
+        "underlying price. **Code** is the export's own `Trade Type` value, so "
+        "every row traces back to the CSV. 👑 is the type running the block "
+        "book overall, 💰 the one with the most premium."
     )
 
 
@@ -716,6 +718,7 @@ def block_oi_section(prints: pd.DataFrame, spot: float,
         + ("  💥" if r["block_type"] == impact else "")
         for _, r in oi.iterrows()
     ]
+    view["Code"] = view["code"]
     view["Open interest"] = view["open_interest"].map(lambda x: f"{x:,.0f}")
     view["Contracts"] = view["contracts_touched"].map(lambda x: f"{x:,.0f}")
     view["Traded"] = view["traded"].map(lambda x: f"{x:,.0f}")
@@ -729,8 +732,8 @@ def block_oi_section(prints: pd.DataFrame, spot: float,
         lambda x: f"{x:+.1f}%" if pd.notna(x) else "—")
     view["Share"] = view["oi_share"] * 100
     st.dataframe(
-        view[["Type", "Open interest", "Contracts", "Traded", "Add", "Opening",
-              "Level", "vs spot", "Share"]],
+        view[["Type", "Code", "Open interest", "Contracts", "Traded", "Add",
+              "Opening", "Level", "vs spot", "Share"]],
         use_container_width=True, hide_index=True,
         column_config={"Share": st.column_config.ProgressColumn(
             "% block OI", min_value=0, max_value=100, format="%.1f%%")},

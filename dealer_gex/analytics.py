@@ -626,8 +626,8 @@ def block_type_breakdown(prints: pd.DataFrame,
     contracts, premium, median_premium, avg_premium, net_contracts,
     direction, premium_share, level, ref_price, distance_pct.
     """
-    cols = ["block_type", "tier", "mechanism", "tied", "spread_leg", "prints",
-            "contracts", "premium", "median_premium", "avg_premium",
+    cols = ["block_type", "code", "tier", "mechanism", "tied", "spread_leg",
+            "prints", "contracts", "premium", "median_premium", "avg_premium",
             "net_contracts", "direction", "premium_share", "level",
             "ref_price", "distance_pct"]
     if prints is None or prints.empty or "is_block" not in prints:
@@ -643,7 +643,8 @@ def block_type_breakdown(prints: pd.DataFrame,
     if "flow_type" not in b:
         b["flow_type"] = "block"
     for c, default in (("block_tier", ""), ("mechanism", ""),
-                       ("is_tied", False), ("is_spread_leg", False)):
+                       ("is_tied", False), ("is_spread_leg", False),
+                       ("trade_type", "")):
         if c not in b:
             b[c] = default
 
@@ -653,6 +654,8 @@ def block_type_breakdown(prints: pd.DataFrame,
     b["_wr"] = b["_w"] * pd.to_numeric(b.get("ref_price", np.nan), errors="coerce")
 
     g = b.groupby("flow_type", dropna=False).agg(
+        code=("trade_type", lambda s: " / ".join(sorted(set(s.astype(str))
+                                                        - {""})) or "—"),
         tier=("block_tier", "first"),
         mechanism=("mechanism", "first"),
         tied=("is_tied", "any"),
@@ -705,7 +708,7 @@ def block_oi_breakdown(prints: pd.DataFrame,
     A contract touched by two block types is counted under both — the
     shares are per type, so they describe composition, not a partition.
     """
-    cols = ["block_type", "tier", "contracts_touched", "open_interest",
+    cols = ["block_type", "code", "tier", "contracts_touched", "open_interest",
             "traded", "add_ratio", "opening_share", "oi_share", "level",
             "distance_pct"]
     if prints is None or prints.empty or "is_block" not in prints:
@@ -721,6 +724,8 @@ def block_oi_breakdown(prints: pd.DataFrame,
         b["flow_type"] = "block"
     if "block_tier" not in b:
         b["block_tier"] = ""
+    if "trade_type" not in b:
+        b["trade_type"] = ""
     keys = ["flow_type", "block_tier"]
     for c in ("ticker", "expiry", "strike", "type"):
         if c in b:
@@ -732,11 +737,14 @@ def block_oi_breakdown(prints: pd.DataFrame,
         open_interest=("open_interest", "max"),
         traded=("size", "sum"),
         opening=("_open_sz", "sum"),
+        code=("trade_type", "first"),
     ).reset_index()
     per["_wk"] = per["open_interest"] * pd.to_numeric(
         per.get("strike", np.nan), errors="coerce")
 
     g = per.groupby(["flow_type", "block_tier"], dropna=False).agg(
+        code=("code", lambda s: " / ".join(sorted(set(s.astype(str))
+                                                  - {""})) or "—"),
         contracts_touched=("open_interest", "size"),
         open_interest=("open_interest", "sum"),
         traded=("traded", "sum"),

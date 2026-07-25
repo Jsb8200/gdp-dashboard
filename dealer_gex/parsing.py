@@ -132,6 +132,35 @@ BLOCK_TIERS = {
 }
 CANCEL_CODES = ("CANCEL", "CXL", "BUST")
 
+# The export's codes are not the names the platform's own UI shows. A trader
+# reading the dashboard next to QuantData looks for "M2M FLR", not
+# "SPRD_FLR" — so recognized codes are displayed under the platform name and
+# the raw code travels alongside for traceability. "M2M" is multi-to-multi:
+# a multi-leg package crossed against another multi-leg package, as opposed
+# to a single-leg print or a leg reported on its own.
+TRADE_TYPE_ALIASES = {
+    "FLR": "FLR single leg",
+    "SPRD_FLR": "M2M FLR",
+    "SPRD_LEG_FLR": "FLR multi leg",
+    "TIED_FLR": "tied FLR",
+    "CROSS": "cross single leg",
+    "TIED_CROSS": "tied cross",
+    "SPRD_CROSS": "multi cross",
+    "SPRD_TIED_CROSS": "tied multi cross",
+    "AUTO": "auto single leg",
+    "SPRD_AUTO": "M2M auto",
+    "SPRD_LEG_AUTO": "auto multi leg",
+    "TIED_AUTO": "tied auto",
+    "COB": "COB",
+    "COB_AUCT": "COB auction",
+    "TIED_COB_AUCT": "tied COB auction",
+    "SPRD_COB": "M2M COB",
+    "AUCT": "auction",
+    "AUCT_ISO": "auction ISO",
+    "SPRD_AUCT": "M2M auction",
+    "ISO": "ISO",
+}
+
 
 def _clean_codes(values) -> pd.Series:
     s = pd.Series(values).fillna("").astype(str).str.upper()
@@ -163,6 +192,9 @@ def classify_trade_type(trade_type) -> pd.DataFrame:
     is_spread = squeezed.str.startswith("SPRD", na=False)
     is_tied = squeezed.str.contains("TIED", na=False, regex=False)
     is_cancelled = _has_any(squeezed, CANCEL_CODES)
+    # the platform's own name for the code, when it is one we know
+    alias = squeezed.map(
+        {k.replace("_", ""): v for k, v in TRADE_TYPE_ALIASES.items()}).fillna("")
 
     tier = pd.Series("", index=s.index, dtype=object)
     for name, mechs in BLOCK_TIERS.items():
@@ -170,9 +202,9 @@ def classify_trade_type(trade_type) -> pd.DataFrame:
     tier = tier.mask(is_spread_leg, "fragment")
     tier = tier.mask(is_cancelled, "cancelled")
     return pd.DataFrame({
-        "trade_type": s, "mechanism": mechanism, "is_spread": is_spread,
-        "is_spread_leg": is_spread_leg, "is_tied": is_tied,
-        "is_cancelled": is_cancelled, "block_tier": tier,
+        "trade_type": s, "trade_label": alias, "mechanism": mechanism,
+        "is_spread": is_spread, "is_spread_leg": is_spread_leg,
+        "is_tied": is_tied, "is_cancelled": is_cancelled, "block_tier": tier,
     })
 
 
@@ -434,6 +466,7 @@ def _parse_trade_flow(raw: pd.DataFrame) -> ParsedFile:
         ]
     mech.index = df.index
     df["trade_type"] = mech["trade_type"]
+    df["trade_label"] = mech["trade_label"]
     df["mechanism"] = mech["mechanism"]
     df["flow_venue"] = mech["mechanism"]
     df["is_spread"] = mech["is_spread"]
@@ -444,12 +477,18 @@ def _parse_trade_flow(raw: pd.DataFrame) -> ParsedFile:
     df["is_auto"] = mech["mechanism"] == "auto"
     df["is_cross"] = mech["mechanism"] == "cross"
 
-    # display label: how it printed + its shape, e.g. "floor block", "auto sweep"
+    # display label: the platform's own name for the code plus the shape
+    # ("M2M FLR block"), falling back to a compositional description when the
+    # code is not one we know ("floor block spread") so an unfamiliar export
+    # still reads sensibly.
     parts = kinds["flow_shape"].where(kinds["flow_shape"] != "single", "")
-    label = (mech["mechanism"] + " " + parts).str.strip()
-    label = label.mask(mech["is_spread"] & ~mech["is_spread_leg"], label + " spread")
-    label = label.mask(mech["is_spread_leg"], label + " leg")
-    label = label.mask(mech["is_tied"], "tied " + label)
+    generic = (mech["mechanism"] + " " + parts).str.strip()
+    generic = generic.mask(mech["is_spread"] & ~mech["is_spread_leg"],
+                           generic + " spread")
+    generic = generic.mask(mech["is_spread_leg"], generic + " leg")
+    generic = generic.mask(mech["is_tied"], "tied " + generic)
+    named = (mech["trade_label"] + " " + parts).str.strip()
+    label = named.where(mech["trade_label"] != "", generic)
     df["flow_type"] = label.where(label != "", kinds["flow_type"])
 
     # Negotiated size, whatever it was tagged: a BLOCK-shaped print, or one

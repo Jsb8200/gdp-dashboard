@@ -229,8 +229,8 @@ def test_mechanism_is_read_from_its_own_column(real):
     ]
     assert list(p["flow_shape"]) == ["block"] * 7 + ["sweep", "sweep"]
     assert list(p["flow_type"])[:5] == [
-        "floor block spread", "tied cross block spread", "floor block",
-        "cob block", "cob auction block",
+        "M2M FLR block", "tied multi cross block", "FLR single leg block",
+        "COB block", "COB auction block",
     ]
 
 
@@ -244,8 +244,8 @@ def test_spread_legs_tied_and_packages_are_flagged(real):
                                         True, True, False, False]
     assert list(p["is_tied"]) == [False, True, False, False, False, False,
                                   False, False, False]
-    assert p.loc[1, "flow_type"] == "tied cross block spread"   # package, tied
-    assert p.loc[5, "flow_type"] == "auto block leg"           # one leg only
+    assert p.loc[1, "flow_type"] == "tied multi cross block"   # package, tied
+    assert p.loc[5, "flow_type"] == "auto multi leg block"           # one leg only
 
 
 def test_cancelled_prints_are_dropped(real):
@@ -260,12 +260,12 @@ def test_block_tiers_rank_by_what_the_print_means(real):
 
     br = block_type_breakdown(real.prints)
     assert list(br["block_type"]) == [
-        "tied cross block spread", "floor block spread", "floor block",
-        "cob block", "cob auction block", "auto block leg",
+        "tied multi cross block", "M2M FLR block", "FLR single leg block",
+        "COB block", "COB auction block", "auto multi leg block",
     ]                                                  # ranked by premium
-    tied = br.set_index("block_type").loc["tied cross block spread"]
+    tied = br.set_index("block_type").loc["tied multi cross block"]
     assert tied["tied"] and tied["tier"] == "negotiated"
-    assert br.set_index("block_type").loc["auto block leg", "tier"] == "fragment"
+    assert br.set_index("block_type").loc["auto multi leg block", "tier"] == "fragment"
 
     tiers = block_tier_summary(br)
     assert list(tiers["tier"]) == ["negotiated", "facilitated", "fragment"]
@@ -292,7 +292,7 @@ def test_report_ranks_block_types_by_tier(real):
                         block_types=block_type_breakdown(real.prints))
     assert "## Block types (how the size printed)" in md
     assert "| **negotiated** |" in md and "| **fragment** |" in md
-    assert "tied cross block spread (stock-tied)" in md
+    assert "tied multi cross block (stock-tied)" in md
     assert "Read premium, not print count" in md
 
 
@@ -305,15 +305,15 @@ def test_block_types_carry_where_the_money_sat(real):
     br = block_type_breakdown(real.prints, spot).set_index("block_type")
     # the two floor prints: 17,000x 710P at $25.058M and 2,100x 775P at
     # $14.0847M are separate types, so each level is its own strike
-    assert br.loc["floor block spread", "level"] == pytest.approx(710.0)
-    assert br.loc["floor block", "level"] == pytest.approx(775.0)
-    assert br.loc["floor block", "distance_pct"] == pytest.approx(
+    assert br.loc["M2M FLR block", "level"] == pytest.approx(710.0)
+    assert br.loc["FLR single leg block", "level"] == pytest.approx(775.0)
+    assert br.loc["FLR single leg block", "distance_pct"] == pytest.approx(
         (775.0 / spot - 1) * 100)
     # ref_price is the underlying when those prints hit, not the current spot
-    assert br.loc["floor block", "ref_price"] == pytest.approx(708.40)
+    assert br.loc["FLR single leg block", "ref_price"] == pytest.approx(708.40)
 
     # a type spanning two strikes gets the premium-weighted blend
-    legs = br.loc["auto block leg"]
+    legs = br.loc["auto multi leg block"]
     assert legs["level"] == pytest.approx(715.0)     # both legs at 715
 
 
@@ -326,7 +326,7 @@ def test_block_level_is_premium_weighted_not_a_plain_mean():
         "7,2026-07-08T14:30:00.700Z,QQQ,2026-07-17,$600.00,CALL,$708.00,10,"
         '"4,000","11,000",B,18.0%,0.011,"$435.00",SPRD_LEG_AUTO,BLOCK,No,No,No')
     br = block_type_breakdown(parse_file(csv.encode()).prints).set_index("block_type")
-    lvl = br.loc["auto block leg", "level"]
+    lvl = br.loc["auto multi leg block", "level"]
     assert lvl == pytest.approx((715 * 60000 + 600 * 435) / 60435)
     assert lvl > 714                       # the $435 leg barely moves it
     assert lvl != pytest.approx(657.5)     # not the unweighted mean
@@ -370,7 +370,7 @@ def test_behaviour_signs_bought_calls_and_sold_puts_as_bullish():
         (90, 700, "CALL", 707.0, 1, "A", 1, "AUTO", "SWEEP"),   # price +1%
     ]
     bh = block_type_behaviour(parse_file(_behaviour_csv(rows)).prints)
-    r = bh.set_index("block_type").loc["floor block"]
+    r = bh.set_index("block_type").loc["FLR single leg block"]
     assert r["scored"] == 3
     assert r["followed_close"] == pytest.approx(1.0, abs=0.01)
     assert r["hit_rate"] == 1.0
@@ -384,7 +384,7 @@ def test_behaviour_is_negative_when_the_tape_fades_the_block():
         (90, 700, "CALL", 693.0, 1, "A", 1, "AUTO", "SWEEP"),   # price -1%
     ]
     bh = block_type_behaviour(parse_file(_behaviour_csv(rows)).prints)
-    r = bh.set_index("block_type").loc["floor block"]
+    r = bh.set_index("block_type").loc["FLR single leg block"]
     assert r["followed_close"] == pytest.approx(-1.0, abs=0.01)
     assert r["hit_rate"] == 0.0
 
@@ -399,7 +399,7 @@ def test_behaviour_is_premium_weighted_across_prints():
         (90, 700, "CALL", 707.0, 1, "A", 1, "AUTO", "SWEEP"),
     ]
     bh = block_type_behaviour(parse_file(_behaviour_csv(rows)).prints)
-    r = bh.set_index("block_type").loc["floor block"]
+    r = bh.set_index("block_type").loc["FLR single leg block"]
     assert r["hit_rate"] == pytest.approx(0.25)     # 1 of 4 prints was right
     assert r["followed_close"] > 0.9               # ...but it was ~all the money
 
@@ -414,7 +414,7 @@ def test_late_prints_have_no_horizon_and_are_not_scored_as_zero():
     ]
     p = parse_file(_behaviour_csv(rows)).prints
     bh = block_type_behaviour(p, horizon_min=30, min_prints=1).set_index("block_type")
-    r = bh.loc["floor block"]
+    r = bh.loc["FLR single leg block"]
     assert r["scored"] == 2                                    # both reach a close
     # to the close: +1% for the early print, 0% for the late one -> +0.5%
     assert r["followed_close"] == pytest.approx(0.5, abs=0.01)
@@ -430,19 +430,19 @@ def test_thin_types_are_flagged_and_left_unscored():
     ]
     bh = block_type_behaviour(parse_file(_behaviour_csv(rows)).prints,
                               min_prints=3).set_index("block_type")
-    assert bh.loc["floor block", "sample"] == "thin"
-    assert pd.isna(bh.loc["floor block", "followed_close"])
-    assert bh.loc["floor block", "scored"] == 1        # counted, just not read
+    assert bh.loc["FLR single leg block", "sample"] == "thin"
+    assert pd.isna(bh.loc["FLR single leg block", "followed_close"])
+    assert bh.loc["FLR single leg block", "scored"] == 1        # counted, just not read
 
 
 def test_every_block_type_carries_a_behavioural_read(real):
     bh = block_type_behaviour(real.prints).set_index("block_type")
     assert (bh["behaviour"].str.len() > 40).all()
-    assert "find the other side" in bh.loc["floor block", "behaviour"]
-    assert "arranged before the print" in bh.loc["tied cross block spread", "behaviour"]
-    assert "delta was hedged" in bh.loc["tied cross block spread", "behaviour"]
+    assert "find the other side" in bh.loc["FLR single leg block", "behaviour"]
+    assert "arranged before the print" in bh.loc["tied multi cross block", "behaviour"]
+    assert "delta was hedged" in bh.loc["tied multi cross block", "behaviour"]
     # a leg gets the fragment warning instead of a mechanism read
-    leg = bh.loc["auto block leg", "behaviour"]
+    leg = bh.loc["auto multi leg block", "behaviour"]
     assert "Do not read it directionally" in leg
     assert "default electronic route" not in leg
 
@@ -481,10 +481,10 @@ def test_open_interest_is_max_per_contract_never_summed_over_prints():
     p = parse_file(_behaviour_csv(rows)).prints
     assert p["open_interest"].sum() == 60_000        # the naive number
     oi = block_oi_breakdown(p).set_index("block_type")
-    assert oi.loc["floor block", "open_interest"] == 20_000    # one contract
-    assert oi.loc["floor block", "contracts_touched"] == 1
-    assert oi.loc["floor block", "traded"] == 600
-    assert oi.loc["floor block", "add_ratio"] == pytest.approx(600 / 20_000)
+    assert oi.loc["FLR single leg block", "open_interest"] == 20_000    # one contract
+    assert oi.loc["FLR single leg block", "contracts_touched"] == 1
+    assert oi.loc["FLR single leg block", "traded"] == 600
+    assert oi.loc["FLR single leg block", "add_ratio"] == pytest.approx(600 / 20_000)
 
 
 def test_open_interest_sums_across_distinct_contracts():
@@ -494,7 +494,7 @@ def test_open_interest_sums_across_distinct_contracts():
         (2, 700, "PUT", 700.0, 100, "A", 100_000, "FLR", "BLOCK"),
     ]
     oi = block_oi_breakdown(parse_file(_behaviour_csv(rows)).prints)
-    row = oi.set_index("block_type").loc["floor block"]
+    row = oi.set_index("block_type").loc["FLR single leg block"]
     assert row["contracts_touched"] == 3            # 700C, 710C, 700P
     assert row["open_interest"] == 60_000
 
@@ -512,10 +512,10 @@ def test_add_ratio_flags_a_position_being_built():
     csv = csv.replace('5000,"9,000","20,000",A,20.0%,0.010,"$1,000,000.00",AUTO',
                       '5000,"9,000","500,000",A,20.0%,0.010,"$1,000,000.00",AUTO')
     oi = block_oi_breakdown(parse_file(csv.encode()).prints).set_index("block_type")
-    assert oi.loc["floor block", "add_ratio"] == pytest.approx(1.0)    # doubled it
-    assert oi.loc["auto block", "add_ratio"] == pytest.approx(0.01)    # noise
+    assert oi.loc["FLR single leg block", "add_ratio"] == pytest.approx(1.0)    # doubled it
+    assert oi.loc["auto single leg block", "add_ratio"] == pytest.approx(0.01)    # noise
     # ...and the OI ranking is the reverse of the premium ranking here
-    assert list(oi.index) == ["auto block", "floor block"]
+    assert list(oi.index) == ["auto single leg block", "FLR single leg block"]
 
 
 def test_oi_level_is_open_interest_weighted_not_premium_weighted():
@@ -533,9 +533,9 @@ def test_oi_level_is_open_interest_weighted_not_premium_weighted():
     oi = block_oi_breakdown(p, spot=700.0).set_index("block_type")
     prem = block_type_breakdown(p, spot=700.0).set_index("block_type")
     # premium is all at the 600 strike, open interest almost all at 800
-    assert prem.loc["floor block", "level"] == pytest.approx(600.0, abs=1.0)
-    assert oi.loc["floor block", "level"] == pytest.approx(798.0, abs=1.0)
-    assert oi.loc["floor block", "distance_pct"] == pytest.approx(14.0, abs=0.3)
+    assert prem.loc["FLR single leg block", "level"] == pytest.approx(600.0, abs=1.0)
+    assert oi.loc["FLR single leg block", "level"] == pytest.approx(798.0, abs=1.0)
+    assert oi.loc["FLR single leg block", "distance_pct"] == pytest.approx(14.0, abs=0.3)
 
 
 def test_opening_share_is_size_weighted(real):
@@ -579,13 +579,13 @@ def test_dominance_names_a_leader_that_wins_two_lenses():
                       '100,"9,000","900,000",A,20.0%,0.010,"$100,000.00",AUTO')
     d = block_dominance(parse_file(csv.encode()).prints, spot=700.0)
     assert d["verdict"] == "clear"
-    assert d["leader"] == "floor block"
+    assert d["leader"] == "FLR single leg block"
     assert d["lenses_won"] == 2
-    assert d["by_money"]["block_type"] == "floor block"
-    assert d["by_impact"]["block_type"] == "floor block"
-    assert d["by_book"]["block_type"] == "auto block"     # the loser's lens
-    assert "dominates" in d["label"] and "floor block" in d["label"]
-    assert "auto block on open interest" in d["label"]
+    assert d["by_money"]["block_type"] == "FLR single leg block"
+    assert d["by_impact"]["block_type"] == "FLR single leg block"
+    assert d["by_book"]["block_type"] == "auto single leg block"     # the loser's lens
+    assert "dominates" in d["label"] and "FLR single leg block" in d["label"]
+    assert "auto single leg block on open interest" in d["label"]
 
 
 def test_dominance_calls_a_split_book_split():
@@ -623,10 +623,10 @@ def test_a_tiny_type_cannot_win_impact_on_a_rounding_error():
                       '200,"9,000","100",A,20.0%,0.010,"$1,000.00",FLR')
     p = parse_file(csv.encode()).prints
     oi = block_oi_breakdown(p).set_index("block_type")
-    assert oi.loc["floor block", "add_ratio"] == pytest.approx(2.0)   # 200%
+    assert oi.loc["FLR single leg block", "add_ratio"] == pytest.approx(2.0)   # 200%
     d = block_dominance(p, spot=700.0)
-    assert d["by_impact"]["block_type"] == "cob block"   # the floor type is too small
-    assert d["leader"] == "cob block"
+    assert d["by_impact"]["block_type"] == "COB block"   # the floor type is too small
+    assert d["leader"] == "COB block"
 
 
 def test_dominance_label_reports_the_leading_tier(real):
@@ -654,3 +654,59 @@ def test_report_names_who_is_dominant(real):
     assert "| Lens | Leader | Reading |" in md
     assert "Most premium" in md and "Biggest book impact" in md
     assert "👑" in md
+
+
+# --- the platform's own names ------------------------------------------------
+
+def test_export_codes_are_shown_under_the_names_the_platform_uses():
+    """The CSV says SPRD_FLR; the trader is looking for "M2M FLR". Rows have
+    to be findable by the name on the screen they came from."""
+    from dealer_gex.parsing import classify_trade_type
+
+    out = classify_trade_type(pd.Series([
+        "FLR", "SPRD_FLR", "SPRD_LEG_FLR", "TIED_FLR",
+        "CROSS", "TIED_CROSS", "SPRD_TIED_CROSS",
+        "AUTO", "SPRD_LEG_AUTO", "COB", "COB_AUCT", "AUCT", "ISO",
+    ]))
+    assert list(out["trade_label"]) == [
+        "FLR single leg", "M2M FLR", "FLR multi leg", "tied FLR",
+        "cross single leg", "tied cross", "tied multi cross",
+        "auto single leg", "auto multi leg", "COB", "COB auction",
+        "auction", "ISO",
+    ]
+
+
+def test_the_three_names_that_went_missing_are_findable(real):
+    """M2M FLR, FLR single leg and multi cross were all in the file — under
+    codes that read nothing like them."""
+    p = real.prints
+    by_code = dict(zip(p["trade_type"], p["flow_type"]))
+    assert by_code["SPRD FLR"] == "M2M FLR block"
+    assert by_code["FLR"] == "FLR single leg block"
+    assert by_code["SPRD TIED CROSS"] == "tied multi cross block"
+
+
+def test_the_raw_code_travels_with_every_row(real):
+    """A renamed row is only trustworthy if it points back at the CSV."""
+    br = block_type_breakdown(real.prints).set_index("block_type")
+    assert br.loc["M2M FLR block", "code"] == "SPRD FLR"
+    assert br.loc["FLR single leg block", "code"] == "FLR"
+    oi = block_oi_breakdown(real.prints).set_index("block_type")
+    assert oi.loc["tied multi cross block", "code"] == "SPRD TIED CROSS"
+
+
+def test_an_unknown_code_still_gets_a_readable_label():
+    """An export with a vocabulary we have not mapped must stay legible
+    rather than falling back to the bare code."""
+    from dealer_gex.parsing import classify_trade_type
+
+    out = classify_trade_type(pd.Series(["SPRD_LEG_XYZDESK", "WEIRD_FLR"]))
+    assert list(out["trade_label"]) == ["", ""]        # no platform name
+    assert list(out["mechanism"]) == ["", "floor"]     # ...but still classified
+    assert list(out["is_spread_leg"]) == [True, False]
+    assert list(out["block_tier"]) == ["fragment", "negotiated"]
+
+    csv = REAL_CSV.replace("SPRD_FLR,BLOCK", "MYSTERY_FLR,BLOCK")
+    p = parse_file(csv.encode())
+    labels = dict(zip(p.prints["trade_type"], p.prints["flow_type"]))
+    assert labels["MYSTERY FLR"] == "floor block"      # compositional fallback
