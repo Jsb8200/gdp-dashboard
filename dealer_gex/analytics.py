@@ -89,6 +89,10 @@ class Analysis:
     charm_flow: float = 0.0   # $ dealers must trade per calendar day (positive = buy)
     expected_move: float | None = None   # 1-sigma $ move to the nearest expiry
     nearest_expiry: date | None = None
+    # every zero-gamma crossing the grid resolves, nearest to spot first;
+    # gamma_flip is flip_levels[0]. More than one means the regime switches
+    # back — spot can sit in a pocket with the opposite regime either side.
+    flip_levels: list = field(default_factory=list)
 
 
 def _years_to_expiry(expiry: pd.Series, asof: date) -> pd.Series:
@@ -158,12 +162,46 @@ def total_gex_at(df: pd.DataFrame, spot_level: float, rate: float,
     return float(np.sum(_gsign(df) * _dollar_gex(gamma, _weights(df), spot_level, multiplier)))
 
 
+def gex_at_levels(df: pd.DataFrame, levels, rate: float,
+                  multiplier: float = DEFAULT_MULTIPLIER) -> np.ndarray:
+    """Net dealer GEX at many hypothetical spots at once.
+
+    Same maths as ``total_gex_at`` per level, evaluated as one
+    (levels x contracts) block instead of a Python loop — an order of
+    magnitude faster, which is what makes a genuinely fine grid affordable
+    for the flip scan. Chunked so a long grid on a big chain cannot blow
+    up memory.
+    """
+    levels = np.atleast_1d(np.asarray(levels, dtype=float))
+    k = df["strike"].to_numpy()[None, :]
+    t = df["t"].to_numpy()[None, :]
+    iv = df["iv"].fillna(0.0).to_numpy()[None, :]
+    w = np.asarray(_weights(df), dtype=float)[None, :]
+    sign = np.asarray(_gsign(df), dtype=float)[None, :]
+
+    out = np.empty(len(levels), dtype=float)
+    chunk = max(1, int(2_000_000 // max(df.shape[0], 1)))   # ~2M cells at a time
+    for i in range(0, len(levels), chunk):
+        s = levels[i:i + chunk][:, None]
+        gamma = bs_gamma(s, k, t, iv, rate)
+        out[i:i + chunk] = np.sum(sign * gamma * w * multiplier * s**2 * 0.01, axis=1)
+    return out
+
+
 def gex_curve(df: pd.DataFrame, spot: float, rate: float,
-              span: float = 0.15, n: int = 121,
+              span: float = 0.15, n: int = 601,
               multiplier: float = DEFAULT_MULTIPLIER) -> pd.DataFrame:
+    """Net GEX across a grid of hypothetical spot levels.
+
+    The grid is what the flip is found on, so its step is a precision
+    floor: a crossing that lives entirely between two samples is invisible.
+    601 points over +/-15% is ~0.05% of spot per step — fine enough that
+    the crossings a trader can act on are all resolved, and cheap because
+    the whole grid is evaluated in one vectorized block.
+    """
     levels = np.linspace(spot * (1 - span), spot * (1 + span), n)
-    totals = [total_gex_at(df, s, rate, multiplier) for s in levels]
-    return pd.DataFrame({"spot_level": levels, "total_gex": totals})
+    return pd.DataFrame({"spot_level": levels,
+                         "total_gex": gex_at_levels(df, levels, rate, multiplier)})
 
 
 def gamma_flip(curve: pd.DataFrame, spot: float) -> float | None:
@@ -180,16 +218,10 @@ def gamma_flip(curve: pd.DataFrame, spot: float) -> float | None:
     return float(min(crossings, key=lambda x: abs(x - spot)))
 
 
-def refine_flip(df: pd.DataFrame, curve: pd.DataFrame, spot: float,
-                rate: float, tol: float = 0.001) -> float | None:
-    """Bisect the actual GEX function around the curve's crossing to cent
-    precision (the curve alone is only as precise as its grid step)."""
-    approx = gamma_flip(curve, spot)
-    if approx is None:
-        return None
-    lv = curve["spot_level"].to_numpy()
-    i = int(np.clip(np.searchsorted(lv, approx) - 1, 0, len(lv) - 2))
-    lo, hi = lv[i], lv[i + 1]
+def _bisect_zero(df: pd.DataFrame, lo: float, hi: float, rate: float,
+                 tol: float = 1e-4) -> float:
+    """Bisect the true GEX function to a hundredth of a cent inside a
+    bracket already known to change sign."""
     f_lo = total_gex_at(df, lo, rate)
     if f_lo == 0:
         return float(lo)
@@ -203,6 +235,44 @@ def refine_flip(df: pd.DataFrame, curve: pd.DataFrame, spot: float,
         else:
             hi = mid
     return float((lo + hi) / 2)
+
+
+def flip_levels(df: pd.DataFrame, curve: pd.DataFrame, spot: float,
+                rate: float, tol: float = 1e-4) -> list[float]:
+    """**Every** spot level where net dealer gamma crosses zero, bisected,
+    ordered by distance from spot.
+
+    The regime does not have to switch exactly once. A book can flip back
+    within a few points — spot sits in a short-gamma pocket with long-gamma
+    on both sides — and reporting only the nearest crossing hides the far
+    edge of that pocket, which is where the behaviour changes back.
+
+    Only crossings the grid resolves are found; the curve's step is the
+    floor on what is visible, which is why ``gex_curve`` samples finely.
+    """
+    lv = curve["spot_level"].to_numpy()
+    g = curve["total_gex"].to_numpy()
+    idx = np.nonzero(np.diff(np.sign(g)) != 0)[0]
+    roots = []
+    for i in idx:
+        if g[i] == 0:
+            roots.append(float(lv[i]))
+            continue
+        roots.append(_bisect_zero(df, float(lv[i]), float(lv[i + 1]), rate, tol))
+    # a shared bracket edge can yield the same root twice
+    uniq: list[float] = []
+    for r in sorted(roots):
+        if not uniq or abs(r - uniq[-1]) > max(tol * 10, 1e-3):
+            uniq.append(r)
+    return sorted(uniq, key=lambda x: abs(x - spot))
+
+
+def refine_flip(df: pd.DataFrame, curve: pd.DataFrame, spot: float,
+                rate: float, tol: float = 1e-4) -> float | None:
+    """The zero-gamma level nearest spot, bisected on the true GEX function
+    (the curve alone is only as precise as its grid step)."""
+    roots = flip_levels(df, curve, spot, rate, tol)
+    return roots[0] if roots else None
 
 
 def _kernel_density(strikes: np.ndarray, weights: np.ndarray, x, bandwidth: float) -> float:
@@ -228,8 +298,11 @@ def side_gamma_density(by_strike: pd.DataFrame, x, side: str, bandwidth: float) 
     return _kernel_density(by_strike["strike"].to_numpy(), w, x, bandwidth)
 
 
-def _golden_max(f, lo: float, hi: float, tol: float = 0.001) -> float:
-    """Golden-section search for the maximum of a unimodal f on [lo, hi]."""
+def _golden_max(f, lo: float, hi: float, tol: float = 1e-4) -> float:
+    """Golden-section search for the maximum of a unimodal f on [lo, hi].
+
+    ``tol`` is the bracket width at exit, so the returned level is good
+    to half of it — a hundredth of a cent by default."""
     inv_phi = (np.sqrt(5.0) - 1.0) / 2.0
     a, b = lo, hi
     c = b - inv_phi * (b - a)
@@ -248,16 +321,26 @@ def _golden_max(f, lo: float, hi: float, tol: float = 0.001) -> float:
 
 
 def wall_level(by_strike: pd.DataFrame, seed_strike: float, spacing: float,
-               side: str, tol: float = 0.001) -> float:
+               side: str, tol: float = 1e-4, reach: float = 2.0) -> float:
     """Pinpoint wall: the price level where that side's smoothed gamma
     density peaks, searched around the heaviest strike (golden-section).
 
     Neighboring strikes pull the peak off the grid, so the wall lands
-    between strikes when the concentration is lopsided."""
-    return _golden_max(
-        lambda x: side_gamma_density(by_strike, x, side, spacing),
-        seed_strike - spacing, seed_strike + spacing, tol,
-    )
+    between strikes when the concentration is lopsided. The search spans
+    ``reach`` strikes either side rather than one — a heavy pair of
+    neighbours can carry the true peak past the next strike, and a bracket
+    of exactly one strike would clamp the answer back onto the seed. The
+    bracket is scanned coarsely first so golden-section starts on a
+    genuinely unimodal interval.
+    """
+    lo, hi = seed_strike - reach * spacing, seed_strike + reach * spacing
+    f = lambda x: side_gamma_density(by_strike, x, side, spacing)
+    grid = np.linspace(lo, hi, int(reach * 40) + 1)
+    vals = np.array([f(x) for x in grid])
+    i = int(vals.argmax())
+    a = grid[max(i - 1, 0)]
+    b = grid[min(i + 1, len(grid) - 1)]
+    return _golden_max(f, a, b, tol)
 
 
 def magnet_levels(a: "Analysis", top_n: int = 5) -> pd.DataFrame:
@@ -1811,7 +1894,8 @@ def analyze(chain: pd.DataFrame, spot: float, asof: date,
     strikes = gex_by_strike(df, spot, multiplier)
     curve = gex_curve(df, spot, rate, multiplier=multiplier)
     total = total_gex_at(df, spot, rate, multiplier)
-    flip = refine_flip(df, curve, spot, rate)  # zero crossing is scale-invariant
+    flips = flip_levels(df, curve, spot, rate)  # crossings are scale-invariant
+    flip = flips[0] if flips else None
 
     uniq = np.sort(strikes["strike"].unique())
     spacing = float(np.median(np.diff(uniq))) if len(uniq) > 1 else spot * 0.01
@@ -1872,6 +1956,7 @@ def analyze(chain: pd.DataFrame, spot: float, asof: date,
         charm_flow=charm_flow,
         expected_move=em,
         nearest_expiry=nearest,
+        flip_levels=flips,
     )
 
 

@@ -62,7 +62,7 @@ history** instead.
 
 | Level | Meaning |
 |---|---|
-| **Gamma flip** | Spot where net GEX crosses zero — bisected to the cent |
+| **Gamma flip** | Spot where net GEX crosses zero — **every** crossing, each bisected on the true GEX function to a hundredth of a cent, nearest to spot first. More than one means spot sits in a pocket and the far crossing is where the regime changes back |
 | **Gamma call / put wall** | Peak aggregate dealer gamma per side |
 | **OI call / put wall** | Peak raw open interest per side |
 | **Magnets & accelerators** | Every positive (pin) / negative (repel) net-gamma peak, ranked |
@@ -208,7 +208,7 @@ estimate — this is positioning analysis, **not trading advice**.
 
 ```
 pip install pytest
-python -m pytest tests/                 # 151 tests
+python -m pytest tests/                 # 161 tests
 python scripts/make_sample_chain.py     # regenerate the bundled sample chain
 ```
 

@@ -243,6 +243,9 @@ def build_markdown(a: Analysis, ticker: str = "",
     title, body = regime_text(a.regime)
     label = f"{ticker.upper()} " if ticker else ""
     flip = f"{a.gamma_flip:,.2f}" if a.gamma_flip is not None else "no crossing in ±15% range"
+    if len(a.flip_levels or []) > 1:
+        flip += (" (of " + ", ".join(f"{x:,.2f}" for x in sorted(a.flip_levels))
+                 + " — the book crosses zero more than once)")
 
     lines = [
         f"# {label}Dealer Positioning Report — {a.asof:%Y-%m-%d}",

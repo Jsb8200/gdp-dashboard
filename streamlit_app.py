@@ -279,8 +279,19 @@ def metrics_row(a: Analysis, zero_dte: bool = False) -> None:
     flip_delta = (
         f"{(a.gamma_flip / a.spot - 1) * 100:+.1f}% vs spot" if a.gamma_flip is not None else None
     )
+    n_flips = len(a.flip_levels or [])
+    if n_flips > 1 and flip_delta:
+        flip_delta += f" · {n_flips} crossings"
     cols[0].metric("Spot", f"{a.spot:,.2f}")
-    cols[1].metric("Gamma flip", flip_val, flip_delta, delta_color="off")
+    cols[1].metric(
+        "Gamma flip", flip_val, flip_delta, delta_color="off",
+        help="Nearest spot level where net dealer gamma crosses zero, "
+             "bisected on the true GEX function to a hundredth of a cent. "
+             + (f"This book crosses {n_flips} times "
+                f"({', '.join(f'{x:,.2f}' for x in a.flip_levels)}) — spot "
+                "sits in a pocket, and the far crossing is where the regime "
+                "changes back." if n_flips > 1 else
+                "This book crosses once, so the regime switch is clean."))
     cols[2].metric("Call wall", f"{a.call_wall:,.2f}",
                    f"strike {a.call_wall_strike:,.0f}", delta_color="off")
     cols[3].metric("Put wall", f"{a.put_wall:,.2f}",
@@ -428,6 +439,13 @@ def gex_curve_chart(a: Analysis) -> None:
                     name="Current spot", marker=dict(color=C["ink"], size=9),
                     hovertemplate="spot %{x:,.2f}<br>net GEX $%{y:,.2f}B<extra></extra>")
     fig.add_hline(y=0, line_color=C["axis"], line_width=1)
+    # a book can cross zero more than once; the far crossings are the other
+    # edge of the pocket spot is sitting in
+    for extra in (a.flip_levels or [])[1:]:
+        fig.add_vline(x=extra, line_dash="dot", line_color=C["muted"],
+                      line_width=1, annotation_text="flip",
+                      annotation_position="top left",
+                      annotation_font_color=C["muted"])
     fig.update_layout(title="Net dealer gamma vs spot level",
                       yaxis_title="Net GEX ($B per 1% move)")
     _level_lines(fig, a, walls=False)
