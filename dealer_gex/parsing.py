@@ -69,6 +69,7 @@ SYNONYMS = {
     "trade_type": ["tradetype", "executiontype", "tradekind"],
     "dte": ["daysuntilexpiration", "dte", "daystoexpiration", "daystoexpiry",
             "daysleft", "daystoexp"],
+    "money_type": ["moneytype", "moneyness", "money"],
     "is_golden": ["isgoldensweep", "goldensweep"],
     "is_unusual": ["isunusual", "unusual"],
     "is_opening": ["isopeningposition", "openingposition", "isopening"],
@@ -434,6 +435,19 @@ def _parse_trade_flow(raw: pd.DataFrame) -> ParsedFile:
     # derived from the expiry — a print's horizon is as much a part of what it
     # says as its size
     df["dte"] = _to_num(raw[cols["dte"]]) if "dte" in cols else float("nan")
+    df["money_type"] = (_clean_codes(raw[cols["money_type"]])
+                        if "money_type" in cols else "")
+    # Signed distance out of the money, in percent of the print's own
+    # reference price, with the same sign convention on both sides:
+    # positive = out of the money, negative = in the money. A call 2% above
+    # spot and a put 2% below it are both +2.
+    _cp = df["type"].astype(str).str.strip().str.upper().str[0]
+    _k = pd.to_numeric(df["strike"], errors="coerce")
+    _r = pd.to_numeric(df["ref_price"], errors="coerce")
+    _call_otm = (_k / _r.where(_r > 0) - 1.0)
+    _put_otm = (_r / _k.where(_k > 0) - 1.0)
+    df["otm_pct"] = (_call_otm.where(_cp == "C", _put_otm) * 100.0).replace(
+        [float("inf"), float("-inf")], float("nan"))
     if "side" in cols:
         side = raw[cols["side"]].astype(str).str.strip().str.upper()
         sign = side.map({"A": 1.0, "AA": 1.0, "B": -1.0, "BB": -1.0}).fillna(0.0)

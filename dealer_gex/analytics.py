@@ -731,7 +731,8 @@ def block_type_breakdown(prints: pd.DataFrame,
     cols = ["block_type", "code", "tier", "mechanism", "tied", "spread_leg",
             "prints", "contracts", "premium", "median_premium", "avg_premium",
             "net_contracts", "direction", "premium_share", "level",
-            "ref_price", "distance_pct", "dte", "dte_median", "horizon"]
+            "ref_price", "distance_pct", "dte", "dte_median", "horizon",
+            "otm_pct", "moneyness"]
     if prints is None or prints.empty or "is_block" not in prints:
         return pd.DataFrame(columns=cols)
     b = prints[prints["is_block"].fillna(False)].copy()
@@ -756,6 +757,8 @@ def block_type_breakdown(prints: pd.DataFrame,
     b["_wr"] = b["_w"] * pd.to_numeric(b.get("ref_price", np.nan), errors="coerce")
     b["_dte"] = pd.to_numeric(b.get("dte", np.nan), errors="coerce")
     b["_wd"] = b["_w"] * b["_dte"]
+    b["_otm"] = pd.to_numeric(b.get("otm_pct", np.nan), errors="coerce")
+    b["_wo"] = b["_w"] * b["_otm"]
 
     g = b.groupby("flow_type", dropna=False).agg(
         code=("trade_type", lambda s: " / ".join(sorted(set(s.astype(str))
@@ -771,6 +774,7 @@ def block_type_breakdown(prints: pd.DataFrame,
         net_contracts=("signed_size", "sum"),
         _w=("_w", "sum"), _wk=("_wk", "sum"), _wr=("_wr", "sum"),
         _wd=("_wd", "sum"), dte_median=("_dte", "median"),
+        _wo=("_wo", "sum"), _n_otm=("_otm", "count"),
     ).reset_index().rename(columns={"flow_type": "block_type"})
 
     with np.errstate(invalid="ignore", divide="ignore"):
@@ -779,7 +783,13 @@ def block_type_breakdown(prints: pd.DataFrame,
         # premium-weighted DTE: where the money's horizon is, which is not
         # the median print's horizon when the size sits further out
         g["dte"] = np.where(g["_w"] > 0, g["_wd"] / g["_w"], np.nan)
+        # premium-weighted distance out of the money, and the bucket it lands in
+        g["otm_pct"] = np.where((g["_w"] > 0) & (g["_n_otm"] > 0),
+                                g["_wo"] / g["_w"], np.nan)
     g["horizon"] = [horizon_label(d) for d in g["dte"]]
+    band = (moneyness_band(float(spot), None) / float(spot) * 100.0
+            if spot else ATM_BAND_PCT * 100.0)
+    g["moneyness"] = classify_moneyness(g["otm_pct"], band).to_numpy()
     ref = float(spot) if spot else float(np.nanmedian(g["ref_price"])) \
         if np.isfinite(g["ref_price"]).any() else np.nan
     g["distance_pct"] = ((g["level"] / ref - 1.0) * 100.0
@@ -1170,6 +1180,136 @@ def block_dte_breakdown(prints: pd.DataFrame,
 
     g["dte_range"] = g["horizon"].map(HORIZON_RANGE).fillna("")
     g["_rank"] = g["horizon"].map({h: i for i, h in enumerate(HORIZON_ORDER)})
+    return g.sort_values("_rank")[cols].reset_index(drop=True)
+
+
+#: Moneyness buckets, in the order a strike ladder reads them.
+MONEYNESS_ORDER = ["ITM", "ATM", "OTM"]
+#: Half-width of the at-the-money band, as a fraction of spot. A file's own
+#: "at the money" flag is usually strict equality — on a real export only 32
+#: of 19,475 prints qualify — which is true and useless. A quarter of a
+#: percent is roughly the nearest strike or two on a liquid name.
+ATM_BAND_PCT = 0.0025
+
+
+def moneyness_band(spot: float, spacing: float | None = None,
+                   band_pct: float = ATM_BAND_PCT) -> float:
+    """Half-width of the ATM band in price, floored at half a strike step.
+
+    Without the floor a cheap underlying with wide strikes gets an empty
+    ATM bucket: 0.25% of $30 is 7 cents, and no strike is ever that close.
+    """
+    band = float(spot) * float(band_pct)
+    if spacing and np.isfinite(spacing) and spacing > 0:
+        band = max(band, spacing * 0.5)
+    return band
+
+
+def classify_moneyness(otm_pct, band_pct: float = ATM_BAND_PCT * 100):
+    """ITM / ATM / OTM from a signed out-of-the-money percentage.
+
+    ``otm_pct`` is positive out of the money and negative in the money on
+    both sides (see ``parsing``), so one comparison covers calls and puts.
+    """
+    v = pd.to_numeric(pd.Series(otm_pct), errors="coerce")
+    out = pd.Series(np.where(v.abs() <= band_pct, "ATM",
+                    np.where(v > 0, "OTM", "ITM")), index=v.index, dtype=object)
+    return out.mask(v.isna(), "")
+
+
+def block_moneyness_breakdown(prints: pd.DataFrame, spot: float | None = None,
+                              band_pct: float | None = None) -> pd.DataFrame:
+    """Block flow by **where it struck relative to spot**, ITM to OTM.
+
+    The counterpart to the expiration table: that one splits the book
+    across time, this one splits it across the strike ladder. Deep OTM
+    size bought is a lottery ticket or a hedge; ITM size is closer to
+    stock and usually carries delta someone wanted; ATM size is where
+    gamma actually lives, so it is the part that moves dealer hedging now.
+
+    Each print is classified against **its own reference price** — what
+    spot was when it traded — not against the latest spot, so a print is
+    not retroactively re-labelled by a move that happened after it.
+
+    Columns: moneyness, band, prints, contracts, premium, premium_share,
+    open_interest, add_ratio, opening_share, net_contracts, direction,
+    avg_otm_pct, level, distance_pct, top_type, top_share.
+    """
+    cols = ["moneyness", "band", "prints", "contracts", "premium",
+            "premium_share", "open_interest", "add_ratio", "opening_share",
+            "net_contracts", "direction", "avg_otm_pct", "level",
+            "distance_pct", "top_type", "top_share"]
+    if prints is None or prints.empty or "is_block" not in prints:
+        return pd.DataFrame(columns=cols)
+    b = prints[prints["is_block"].fillna(False)].copy()
+    if b.empty or "otm_pct" not in b:
+        return pd.DataFrame(columns=cols)
+
+    b["_otm"] = pd.to_numeric(b["otm_pct"], errors="coerce")
+    b = b[b["_otm"].notna()]
+    if b.empty:
+        return pd.DataFrame(columns=cols)
+
+    ks = np.sort(pd.to_numeric(b["strike"], errors="coerce").dropna().unique())
+    spacing = float(np.median(np.diff(ks))) if len(ks) > 1 else None
+    ref = float(spot) if spot else float(
+        pd.to_numeric(b["ref_price"], errors="coerce").median())
+    if band_pct is None:
+        band_pct = moneyness_band(ref, spacing) / ref * 100.0 if ref else \
+            ATM_BAND_PCT * 100.0
+    b["moneyness"] = classify_moneyness(b["_otm"], band_pct).to_numpy()
+
+    b["premium"] = pd.to_numeric(b.get("premium", 0.0), errors="coerce").fillna(0.0)
+    b["size"] = pd.to_numeric(b.get("size", 0.0), errors="coerce").fillna(0.0)
+    b["signed_size"] = pd.to_numeric(b.get("signed_size", 0.0),
+                                     errors="coerce").fillna(0.0)
+    b["open_interest"] = pd.to_numeric(b.get("open_interest", 0.0),
+                                       errors="coerce").fillna(0.0)
+    b["_open_sz"] = b["size"] * b.get("is_opening", False).astype(float)
+    b["_wk"] = b["premium"] * pd.to_numeric(b["strike"], errors="coerce")
+    b["_wo"] = b["premium"] * b["_otm"]
+
+    g = b.groupby("moneyness", dropna=False).agg(
+        prints=("premium", "size"),
+        contracts=("size", "sum"),
+        premium=("premium", "sum"),
+        net_contracts=("signed_size", "sum"),
+        opening=("_open_sz", "sum"),
+        _wk=("_wk", "sum"), _wo=("_wo", "sum"),
+    ).reset_index()
+
+    ckeys = ["moneyness"] + [c for c in ("ticker", "expiry", "strike", "type")
+                             if c in b]
+    per = b.groupby(ckeys, dropna=False)["open_interest"].max().reset_index()
+    g = g.merge(per.groupby("moneyness")["open_interest"].sum().reset_index(),
+                on="moneyness", how="left")
+
+    total = float(g["premium"].sum())
+    g["premium_share"] = g["premium"] / total if total > 0 else 0.0
+    with np.errstate(invalid="ignore", divide="ignore"):
+        g["add_ratio"] = np.where(g["open_interest"] > 0,
+                                  g["contracts"] / g["open_interest"], np.nan)
+        g["opening_share"] = np.where(g["contracts"] > 0,
+                                      g["opening"] / g["contracts"], np.nan)
+        g["level"] = np.where(g["premium"] > 0, g["_wk"] / g["premium"], np.nan)
+        g["avg_otm_pct"] = np.where(g["premium"] > 0, g["_wo"] / g["premium"], np.nan)
+    g["distance_pct"] = ((g["level"] / ref - 1.0) * 100.0 if ref else np.nan)
+    tilt = np.where(g["contracts"] > 0, g["net_contracts"] / g["contracts"], 0.0)
+    g["direction"] = np.where(tilt > 0.15, "bought",
+                       np.where(tilt < -0.15, "sold", "two-way"))
+
+    if "flow_type" in b:
+        owner = b.groupby(["moneyness", "flow_type"])["premium"].sum().reset_index()
+        idx = owner.groupby("moneyness")["premium"].idxmax()
+        top = owner.loc[idx].set_index("moneyness")
+        g["top_type"] = g["moneyness"].map(top["flow_type"])
+        g["top_share"] = (g["moneyness"].map(top["premium"]) / g["premium"]).where(
+            g["premium"] > 0)
+    else:
+        g["top_type"], g["top_share"] = "", np.nan
+
+    g["band"] = f"±{band_pct:.2f}%"
+    g["_rank"] = g["moneyness"].map({m: i for i, m in enumerate(MONEYNESS_ORDER)})
     return g.sort_values("_rank")[cols].reset_index(drop=True)
 
 

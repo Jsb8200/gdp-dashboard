@@ -15,9 +15,9 @@ import streamlit as st
 from dealer_gex.analytics import (
     Analysis, analyze, block_levels, confluence_levels, darkpool_levels,
     BLOCK_TIER_NOTE, BLOCK_WINDOWS, block_dominance, block_dte_breakdown,
-    block_oi_breakdown, block_tier_summary, block_type_behaviour,
-    block_type_breakdown, block_window_breakdown, block_window_summary,
-    data_quality,
+    block_moneyness_breakdown, block_oi_breakdown, block_tier_summary,
+    block_type_behaviour, block_type_breakdown, block_window_breakdown,
+    block_window_summary, data_quality,
     flow_books, flow_type_breakdown, fmt_dollars, institutional_mask,
     intraday_flow, level_hit_rate, magnet_levels, oi_levels, oi_walls,
     tuned_layer_weights,
@@ -692,6 +692,12 @@ def block_type_section(prints: pd.DataFrame, spot: float,
            else "")
         for _, r in br.iterrows()
     ]
+    view["Moneyness"] = [
+        "—" if pd.isna(r["otm_pct"]) else
+        f"{_MONEY_ICON.get(r['moneyness'], '')} {r['moneyness']} "
+        f"({r['otm_pct']:+.1f}%)"
+        for _, r in br.iterrows()
+    ]
     view["Level"] = view["level"].map(
         lambda x: f"{x:,.2f}" if pd.notna(x) else "—")
     view["vs spot"] = view["distance_pct"].map(
@@ -704,7 +710,8 @@ def block_type_section(prints: pd.DataFrame, spot: float,
     view["Share"] = view["premium_share"] * 100
     st.dataframe(
         view[["Type", "Code", "Premium", "Contracts", "Prints",
-              "Median print", "DTE", "Level", "vs spot", "Net", "Share"]],
+              "Median print", "DTE", "Moneyness", "Level", "vs spot", "Net",
+              "Share"]],
         use_container_width=True, hide_index=True,
         column_config={"Share": st.column_config.ProgressColumn(
             "% block premium", min_value=0, max_value=100, format="%.1f%%")},
@@ -849,6 +856,71 @@ def block_dte_section(prints: pd.DataFrame, spot: float) -> None:
         "**Opening** the share flagged as opening rather than closing, and "
         "**Level** the premium-weighted strike — near-dated flow clusters at "
         "spot, long-dated flow does not have to."
+    )
+
+
+_MONEY_ICON = {"ITM": "💵", "ATM": "🎯", "OTM": "🎟️"}
+_MONEY_NOTE = {
+    "ITM": "In the money — carries real delta, closer to owning the "
+           "underlying than to a bet on it.",
+    "ATM": "At the money — where gamma actually lives, so this is the part "
+           "that moves dealer hedging now.",
+    "OTM": "Out of the money — a lottery ticket or a hedge, cheap per "
+           "contract and only bites if price gets there.",
+}
+
+
+def block_moneyness_section(prints: pd.DataFrame, spot: float) -> None:
+    """Block flow across the strike ladder: ITM / ATM / OTM."""
+    m = block_moneyness_breakdown(prints, spot)
+    if m.empty:
+        return
+    band = m["band"].iloc[0]
+    st.markdown(f"**Block types by moneyness — where they struck relative to "
+                f"spot** (ATM band {band}):")
+    view = m.copy()
+    view["Moneyness"] = [f"{_MONEY_ICON.get(r['moneyness'], '')} {r['moneyness']}"
+                         for _, r in m.iterrows()]
+    view["Premium"] = view["premium"].map(fmt_dollars)
+    view["Prints"] = view["prints"].map(lambda x: f"{x:,.0f}")
+    view["Contracts"] = view["contracts"].map(lambda x: f"{x:,.0f}")
+    view["Open interest"] = view["open_interest"].map(
+        lambda x: "—" if pd.isna(x) else f"{x:,.0f}")
+    view["Add"] = view["add_ratio"].map(
+        lambda x: "—" if pd.isna(x) else f"{x:.0%}")
+    view["Opening"] = view["opening_share"].map(
+        lambda x: "—" if pd.isna(x) else f"{x:.0%}")
+    view["Avg OTM"] = view["avg_otm_pct"].map(
+        lambda x: "—" if pd.isna(x) else f"{x:+.1f}%")
+    view["Level"] = view["level"].map(
+        lambda x: "—" if pd.isna(x) else f"{x:,.2f}")
+    view["Net"] = [
+        f"{'🟢' if r['direction'] == 'bought' else '🔴' if r['direction'] == 'sold' else '⚪'} "
+        f"{r['direction']}" for _, r in m.iterrows()
+    ]
+    view["Owned by"] = [
+        "—" if not r["top_type"] else r["top_type"]
+        + ("" if pd.isna(r["top_share"]) else f" ({r['top_share']:.0%})")
+        for _, r in m.iterrows()
+    ]
+    view["Share"] = view["premium_share"] * 100
+    st.dataframe(
+        view[["Moneyness", "Premium", "Prints", "Contracts", "Open interest",
+              "Add", "Opening", "Avg OTM", "Level", "Net", "Owned by", "Share"]],
+        use_container_width=True, hide_index=True,
+        column_config={"Share": st.column_config.ProgressColumn(
+            "% block premium", min_value=0, max_value=100, format="%.1f%%")},
+    )
+    st.caption(
+        " ".join(f"{_MONEY_ICON[k]} **{k}** — {v}" for k, v in _MONEY_NOTE.items())
+        + f" Each print is classified against **its own reference price** — "
+        "what spot was when it traded — so a later move does not retroactively "
+        "relabel it. **Avg OTM** is premium-weighted and signed the same way "
+        "on both sides: positive is out of the money for a call *and* for a "
+        f"put. The ATM band is {band} of spot, floored at half a strike step "
+        "so a wide-strike underlying still gets a populated ATM bucket; a "
+        "file's own at-the-money flag is usually strict equality and catches "
+        "almost nothing."
     )
 
 
@@ -1037,6 +1109,7 @@ def block_section(a: Analysis, prints: pd.DataFrame, books: dict,
     block_type_section(prints, a.spot, dom)
     block_oi_section(prints, a.spot, dom)
     block_dte_section(prints, a.spot)
+    block_moneyness_section(prints, a.spot)
     block_window_section(prints, a.spot)
     block_behaviour_section(prints)
     with st.expander("All flow types (sweeps, splits, everything else)"):

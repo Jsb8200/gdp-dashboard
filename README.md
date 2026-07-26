@@ -138,6 +138,16 @@ history** instead.
   export the weekly window surfaces a type trading **111% of the standing
   book** 8% above spot, net sold — a position that has to resolve inside ten
   days.
+- **Block types by moneyness** — a separate table splitting the block book
+  across the strike ladder: 💵 **ITM** (real delta, closer to owning the
+  underlying), 🎯 **ATM** (where gamma lives, so it moves dealer hedging now),
+  🎟️ **OTM** (lottery ticket or hedge). Distance out of the money is signed the
+  same way on both sides — positive is OTM for a call *and* for a put — and
+  each print is classified against **its own reference price**, so a later move
+  can't retroactively relabel it. The ATM band is ±0.25% of spot floored at
+  half a strike step: a file's own at-the-money flag is usually strict equality
+  and catches almost nothing (32 of 19,475 prints on a real export). Per-type
+  rows carry the same read as a premium-weighted OTM%.
 - **Block type behaviour** — what each type means for dealer hedging (a floor
   print leaves a dealer with a real hedging obligation; a cross may leave the
   bank flat; a stock-tied print has already hedged its delta), and whether the
@@ -208,7 +218,7 @@ estimate — this is positioning analysis, **not trading advice**.
 
 ```
 pip install pytest
-python -m pytest tests/                 # 161 tests
+python -m pytest tests/                 # 170 tests
 python scripts/make_sample_chain.py     # regenerate the bundled sample chain
 ```
 

@@ -8,8 +8,9 @@ import pandas as pd
 
 from dealer_gex.analytics import (
     Analysis, block_behaviour_note, block_dominance, block_dte_breakdown,
-    block_oi_breakdown, block_tier_summary, block_type_behaviour,
-    block_window_summary, fmt_dollars, magnet_levels, oi_levels, oi_walls,
+    block_moneyness_breakdown, block_oi_breakdown, block_tier_summary,
+    block_type_behaviour, block_window_summary, fmt_dollars, magnet_levels,
+    oi_levels, oi_walls,
 )
 
 
@@ -553,6 +554,39 @@ def build_markdown(a: Analysis, ticker: str = "",
                 "split: 0DTE usually carries most of the prints and least of "
                 "the premium.",
             ]
+
+        mny = (block_moneyness_breakdown(block_prints, a.spot)
+               if block_prints is not None and not block_prints.empty
+               else None)
+        if mny is not None and not mny.empty:
+            lines += [
+                "",
+                "### By moneyness — where they struck relative to spot",
+                "",
+                f"ATM band {mny['band'].iloc[0]} of spot, floored at half a "
+                "strike step. Each print is classified against its own "
+                "reference price, not the latest spot.",
+                "",
+                "| Moneyness | Premium | % | Prints | Contracts | Open interest "
+                "| Add | Opening | Avg OTM | Level | Owned by |",
+                "|---|---|---|---|---|---|---|---|---|---|---|",
+            ]
+            for _, r in mny.iterrows():
+                add = "—" if pd.isna(r["add_ratio"]) else f"{r['add_ratio']:.0%}"
+                opn = "—" if pd.isna(r["opening_share"]) else f"{r['opening_share']:.0%}"
+                lvl = "—" if pd.isna(r["level"]) else f"{r['level']:,.2f}"
+                oi_v = "—" if pd.isna(r["open_interest"]) else f"{r['open_interest']:,.0f}"
+                avg = "—" if pd.isna(r["avg_otm_pct"]) else f"{r['avg_otm_pct']:+.1f}%"
+                own = r["top_type"] or "—"
+                if own != "—" and pd.notna(r["top_share"]):
+                    own += f" ({r['top_share']:.0%})"
+                lines.append(
+                    f"| {r['moneyness']} | {fmt_dollars(r['premium'])} "
+                    f"| {r['premium_share'] * 100:.0f}% | {r['prints']:,.0f} "
+                    f"| {r['contracts']:,.0f} | {oi_v} | {add} | {opn} "
+                    f"| {avg} | {lvl} | {own} |"
+                )
+            lines.append("")
 
         win = (block_window_summary(block_prints)
                if block_prints is not None and not block_prints.empty else None)
