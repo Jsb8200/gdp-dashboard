@@ -1,5 +1,7 @@
 """Precision of the consolidated-flow type: FLR / AUTO / CROSS / BLOCK …"""
 
+from datetime import date
+
 import numpy as np
 import pandas as pd
 import pytest
@@ -977,3 +979,54 @@ def test_report_lists_the_windows(real):
     assert "### In play by window" in md
     assert "| Window | Premium | % of block book |" in md
     assert "the rows nest" in md
+
+
+# --- records that are not trades ---------------------------------------------
+
+def test_adjustment_records_are_dropped_like_cancels():
+    """ADJ_LAST is a correction to a print already counted, not new size.
+    Kept, it lands in the tables as an untyped block with a nonsense tenor."""
+    from dealer_gex.parsing import classify_trade_type
+
+    out = classify_trade_type(pd.Series(["ADJ_LAST", "CANCEL", "AUTO"]))
+    assert list(out["is_adjustment"]) == [True, False, False]
+    assert list(out["is_cancelled"]) == [False, True, False]
+    assert list(out["block_tier"]) == ["adjustment", "cancelled", "electronic"]
+
+    csv = REAL_CSV.replace("SPRD_LEG_AUTO,BLOCK", "ADJ_LAST,BLOCK", 1)
+    p = parse_file(csv.encode()).prints
+    assert "ADJ LAST" not in set(p["trade_type"])
+    assert len(p) == 8              # the CANCEL row and the ADJ row both gone
+
+
+def test_expected_move_survives_signed_flow_weights():
+    """Regression: signed weights went straight into np.average, and mixed
+    signs summing positive slipped past the "sum > 0" guard — two strikes at
+    20% and 60% IV weighted +1000/-900 gave an implied vol of -3.4 and an
+    expected move of -105 on a spot of 100."""
+    chain = pd.DataFrame({
+        "strike": [99.0, 101.0], "type": ["C", "C"],
+        "open_interest": [100.0, 100.0], "iv": [0.20, 0.60],
+        "net_customer_size": [-1000.0, 900.0],
+        "volume": [0.0, 0.0], "gamma": [np.nan, np.nan],
+        "expiry": pd.to_datetime(["2026-08-21"] * 2),
+    })
+    a = analyze(chain, 100.0, date(2026, 7, 17), weight="flow")
+    assert a.expected_move is not None
+    assert a.expected_move > 0
+    # the blend is an activity-weighted mean, so it stays inside the book's IVs
+    implied = a.expected_move / (100.0 * np.sqrt(35 / 365))
+    assert 0.20 <= implied <= 0.60
+
+
+def test_expected_move_matches_oi_weighting_when_flow_is_one_sided():
+    chain = pd.DataFrame({
+        "strike": [100.0, 100.0], "type": ["C", "P"],
+        "open_interest": [500.0, 500.0], "iv": [0.30, 0.30],
+        "net_customer_size": [-500.0, -500.0],
+        "volume": [0.0, 0.0], "gamma": [np.nan, np.nan],
+        "expiry": pd.to_datetime(["2026-08-21"] * 2),
+    })
+    flow = analyze(chain, 100.0, date(2026, 7, 17), weight="flow")
+    oi = analyze(chain, 100.0, date(2026, 7, 17))
+    assert flow.expected_move == pytest.approx(oi.expected_move)

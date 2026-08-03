@@ -93,7 +93,9 @@ history** instead.
   QuantData export the fragments are ~60% of block *prints* and ~3% of block
   *premium*, so they are excluded from levels and the block book by default.
   Stock-tied (delta-hedged) prints are flagged 🔗 — a volatility position, not
-  a directional one — and cancelled/busted prints are dropped outright. Each
+  a directional one — and records that are not trades are dropped outright:
+  cancels/busts, and last-sale **adjustments** (`ADJ_LAST`), which are
+  corrections to prints already counted. Each
   type carries the **premium-weighted strike it traded at** and that level's
   distance from spot: a $25M block 5% out is a different trade from the same
   size at the money.
@@ -227,7 +229,7 @@ estimate — this is positioning analysis, **not trading advice**.
 
 ```
 pip install pytest
-python -m pytest tests/                 # 179 tests
+python -m pytest tests/                 # 182 tests
 python scripts/make_sample_chain.py     # regenerate the bundled sample chain
 ```
 

@@ -134,6 +134,11 @@ BLOCK_TIERS = {
     "electronic": ("auto", "iso"),      # the default route
 }
 CANCEL_CODES = ("CANCEL", "CXL", "BUST")
+#: Records that are not trades at all. ADJ_LAST and friends are last-sale
+#: *adjustments* — a correction to a previously reported print, not new
+#: size. Counting them inflates block premium and they carry no side, so
+#: they land in the tables as untyped "block" rows with nonsense tenors.
+ADJUSTMENT_CODES = ("ADJ", "CORRECT", "REVERSAL")
 
 # The export's codes are not the names the platform's own UI shows. A trader
 # reading the dashboard next to QuantData looks for "M2M FLR", not
@@ -195,6 +200,7 @@ def classify_trade_type(trade_type) -> pd.DataFrame:
     is_spread = squeezed.str.startswith("SPRD", na=False)
     is_tied = squeezed.str.contains("TIED", na=False, regex=False)
     is_cancelled = _has_any(squeezed, CANCEL_CODES)
+    is_adjustment = _has_any(squeezed, ADJUSTMENT_CODES)
     # the platform's own name for the code, when it is one we know
     alias = squeezed.map(
         {k.replace("_", ""): v for k, v in TRADE_TYPE_ALIASES.items()}).fillna("")
@@ -203,11 +209,13 @@ def classify_trade_type(trade_type) -> pd.DataFrame:
     for name, mechs in BLOCK_TIERS.items():
         tier = tier.mask((tier == "") & mechanism.isin(mechs), name)
     tier = tier.mask(is_spread_leg, "fragment")
+    tier = tier.mask(is_adjustment, "adjustment")
     tier = tier.mask(is_cancelled, "cancelled")
     return pd.DataFrame({
         "trade_type": s, "trade_label": alias, "mechanism": mechanism,
         "is_spread": is_spread, "is_spread_leg": is_spread_leg,
-        "is_tied": is_tied, "is_cancelled": is_cancelled, "block_tier": tier,
+        "is_tied": is_tied, "is_cancelled": is_cancelled,
+        "is_adjustment": is_adjustment, "block_tier": tier,
     })
 
 
@@ -516,15 +524,16 @@ def _parse_trade_flow(raw: pd.DataFrame) -> ParsedFile:
     # electronic execution is the default route, not a size signal.
     df["is_institutional"] = (
         (df["is_block"] | mech["mechanism"].isin(INSTITUTIONAL_VENUES))
-        & ~mech["is_cancelled"]
+        & ~mech["is_cancelled"] & ~mech["is_adjustment"]
     )
 
-    # Cancelled/busted prints never happened — drop them rather than let
-    # them inflate block premium (they are large and rare, so they land
-    # straight in the "biggest prints" table if kept).
-    cancelled = mech["is_cancelled"]
-    if cancelled.any():
-        df = df[~cancelled]
+    # Cancelled prints never happened and adjustments are corrections to
+    # prints already counted — drop both rather than let them inflate block
+    # premium. They are large and rare, so kept they land straight in the
+    # "biggest prints" table.
+    not_a_trade = mech["is_cancelled"] | mech["is_adjustment"]
+    if not_a_trade.any():
+        df = df[~not_a_trade]
         raw = raw.loc[df.index]
     for flag in ("is_golden", "is_unusual", "is_opening"):
         df[flag] = _yes(raw[cols[flag]]) if flag in cols else False

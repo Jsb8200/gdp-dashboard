@@ -551,10 +551,18 @@ def expected_move(df: pd.DataFrame, spot: float) -> tuple[float | None, date | N
     ]
     if sub.empty:
         return None, nearest.date()
-    w = _weights(sub).to_numpy()
-    w = w if w.sum() > 0 else np.ones_like(w)
+    # Weight the IV blend by *activity*, not direction. In signed-flow mode
+    # the weights carry a sign, and mixed signs summing positive slip past a
+    # "sum > 0" guard straight into np.average — which then returns a mean
+    # outside the range of the inputs. Two strikes at 20% and 60% IV with
+    # weights +1000 and -900 produced an implied vol of -3.4 and an expected
+    # move of -105 on a spot of 100.
+    w = np.abs(_weights(sub).to_numpy(dtype=float))
+    w = w if np.isfinite(w).all() and w.sum() > 0 else np.ones(len(sub))
     iv_atm = float(np.average(sub["iv"].to_numpy(), weights=w))
     t = float(sub["t"].iloc[0])
+    if not np.isfinite(iv_atm) or iv_atm <= 0:
+        return None, nearest.date()
     return spot * iv_atm * np.sqrt(t), nearest.date()
 
 
