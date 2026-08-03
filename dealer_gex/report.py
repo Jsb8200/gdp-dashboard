@@ -8,9 +8,9 @@ import pandas as pd
 
 from dealer_gex.analytics import (
     Analysis, block_behaviour_note, block_dominance, block_dte_breakdown,
-    block_moneyness_breakdown, block_oi_breakdown, block_tier_summary,
-    block_type_behaviour, block_window_summary, fmt_dollars, magnet_levels,
-    oi_levels, oi_walls,
+    block_moneyness_breakdown, block_oi_breakdown, block_strike_ladder,
+    block_tier_summary, block_type_behaviour, block_window_summary,
+    fmt_dollars, magnet_levels, oi_levels, oi_walls,
 )
 
 
@@ -553,6 +553,38 @@ def build_markdown(a: Analysis, ticker: str = "",
                 "In tenor order, not size order. Watch the count-versus-money "
                 "split: 0DTE usually carries most of the prints and least of "
                 "the premium.",
+            ]
+
+        ladder = (block_strike_ladder(block_prints, a.spot, top_n=12)
+                  if block_prints is not None and not block_prints.empty
+                  else None)
+        if ladder is not None and not ladder.empty:
+            lines += [
+                "",
+                "### Where the blocks are — by strike",
+                "",
+                "| Strike | vs spot | Premium | % | Contracts | Prints "
+                "| Open interest | Add | DTE | Side | Net | Type |",
+                "|---|---|---|---|---|---|---|---|---|---|---|---|",
+            ]
+            for _, r in ladder.iterrows():
+                add = "—" if pd.isna(r["add_ratio"]) else f"{r['add_ratio']:.0%}"
+                oi_v = "—" if pd.isna(r["open_interest"]) else f"{r['open_interest']:,.0f}"
+                dte = "—" if pd.isna(r["dte"]) else f"{r['dte']:,.0f}"
+                lines.append(
+                    f"| {r['strike']:,.2f} | {r['distance_pct']:+.1f}% "
+                    f"| {fmt_dollars(r['premium'])} "
+                    f"| {r['premium_share'] * 100:.1f}% | {r['contracts']:,.0f} "
+                    f"| {r['prints']:,.0f} | {oi_v} | {add} | {dte} "
+                    f"| {r['side']} | {r['direction']} | {r['top_type']} |"
+                )
+            lines += [
+                "",
+                "The raw ladder, ranked by premium — no smoothing and no peak "
+                "finding. Ranking by quantity instead reorders it and swaps "
+                "rows in and out, because cheap far strikes carry size without "
+                "money.",
+                "",
             ]
 
         mny = (block_moneyness_breakdown(block_prints, a.spot)

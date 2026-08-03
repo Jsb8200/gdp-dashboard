@@ -15,9 +15,9 @@ import streamlit as st
 from dealer_gex.analytics import (
     Analysis, analyze, block_levels, confluence_levels, darkpool_levels,
     BLOCK_TIER_NOTE, BLOCK_WINDOWS, block_dominance, block_dte_breakdown,
-    block_moneyness_breakdown, block_oi_breakdown, block_tier_summary,
-    block_type_behaviour, block_type_breakdown, block_window_breakdown,
-    block_window_summary, data_quality,
+    block_moneyness_breakdown, block_oi_breakdown, block_strike_ladder,
+    block_tier_summary, block_type_behaviour, block_type_breakdown,
+    block_window_breakdown, block_window_summary, data_quality,
     flow_books, flow_type_breakdown, fmt_dollars, institutional_mask,
     intraday_flow, level_hit_rate, magnet_levels, oi_levels, oi_walls,
     tuned_layer_weights,
@@ -859,6 +859,78 @@ def block_dte_section(prints: pd.DataFrame, spot: float) -> None:
     )
 
 
+def block_strike_section(prints: pd.DataFrame, spot: float) -> None:
+    """Where the block premium and size actually sit — one row per strike."""
+    probe = block_strike_ladder(prints, spot, top_n=1)
+    if probe.empty:
+        return
+    st.markdown("**Where the blocks are — premium and quantity by strike:**")
+    rank_label = st.segmented_control(
+        "Rank by", ["💰 Premium", "📦 Quantity"], default="💰 Premium",
+        key="block_strike_rank", label_visibility="collapsed",
+    )
+    rank = "contracts" if rank_label and "Quantity" in rank_label else "premium"
+    L = block_strike_ladder(prints, spot, top_n=15, rank=rank)
+    if L.empty:
+        return
+
+    fig = go.Figure()
+    for name, col, colour in (("Calls", "call_premium", C["call"]),
+                              ("Puts", "put_premium", C["put"])):
+        fig.add_bar(x=L["strike"], y=L[col] / 1e6, name=name,
+                    marker_color=colour,
+                    hovertemplate="strike %{x:,.0f}<br>" + name
+                                  + " $%{y:,.1f}M<extra></extra>")
+    fig.add_vline(x=spot, line_dash="dot", line_color=C["ink"], line_width=1,
+                  annotation_text="spot", annotation_position="top right",
+                  annotation_font_color=C["ink"])
+    fig.update_layout(barmode="stack", title="Block premium by strike",
+                      yaxis_title="Block premium ($M)")
+    st.plotly_chart(_style(fig), use_container_width=True)
+
+    view = L.copy()
+    view["Strike"] = view["strike"].map(lambda x: f"{x:,.2f}")
+    view["vs spot"] = view["distance_pct"].map(
+        lambda x: "—" if pd.isna(x) else f"{x:+.1f}%")
+    view["Premium"] = view["premium"].map(fmt_dollars)
+    view["Contracts"] = view["contracts"].map(lambda x: f"{x:,.0f}")
+    view["Prints"] = view["prints"].map(lambda x: f"{x:,.0f}")
+    view["Open interest"] = view["open_interest"].map(
+        lambda x: "—" if pd.isna(x) else f"{x:,.0f}")
+    view["Add"] = view["add_ratio"].map(
+        lambda x: "—" if pd.isna(x) else f"{x:.0%}")
+    view["DTE"] = view["dte"].map(lambda x: "—" if pd.isna(x) else f"{x:,.0f}")
+    view["Side"] = view["side"].map(
+        {"calls": "📈 calls", "puts": "📉 puts", "mixed": "⚖️ mixed"})
+    view["Net"] = [
+        f"{'🟢' if r['direction'] == 'bought' else '🔴' if r['direction'] == 'sold' else '⚪'} "
+        f"{r['direction']}" for _, r in L.iterrows()
+    ]
+    view["Type"] = view["top_type"]
+    view["Share"] = (L["contracts_share"] if rank == "contracts"
+                     else L["premium_share"]) * 100
+    st.dataframe(
+        view[["Strike", "vs spot", "Premium", "Contracts", "Prints",
+              "Open interest", "Add", "DTE", "Side", "Net", "Type", "Share"]],
+        use_container_width=True, hide_index=True,
+        column_config={"Share": st.column_config.ProgressColumn(
+            "% of block " + ("size" if rank == "contracts" else "premium"),
+            min_value=0, max_value=100, format="%.1f%%")},
+    )
+    st.caption(
+        "The raw ladder — no smoothing, no peak finding, so a strike either "
+        "has the money or it does not. **Premium and quantity rank "
+        "differently**: a cheap far strike can carry huge size for little "
+        "money and a deep-in-the-money strike the reverse, so the toggle "
+        "changes the list, not just the order. **Add** is traded size against "
+        "the standing book on that strike — the same max-per-contract rule as "
+        "the other tables. **Side** is the call/put split of premium at the "
+        "strike, **Net** the signed direction, and **DTE** is "
+        "premium-weighted, so one strike can host both a 0DTE trade and a "
+        "LEAP."
+    )
+
+
 _MONEY_ICON = {"ITM": "💵", "ATM": "🎯", "OTM": "🎟️"}
 _MONEY_NOTE = {
     "ITM": "In the money — carries real delta, closer to owning the "
@@ -1110,6 +1182,7 @@ def block_section(a: Analysis, prints: pd.DataFrame, books: dict,
     block_oi_section(prints, a.spot, dom)
     block_dte_section(prints, a.spot)
     block_moneyness_section(prints, a.spot)
+    block_strike_section(prints, a.spot)
     block_window_section(prints, a.spot)
     block_behaviour_section(prints)
     with st.expander("All flow types (sweeps, splits, everything else)"):

@@ -148,6 +148,15 @@ history** instead.
   half a strike step: a file's own at-the-money flag is usually strict equality
   and catches almost nothing (32 of 19,475 prints on a real export). Per-type
   rows carry the same read as a premium-weighted OTM%.
+- **Where the blocks are** — the raw strike ladder: block premium *and*
+  quantity per strike, with open interest, add ratio, the call/put split, net
+  direction, premium-weighted DTE and the type that owns the strike. No kernel
+  smoothing and no peak finding, so a strike either has the money or it does
+  not. A toggle ranks by 💰 premium or 📦 quantity, and the two genuinely
+  disagree — on a real SPX export only 8 of the top 12 strikes are common to
+  both lists, because cheap far strikes carry size without money. Shares stay
+  relative to the whole block book, so truncating to the top rows does not
+  inflate them.
 - **Block type behaviour** — what each type means for dealer hedging (a floor
   print leaves a dealer with a real hedging obligation; a cross may leave the
   bank flat; a stock-tied print has already hedged its delta), and whether the
@@ -218,7 +227,7 @@ estimate — this is positioning analysis, **not trading advice**.
 
 ```
 pip install pytest
-python -m pytest tests/                 # 170 tests
+python -m pytest tests/                 # 179 tests
 python scripts/make_sample_chain.py     # regenerate the bundled sample chain
 ```
 

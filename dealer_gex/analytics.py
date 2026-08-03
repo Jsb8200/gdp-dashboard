@@ -1183,6 +1183,104 @@ def block_dte_breakdown(prints: pd.DataFrame,
     return g.sort_values("_rank")[cols].reset_index(drop=True)
 
 
+def block_strike_ladder(prints: pd.DataFrame, spot: float | None = None,
+                        top_n: int = 15, rank: str = "premium",
+                        near_pct: float | None = None) -> pd.DataFrame:
+    """**Where** the block money and size actually sit: one row per strike.
+
+    Every other block table asks *what kind* of flow this is — by type, by
+    tenor, by moneyness. This one asks the question a levels dashboard
+    exists for: which strikes. No kernel smoothing and no top-N peak
+    finding, just the raw ladder, so a strike either has the money or it
+    does not.
+
+    ``rank`` picks what "biggest" means — ``premium`` (dollars committed)
+    or ``contracts`` (size). They disagree: cheap far-dated strikes can
+    carry huge quantity for little premium, and a deep-ITM strike the
+    reverse. Both columns are always present so the mismatch is visible.
+
+    Open interest is summed over the (expiry, right) contracts at that
+    strike, each taken as a max over its prints — the same rule as
+    everywhere else, so ``add_ratio`` is traded size against the standing
+    book on that strike.
+
+    Columns: strike, distance_pct, premium, premium_share, contracts,
+    contracts_share, prints, open_interest, add_ratio, net_contracts,
+    direction, call_premium, put_premium, side, dte, top_type.
+    """
+    cols = ["strike", "distance_pct", "premium", "premium_share", "contracts",
+            "contracts_share", "prints", "open_interest", "add_ratio",
+            "net_contracts", "direction", "call_premium", "put_premium",
+            "side", "dte", "top_type"]
+    if prints is None or prints.empty or "is_block" not in prints:
+        return pd.DataFrame(columns=cols)
+    b = prints[prints["is_block"].fillna(False)].copy()
+    if b.empty:
+        return pd.DataFrame(columns=cols)
+    b["strike"] = pd.to_numeric(b["strike"], errors="coerce")
+    b = b[b["strike"].notna()]
+    if b.empty:
+        return pd.DataFrame(columns=cols)
+
+    ref = float(spot) if spot else float(
+        pd.to_numeric(b.get("ref_price", np.nan), errors="coerce").median())
+    if near_pct and np.isfinite(ref):
+        b = b[(b["strike"] - ref).abs() <= ref * near_pct]
+        if b.empty:
+            return pd.DataFrame(columns=cols)
+
+    b["premium"] = pd.to_numeric(b.get("premium", 0.0), errors="coerce").fillna(0.0)
+    b["size"] = pd.to_numeric(b.get("size", 0.0), errors="coerce").fillna(0.0)
+    b["signed_size"] = pd.to_numeric(b.get("signed_size", 0.0),
+                                     errors="coerce").fillna(0.0)
+    b["_cp"] = b["type"].astype(str).str.strip().str.upper().str[0]
+    b["_call_prem"] = b["premium"].where(b["_cp"] == "C", 0.0)
+    b["_put_prem"] = b["premium"].where(b["_cp"] == "P", 0.0)
+    b["_wd"] = b["premium"] * pd.to_numeric(b.get("dte", np.nan), errors="coerce")
+
+    g = b.groupby("strike", dropna=False).agg(
+        premium=("premium", "sum"),
+        contracts=("size", "sum"),
+        prints=("premium", "size"),
+        net_contracts=("signed_size", "sum"),
+        call_premium=("_call_prem", "sum"),
+        put_premium=("_put_prem", "sum"),
+        _wd=("_wd", "sum"),
+    ).reset_index()
+
+    # open interest belongs to the contract: max per (strike, expiry, right)
+    okeys = ["strike"] + [c for c in ("ticker", "expiry", "type") if c in b]
+    per = b.groupby(okeys, dropna=False)["open_interest"].max().reset_index()
+    g = g.merge(per.groupby("strike")["open_interest"].sum().reset_index(),
+                on="strike", how="left")
+
+    tot_p, tot_c = float(g["premium"].sum()), float(g["contracts"].sum())
+    g["premium_share"] = g["premium"] / tot_p if tot_p > 0 else np.nan
+    g["contracts_share"] = g["contracts"] / tot_c if tot_c > 0 else np.nan
+    with np.errstate(invalid="ignore", divide="ignore"):
+        g["add_ratio"] = np.where(g["open_interest"] > 0,
+                                  g["contracts"] / g["open_interest"], np.nan)
+        g["dte"] = np.where(g["premium"] > 0, g["_wd"] / g["premium"], np.nan)
+    g["distance_pct"] = ((g["strike"] / ref - 1.0) * 100.0
+                         if np.isfinite(ref) else np.nan)
+    tilt = np.where(g["contracts"] > 0, g["net_contracts"] / g["contracts"], 0.0)
+    g["direction"] = np.where(tilt > 0.15, "bought",
+                       np.where(tilt < -0.15, "sold", "two-way"))
+    share_c = np.where(g["premium"] > 0, g["call_premium"] / g["premium"], 0.5)
+    g["side"] = np.where(share_c > 0.65, "calls",
+                  np.where(share_c < 0.35, "puts", "mixed"))
+
+    if "flow_type" in b:
+        owner = b.groupby(["strike", "flow_type"])["premium"].sum().reset_index()
+        idx = owner.groupby("strike")["premium"].idxmax()
+        g["top_type"] = g["strike"].map(owner.loc[idx].set_index("strike")["flow_type"])
+    else:
+        g["top_type"] = ""
+
+    key = "contracts" if rank == "contracts" else "premium"
+    return g.nlargest(top_n, key)[cols].reset_index(drop=True)
+
+
 #: Moneyness buckets, in the order a strike ladder reads them.
 MONEYNESS_ORDER = ["ITM", "ATM", "OTM"]
 #: Half-width of the at-the-money band, as a fraction of spot. A file's own
