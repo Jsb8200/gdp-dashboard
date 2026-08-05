@@ -185,9 +185,11 @@ class Field:
     hue: object = "slate"
     icon: str = "dot"
     rows: object = None
-    #: ``(strike, value)`` pairs drawn as vertical bars off a zero line.
+    #: ``(strike, value)`` pairs drawn as a price ladder — see ``_draw_bars``.
     bars: object = None
     span: int = 1
+    #: Grid rows the tile occupies. A ladder wants to be tall and narrow.
+    rowspan: int = 1
 
 
 def _pct_of_spot(level, a: Analysis) -> str:
@@ -342,15 +344,15 @@ def card_catalog(a: Analysis, *, oi=None, magnets=None,
         near = bs[(bs["strike"] >= a.spot * 0.92) & (bs["strike"] <= a.spot * 1.08)]
         if len(near) < 5:
             near = bs
-        if len(near) > 40:
+        if len(near) > 26:
             near = near.reindex(
-                (near["strike"] - a.spot).abs().sort_values().index).head(40)
+                (near["strike"] - a.spot).abs().sort_values().index).head(26)
         near = near.sort_values("strike")
         cat["gex_bars"] = Field(
             "gex_bars", "Net GEX by strike",
             lambda a: fmt_dollars(a.total_gex),
-            lambda a, n=len(near): f"{n} strikes around spot · green stabilizes, red amplifies",
-            hue="sky", icon="bars", span=4,
+            lambda a, n=len(near): f"{n} strikes around spot",
+            hue="sky", icon="bars", span=1, rowspan=2,
             bars=lambda a, t=near: [(float(r.strike), float(r.net_gex))
                                     for r in t.itertuples()])
 
@@ -709,13 +711,17 @@ def _icon(d: ImageDraw.ImageDraw, box, kind: str, colour) -> None:
 
 
 def _draw_bars(d: ImageDraw.ImageDraw, box, data, spot: float, sty: dict) -> None:
-    """Net GEX by strike as vertical bars off a zero line.
+    """Net GEX by strike as a price ladder: strike up the vertical axis,
+    each strike's gamma as a horizontal bar off a zero line.
 
-    The zero line is placed by the data, not at the middle: a book that is
-    long gamma nearly everywhere should show one shallow red stub below a
-    wall of green, and centring the axis would misrepresent that as a
-    balanced book. Bars take their colour from their own sign, and the spot
-    is marked so every bar is read as above or below where price is.
+    Price runs vertically here because that is how a trader reads a level —
+    high strikes at the top, low at the bottom, spot marked between them.
+    A strike axis laid out horizontally forces you to re-map the picture
+    onto the chart you already have in your head.
+
+    The zero line is placed by the data, not down the middle: a book that
+    is long gamma nearly everywhere should show one shallow red stub beside
+    a wall of green, and centring the axis would draw that as balanced.
     """
     x0, y0, x1, y1 = box
     if not data:
@@ -723,30 +729,31 @@ def _draw_bars(d: ImageDraw.ImageDraw, box, data, spot: float, sty: dict) -> Non
     vals = [v for _, v in data]
     hi, lo = max(max(vals), 0.0), min(min(vals), 0.0)
     span = (hi - lo) or 1.0
-    zero_y = y0 + (hi / span) * (y1 - y0)
-    bw = (x1 - x0) / len(data)
+    zero_x = x0 + (-lo / span) * (x1 - x0)
+    bh = (y1 - y0) / len(data)
 
+    # highest strike at the top: the data arrives strike-ascending
     for i, (k, v) in enumerate(data):
-        cx = x0 + (i + 0.5) * bw
-        tip = zero_y - (v / span) * (y1 - y0)
+        cy = y1 - (i + 0.5) * bh
+        tip = zero_x + (v / span) * (x1 - x0)
         colour = HUES["mint"] if v >= 0 else HUES["rose"]
-        d.rectangle([cx - bw * 0.33, min(tip, zero_y),
-                     cx + bw * 0.33, max(tip, zero_y)], fill=colour)
+        d.rectangle([min(tip, zero_x), cy - bh * 0.33,
+                     max(tip, zero_x), cy + bh * 0.33], fill=colour)
 
-    d.line([(x0, zero_y), (x1, zero_y)], fill=sty["border"], width=SCALE)
+    d.line([(zero_x, y0), (zero_x, y1)], fill=sty["border"], width=SCALE)
 
-    # spot: a dotted rule at where price actually is
     ks = [k for k, _ in data]
-    if spot and ks[0] <= spot <= ks[-1] and len(ks) > 1:
+    f = _font(12 * SCALE)
+    if spot and len(ks) > 1 and ks[0] <= spot <= ks[-1]:
         j = max(i for i, k in enumerate(ks) if k <= spot)
         frac = ((spot - ks[j]) / (ks[j + 1] - ks[j])) if j + 1 < len(ks) else 0.0
-        sx = x0 + (j + 0.5 + frac) * bw
-        for yy in range(int(y0), int(y1), 8 * SCALE):
-            d.line([(sx, yy), (sx, yy + 4 * SCALE)], fill=sty["label"], width=SCALE)
+        sy = y1 - (j + 0.5 + frac) * bh
+        for xx in range(int(x0), int(x1), 8 * SCALE):
+            d.line([(xx, sy), (xx + 4 * SCALE, sy)], fill=sty["label"], width=SCALE)
+        _text(d, (x1, sy - 4 * SCALE), f"{spot:,.0f}", f, sty["label"], "rd")
 
-    f = _font(12 * SCALE)
-    _text(d, (x0, y1 + 6 * SCALE), f"{ks[0]:,.0f}", f, sty["sub"], "la")
-    _text(d, (x1, y1 + 6 * SCALE), f"{ks[-1]:,.0f}", f, sty["sub"], "ra")
+    _text(d, (x0, y0), f"{ks[-1]:,.0f}", f, sty["sub"], "la")
+    _text(d, (x0, y1), f"{ks[0]:,.0f}", f, sty["sub"], "ld")
 
 
 _DELTA = re.compile(r"^([+\-−][\d.,]+%?)(.*)$")
@@ -789,6 +796,7 @@ class _Tile:
     rows: list | None
     span: int
     bars: list | None = None
+    rowspan: int = 1
 
 
 def _tile_need(t: _Tile) -> float:
@@ -807,29 +815,53 @@ def _tile_need(t: _Tile) -> float:
 
 
 def _place(tiles: list) -> tuple[int, list, list]:
-    """Choose a column count and flow the tiles into it, honouring spans.
+    """Pack the tiles into a grid, honouring column *and* row spans.
 
-    Returns ``(cols, [(row, col, span), ...], [row_height, ...])``. A tile
-    that will not fit in what is left of the current row starts the next
-    one, so a two-column list tile is never split across a boundary; each
-    row is then as tall as its tallest tile.
+    Returns ``(cols, [(row, col, span, rowspan), ...], [row_height, ...])``.
+
+    Placement is first-fit over an occupancy grid, but tiles taller than one
+    row are placed first. A full-height price ladder belongs against the
+    left edge with the single-number tiles flowing to its right; threading
+    it into the reading order instead would leave a hole wherever it landed.
     """
     widest = max(t.span for t in tiles)
-    cells = sum(t.span for t in tiles)
+    cells = sum(t.span * t.rowspan for t in tiles)
     cols = max(_COLS.get(cells, 4), widest)
-    places, r, c = [], 0, 0
-    for t in tiles:
-        span = min(t.span, cols)
-        if c + span > cols:
-            r, c = r + 1, 0
-        places.append((r, c, span))
-        c += span
-        if c >= cols:
-            r, c = r + 1, 0
-    n_rows = r + (1 if c else 0)
-    heights = [TILE_H] * n_rows
-    for t, (rr, _, _) in zip(tiles, places):
-        heights[rr] = max(heights[rr], _tile_need(t))
+
+    grid: list[list[bool]] = []
+
+    def row(r: int) -> list[bool]:
+        while len(grid) <= r:
+            grid.append([False] * cols)
+        return grid[r]
+
+    def fits(r: int, c: int, sp: int, rs: int) -> bool:
+        return all(not any(row(rr)[c:c + sp]) for rr in range(r, r + rs))
+
+    places: list = [None] * len(tiles)
+    for i in sorted(range(len(tiles)), key=lambda i: -tiles[i].rowspan):
+        t = tiles[i]
+        sp, rs = min(t.span, cols), t.rowspan
+        r = 0
+        while True:
+            row(r + rs - 1)
+            hit = next((c for c in range(cols - sp + 1) if fits(r, c, sp, rs)), None)
+            if hit is not None:
+                for rr in range(r, r + rs):
+                    for cc in range(hit, hit + sp):
+                        row(rr)[cc] = True
+                places[i] = (r, hit, sp, rs)
+                break
+            r += 1
+
+    while grid and not any(grid[-1]):
+        grid.pop()
+    heights = [TILE_H] * len(grid)
+    # A tile spanning rows takes its height from the rows it covers, so only
+    # single-row tiles get a say in how tall a row has to be.
+    for t, (r, _, _, rs) in zip(tiles, places):
+        if rs == 1:
+            heights[r] = max(heights[r], _tile_need(t))
     return cols, places, heights
 
 
@@ -859,7 +891,7 @@ def build_share_card(a: Analysis, ticker: str = "", *,
     tiles = [_Tile(f.label, f.value(a), (f.sub(a) if f.sub else ""),
                    _hue_of(f, a), f.icon,
                    f.rows(a) if f.rows else None, max(1, f.span),
-                   f.bars(a) if f.bars else None)
+                   f.bars(a) if f.bars else None, max(1, f.rowspan))
              for f in spec]
     for i, extra in enumerate(extras or []):
         lab, val, sb = extra[0], extra[1], (extra[2] if len(extra) > 2 else "")
@@ -943,11 +975,11 @@ def build_share_card(a: Analysis, ticker: str = "", *,
           _fit(d, tag, w / 2 - 40 * SCALE, 15, 10), sty["sub"], "rs")
 
     # --- tiles ----------------------------------------------------------
-    for t, (r, c, span) in zip(tiles, places):
+    for t, (r, c, span, rspan) in zip(tiles, places):
         lab, val, sb, hue, icon = t.label, t.value, t.sub, t.hue, t.icon
         x0 = pad + c * (tw + gap)
         y0 = row_y[r]
-        th = row_h[r]
+        th = sum(row_h[r:r + rspan]) + gap * (rspan - 1)
         tile_w = span * tw + (span - 1) * gap
         box = (x0, y0, x0 + tile_w, y0 + th)
         if glass:

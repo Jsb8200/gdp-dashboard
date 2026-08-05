@@ -336,7 +336,7 @@ def test_a_wide_tile_is_never_split_across_a_row(sample):
     plain = _Tile("x", "1", "", HUES["slate"], "dot", None, 1)
     wide = _Tile("y", "1", "", HUES["slate"], "dot", [("a", "b")], 2)
     cols, places, _ = _place([plain, plain, plain, wide])
-    for (r, c, span), t in zip(places, [plain, plain, plain, wide]):
+    for (r, c, span, rspan) in places:
         assert c + span <= cols                  # fits in the row it starts
 
 
@@ -381,3 +381,53 @@ def test_the_zero_line_follows_the_data_not_the_middle():
     lit = np.flatnonzero(px.max(axis=1) > 20)
     # most of the ink sits above the zero line, which is low in the frame
     assert lit.size and np.median(lit) < 60
+
+
+def test_the_gex_ladder_is_a_tall_left_hand_tile(sample):
+    """Price runs up the vertical axis, so the tile is narrow and tall and
+    sits against the left edge with the numbers flowing to its right."""
+    from dealer_gex.share import _place, _Tile
+    cat = card_catalog(sample)
+    f = cat["gex_bars"]
+    assert f.span == 1 and f.rowspan == 2
+    tiles = [_Tile(x.label, "1", "", HUES["slate"], "dot", None, x.span, None,
+                   x.rowspan) for x in CARD_FIELDS]
+    ladder = _Tile(f.label, "1", "", HUES["sky"], "bars", None, f.span,
+                   f.bars(sample), f.rowspan)
+    # even placed last in the reading order, the tall tile takes the corner
+    cols, places, heights = _place(tiles + [ladder])
+    assert places[-1][:2] == (0, 0)
+    assert places[-1][3] == 2
+    for (r, c, sp, rs) in places[:-1]:
+        assert not (r < 2 and c == 0)            # nothing else in that corner
+
+
+def test_nothing_overlaps_in_the_packed_grid():
+    """Row spans mean a naive flow can write two tiles into one cell."""
+    from dealer_gex.share import _place, _Tile
+    def mk(span, rowspan):
+        return _Tile("x", "1", "", HUES["slate"], "dot", None, span, None, rowspan)
+    tiles = [mk(1, 2), mk(1, 1), mk(2, 1), mk(1, 1), mk(2, 1), mk(1, 1), mk(1, 2)]
+    cols, places, heights = _place(tiles)
+    seen = set()
+    for (r, c, sp, rs) in places:
+        for rr in range(r, r + rs):
+            for cc in range(c, c + sp):
+                assert (rr, cc) not in seen, (rr, cc)
+                seen.add((rr, cc))
+                assert cc < cols
+    assert len(heights) == max(r + rs for r, _, _, rs in places)
+
+
+def test_the_ladder_puts_high_strikes_at_the_top():
+    """A price ladder read upside down is worse than no ladder."""
+    from PIL import Image as _I, ImageDraw as _D
+    from dealer_gex.share import STYLES, _draw_bars
+    im = _I.new("RGB", (200, 120), (0, 0, 0))
+    _draw_bars(_D.Draw(im), (0, 0, 200, 120),
+               [(100.0, 1.0), (101.0, 0.0), (102.0, 9.0)], 101.0,
+               STYLES["midnight"])
+    px = np.asarray(im.convert("L"), dtype=float)
+    # the biggest bar belongs to the highest strike, so the ink is up top
+    rows = px.sum(axis=1)
+    assert rows[:40].sum() > rows[80:].sum()
