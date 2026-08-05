@@ -36,7 +36,9 @@ from dealer_gex.instruments import (
     DEFAULT_INSTRUMENT, detect_instrument, instrument_choices,
     instrument_from_choice,
 )
-from dealer_gex.share import build_share_card, card_filename
+from dealer_gex.share import (
+    DEFAULT_KEYS, SIZES, STYLES, build_share_card, card_catalog, card_filename,
+)
 from dealer_gex.report import (
     build_markdown, build_playbook, executive_summary, key_ladder,
     markdown_to_html, regime_text,
@@ -1547,24 +1549,52 @@ def tables(a: Analysis) -> None:
         st.dataframe(top, use_container_width=True, hide_index=True)
 
 
-def share_card_section(a: Analysis, ticker: str, dom: dict | None = None) -> None:
-    """The headline read as one downloadable picture."""
+def share_card_section(a: Analysis, ticker: str,
+                       magnets: pd.DataFrame | None = None,
+                       forecast=None) -> None:
+    """The headline read as one downloadable picture — tiles, order, style
+    and wording all chosen here rather than baked into the renderer."""
     st.subheader("🪟 Share card")
-    extras = []
-    if dom and dom.get("leader"):
-        extras.append(("Block book", dom["leader"],
-                       "leads " + ("2 of 3" if dom.get("lenses_won", 0) >= 2
-                                   else "one") + " lenses"))
-    png = build_share_card(a, ticker, extras=extras)
+    cat = card_catalog(a, oi=oi_walls(a), magnets=magnets, forecast=forecast)
+    keys = list(cat)
+
+    with st.expander("⚙️ Customise the card", expanded=False):
+        c1, c2, c3, c4 = st.columns([1, 1, 1, 1])
+        style = c1.selectbox("Style", list(STYLES), index=0, key="card_style",
+                             help="`midnight` is the flat dashboard look; "
+                                  "`glass` refracts the backdrop through each panel.")
+        size = c2.selectbox("Size", list(SIZES), index=0, key="card_size",
+                            format_func=lambda k: f"{k} · {SIZES[k]}px",
+                            help="Card width. Height follows the tiles you pick.")
+        title = c3.text_input("Title", value=ticker, key="card_title",
+                              help="Defaults to the ticker.")
+        footnote = c4.text_input("Footnote", value="", key="card_footnote",
+                                 placeholder="none",
+                                 help="A line under the grid. Empty means no footer.")
+        picked = st.multiselect(
+            "Tiles — the card follows this order", options=keys,
+            default=[k for k in DEFAULT_KEYS if k in cat], key="card_tiles",
+            format_func=lambda k: cat[k].label,
+            help="Every number this file can support. The card grows a row at "
+                 "a time, so pick as many as you want.")
+        subtitle = st.text_input(
+            "Subtitle", value="", key="card_subtitle",
+            placeholder="auto — instrument · multiplier · date · contracts",
+            help="Leave empty to keep the generated line.")
+
+    fields = [cat[k] for k in picked]
+    png = build_share_card(a, title, fields=fields, style=style, size=size,
+                           footnote=footnote,
+                           subtitle=subtitle or None)
     st.image(png, use_container_width=True)
     c1, c2 = st.columns([1, 4])
     c1.download_button("⬇️ Download card (.png)", png,
-                       file_name=card_filename(a, ticker), mime="image/png")
+                       file_name=card_filename(a, title or ticker),
+                       mime="image/png")
     c2.caption(
-        "The headline numbers only — spot, regime, flip, walls, expected move "
-        "and max pain — sized for pasting into a chat. Tell me which other "
-        "columns you want and they become tiles; the set is a list, not a "
-        "layout."
+        f"{len(fields)} tiles from {len(keys)} available. Everything on the "
+        "card is a choice above — which numbers, their order, the style, and "
+        "the wording of the title, subtitle and footer."
     )
 
 
@@ -1990,8 +2020,7 @@ def main() -> None:
         notable_flow_section(merged_prints, a.spot)
 
     playbook_section(a, master)
-    share_card_section(a, ticker,
-                       block_dominance(merged_prints, a.spot) if merged_prints is not None else None)
+    share_card_section(a, ticker, magnets, forecast)
     tables(a)
     report_section(a, ticker, hist, blk_books, blk_lvls, master, dq,
                    dark_lvls, forecast,

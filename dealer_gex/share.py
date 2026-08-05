@@ -1,31 +1,35 @@
 """Shareable card: the headline read as a downloadable picture.
 
 The dashboard is twenty tables deep. This is the opposite — one image with
-the numbers you would actually paste into a chat, rendered in the
-liquid-glass idiom: translucent panels floating over a blurred, tinted
-backdrop, with a specular edge where the light catches.
+the numbers you would actually paste into a chat.
 
-Real glass, not a flat grey box with rounded corners: each panel blurs the
-backdrop *behind it* (``ImageFilter.GaussianBlur`` on the cropped region),
-then layers a coloured glow, a translucent fill, a bright hairline border
-and a top-edge highlight. That is what makes it read as depth rather than
-decoration.
+Two looks, both dark:
+
+``midnight`` (default) is the flat fintech-dashboard idiom — near-black
+page, opaque panels a shade lighter, a hairline border, an icon chip beside
+a muted label, a large white value, and a small coloured delta underneath.
+Restraint is the point: colour appears on the delta, the icon and the
+verdict pill, and nowhere else, so the eye lands on the numbers.
+
+``glass`` is the liquid-glass alternative: the panel is a real lens. Near
+the rim it drags the blurred backdrop outward along the surface normal,
+fringes the channels (chromatic aberration), and carries a specular that
+follows the curvature of the corner rather than running straight across the
+top. That is what makes something read as a solid transparent object
+instead of a frosted sticker.
 
 Type is monospaced throughout — Consolas where it exists, a close free
 substitute where it does not. Numbers in a mono face line up column-wise
-between tiles, which is the whole reason a trading card is legible at a
+between tiles, which is the whole reason a card of figures is legible at a
 glance.
-
-Colour carries meaning rather than mood: every tile owns an accent, and the
-accent says what the number is. Walls are green above and red below, the
-flip is violet, expected move amber, and net GEX takes its colour from its
-own sign. Read the card by hue before reading a digit.
 
 Pillow only — it already ships with Streamlit, so the picture costs no new
 dependency.
 
-The tile set is data-driven (``CARD_FIELDS``): adding a number to the card
-is one entry, not a layout change.
+Which numbers appear is entirely the caller's choice: ``card_catalog``
+returns every tile the current analysis can support, keyed by name, and
+``build_share_card(fields=...)`` renders whichever subset is handed to it,
+in that order.
 """
 
 from __future__ import annotations
@@ -33,7 +37,8 @@ from __future__ import annotations
 import io
 import math
 import os
-from dataclasses import dataclass
+import re
+from dataclasses import dataclass, replace
 from datetime import date
 from functools import lru_cache
 
@@ -44,15 +49,19 @@ from dealer_gex.analytics import Analysis, fmt_dollars
 from dealer_gex.instruments import detect_instrument
 
 # Rendered at 2x and kept there: the card is meant to survive being
-# screenshotted, cropped and re-posted.
+# screenshotted, cropped and re-posted. Width is a preset; height is
+# whatever the chosen tiles need — see ``card_size``.
 SCALE = 2
-CARD_W, CARD_H = 1200, 675
+
+#: Card widths. ``desktop`` is a 1080p-class picture — the card at the size
+#: a desktop actually shows it, rather than a chat thumbnail blown up.
+SIZES = {"desktop": 1920, "wide": 1600, "share": 1200}
+DEFAULT_SIZE = "desktop"
 
 #: Consolas first — it is what the card was drawn for, and it is present on
 #: Windows and on any box with the ms core fonts. Everything after it is a
 #: humanist mono of the same flavour, so the layout holds even where the
-#: licensed face is missing (Linux CI, Streamlit Cloud). Ordered by how
-#: close the metrics sit to Consolas, not by preference.
+#: licensed face is missing (Linux CI, Streamlit Cloud).
 _MONO_CANDIDATES = {
     False: [
         "C:/Windows/Fonts/consola.ttf",
@@ -81,10 +90,8 @@ _MONO_CANDIDATES = {
     ],
 }
 
-#: Palette per regime. Near-black base with the tint carried by low-alpha
-#: blobs rather than the background itself — the card reads dark, and the
-#: colour is a signal (which way dealers are forced to hedge) rather than a
-#: wash. ``accent`` drives the spot price and the verdict pill.
+#: Regime palette. The accent is the only saturated colour on a midnight
+#: card: the spot price, the verdict pill and a whisper of tint on the page.
 THEMES = {
     "long_gamma": {
         "base": (8, 11, 15), "blobs": [(16, 84, 70), (14, 48, 92), (28, 24, 86)],
@@ -98,7 +105,7 @@ THEMES = {
     },
 }
 
-#: Named accents. Semantic, not decorative — see the module docstring.
+#: Named accents, used for a tile's icon and its delta.
 HUES = {
     "mint": (74, 222, 145),
     "rose": (251, 113, 133),
@@ -108,14 +115,53 @@ HUES = {
     "fuchsia": (232, 121, 249),
     "lime": (163, 230, 53),
     "orange": (251, 146, 60),
+    "slate": (148, 163, 184),
 }
 
 #: Accents handed to ``extras`` tiles in order, so a caller that appends a
 #: number does not have to pick a colour.
 _EXTRA_HUES = ["fuchsia", "sky", "lime", "orange", "violet", "amber"]
 
+#: How tall a tile wants to be, and how tall one row of a ranked-list tile
+#: is. See ``_tile_need``.
+TILE_H = 158 * SCALE
+ROW_H = 26 * SCALE
+BARS_H = 268 * SCALE
+
 #: Tiles per row, by tile count. Anything past eight takes four columns.
-_COLS = {1: 1, 2: 2, 3: 3, 4: 2, 5: 3, 6: 3, 7: 4, 8: 4}
+_COLS = {1: 1, 2: 2, 3: 3, 4: 2, 5: 3, 6: 3, 7: 4, 8: 4, 9: 3,
+         10: 4, 11: 4, 12: 4}
+
+#: The two looks. ``glass`` panels are lenses over a tinted backdrop;
+#: ``midnight`` panels are opaque and flat, which is what a dashboard card
+#: actually looks like.
+STYLES = {
+    "midnight": {
+        "glass": False,
+        "page": (10, 10, 12),
+        "panel": (23, 23, 26),
+        "panel_head": (28, 28, 32),
+        "border": (44, 44, 50),
+        "label": (139, 139, 149),
+        "value": (246, 246, 248),
+        "sub": (112, 112, 122),
+        "radius": 20,
+        "wash": 0.10,          # how much regime tint reaches the page
+    },
+    "glass": {
+        "glass": True,
+        "page": None,          # comes from the regime blobs
+        "panel": None,
+        "panel_head": None,
+        "border": (255, 255, 255),
+        "label": (170, 170, 180),
+        "value": (255, 255, 255),
+        "sub": (150, 150, 160),
+        "radius": 24,
+        "wash": 1.0,
+    },
+}
+DEFAULT_STYLE = "midnight"
 
 
 @dataclass(frozen=True)
@@ -124,12 +170,24 @@ class Field:
 
     ``hue`` is a key into ``HUES``, or a callable taking the Analysis and
     returning one — that is how net GEX colours itself by its own sign.
+    ``icon`` names the mark drawn in the tile's chip.
+
+    A ranked list — the top strikes, the magnet map — is not one number, so
+    it gets ``rows`` instead: a callable returning ``(left, right, hue)``
+    triples, drawn as a small table in place of the big value. Those tiles
+    also set ``span`` to take more than one grid column, because five rows
+    of "level … dollars … what it is" need the width.
     """
     key: str
     label: str
     value: object
     sub: object = None
-    hue: object = "sky"
+    hue: object = "slate"
+    icon: str = "dot"
+    rows: object = None
+    #: ``(strike, value)`` pairs drawn as vertical bars off a zero line.
+    bars: object = None
+    span: int = 1
 
 
 def _pct_of_spot(level, a: Analysis) -> str:
@@ -138,35 +196,188 @@ def _pct_of_spot(level, a: Analysis) -> str:
     return f"{(level / a.spot - 1) * 100:+.2f}% vs spot"
 
 
-#: The headline set. Extend this list to put another number on the card.
+#: The headline set — the default six, and the order they appear in.
 CARD_FIELDS = [
     Field("net_gex", "Net GEX / 1% move",
           lambda a: fmt_dollars(a.total_gex),
           lambda a: "positive = stabilizing" if a.total_gex >= 0 else "negative = amplifying",
-          hue=lambda a: "mint" if a.total_gex >= 0 else "rose"),
+          hue=lambda a: "mint" if a.total_gex >= 0 else "rose", icon="coin"),
     Field("flip", "Gamma flip",
           lambda a: f"{a.gamma_flip:,.2f}" if a.gamma_flip is not None else "—",
           lambda a: (_pct_of_spot(a.gamma_flip, a) +
                      (f" · {len(a.flip_levels)} crossings" if len(a.flip_levels or []) > 1 else ""))
           if a.gamma_flip is not None else "no crossing in ±15%",
-          hue="violet"),
+          hue="violet", icon="target"),
     Field("call_wall", "Call wall",
           lambda a: f"{a.call_wall:,.2f}",
-          lambda a: _pct_of_spot(a.call_wall, a), hue="mint"),
+          lambda a: _pct_of_spot(a.call_wall, a), hue="mint", icon="up"),
     Field("put_wall", "Put wall",
           lambda a: f"{a.put_wall:,.2f}",
-          lambda a: _pct_of_spot(a.put_wall, a), hue="rose"),
+          lambda a: _pct_of_spot(a.put_wall, a), hue="rose", icon="down"),
     Field("expected_move", "Expected move (1σ)",
           lambda a: f"±{a.expected_move:,.2f}" if a.expected_move is not None else "—",
           lambda a: f"into {a.nearest_expiry}" if a.expected_move is not None else "",
-          hue="amber"),
+          hue="amber", icon="range"),
     Field("max_pain", "Max pain",
           lambda a: f"{a.max_pain:,.2f}",
-          lambda a: _pct_of_spot(a.max_pain, a), hue="sky"),
+          lambda a: _pct_of_spot(a.max_pain, a), hue="sky", icon="pin"),
 ]
 
+DEFAULT_KEYS = [f.key for f in CARD_FIELDS]
 
-@lru_cache(maxsize=64)
+
+def _em_band(a: Analysis) -> str:
+    if a.expected_move is None:
+        return "—"
+    return f"{a.spot - a.expected_move:,.0f} – {a.spot + a.expected_move:,.0f}"
+
+
+def card_catalog(a: Analysis, *, oi=None, magnets=None,
+                 forecast=None) -> dict[str, Field]:
+    """Every tile this analysis can support, keyed by name.
+
+    The dashboard renders the keys as checkboxes; anything the current file
+    cannot answer is simply absent, so the picker never offers a number that
+    would come out as an em dash. Pass the optional analytics (OI walls,
+    magnet map, model forecast) to unlock the tiles that need them.
+    """
+    # The default six go in only where the book can answer them: the
+    # catalogue is what the dashboard's picker is built from, so an entry
+    # that would render as an em dash must not appear in it at all.
+    dead = set()
+    if a.gamma_flip is None:
+        dead |= {"flip"}
+    if a.expected_move is None:
+        dead |= {"expected_move"}
+    cat: dict[str, Field] = {f.key: f for f in CARD_FIELDS if f.key not in dead}
+
+    cat["spot"] = Field("spot", "Spot", lambda a: f"{a.spot:,.2f}",
+                        lambda a: f"{a.asof:%d %b %Y}", hue="slate", icon="dot")
+    cat["regime"] = Field(
+        "regime", "Regime",
+        lambda a: "LONG GAMMA" if a.regime == "long_gamma" else "SHORT GAMMA",
+        lambda a: THEMES[a.regime]["tagline"],
+        hue=lambda a: "mint" if a.regime == "long_gamma" else "rose", icon="flag")
+    cat["contracts"] = Field(
+        "contracts", "Contracts", lambda a: f"{a.n_contracts:,}",
+        lambda a: f"{len(a.expiries)} expiries · ×{a.multiplier:g}",
+        hue="slate", icon="stack")
+    cat["range_frame"] = Field(
+        "range_frame", "Wall-to-wall range",
+        lambda a: f"{a.put_wall:,.0f} – {a.call_wall:,.0f}",
+        lambda a: f"{(a.call_wall - a.put_wall) / a.spot * 100:.2f}% wide"
+        if a.spot else "", hue="sky", icon="range")
+    cat["dex"] = Field(
+        "dex", "Net dealer delta", lambda a: fmt_dollars(a.dex),
+        lambda a: "dealers long stock-equiv." if a.dex >= 0 else "dealers short stock-equiv.",
+        hue=lambda a: "mint" if a.dex >= 0 else "rose", icon="coin")
+    cat["vanna"] = Field(
+        "vanna", "Vanna flow / 1pt IV", lambda a: fmt_dollars(a.vanna_flow),
+        lambda a: "buying if IV falls" if a.vanna_flow >= 0 else "selling if IV falls",
+        hue=lambda a: "mint" if a.vanna_flow >= 0 else "rose", icon="bolt")
+    cat["charm"] = Field(
+        "charm", "Charm flow / day", lambda a: fmt_dollars(a.charm_flow),
+        lambda a: "buying from decay" if a.charm_flow >= 0 else "selling from decay",
+        hue=lambda a: "mint" if a.charm_flow >= 0 else "rose", icon="bolt")
+
+    if a.expected_move is not None:
+        cat["em_band"] = Field(
+            "em_band", "1σ range", _em_band,
+            lambda a: f"into {a.nearest_expiry}", hue="amber", icon="range")
+    if a.gamma_flip is not None and a.spot:
+        cat["flip_distance"] = Field(
+            "flip_distance", "Distance to flip",
+            lambda a: f"{(a.gamma_flip / a.spot - 1) * 100:+.2f}%",
+            lambda a: f"flip at {a.gamma_flip:,.2f}", hue="violet", icon="target")
+    if oi is not None and getattr(oi, "call", None) is not None:
+        cat["call_oi_wall"] = Field(
+            "call_oi_wall", "Call OI wall", lambda a, v=oi.call: f"{v:,.2f}",
+            lambda a, v=oi.call: _pct_of_spot(v, a), hue="mint", icon="wall")
+    if oi is not None and getattr(oi, "put", None) is not None:
+        cat["put_oi_wall"] = Field(
+            "put_oi_wall", "Put OI wall", lambda a, v=oi.put: f"{v:,.2f}",
+            lambda a, v=oi.put: _pct_of_spot(v, a), hue="rose", icon="wall")
+
+    if magnets is not None and len(magnets):
+        above = magnets[magnets["level"] > a.spot]
+        below = magnets[magnets["level"] < a.spot]
+        if len(above):
+            r = above.iloc[0]
+            cat["magnet_above"] = Field(
+                "magnet_above", "Magnet above",
+                lambda a, v=float(r["level"]): f"{v:,.2f}",
+                lambda a, v=float(r["level"]), k=str(r["kind"]),
+                s=float(r["strength"]): f"{k} · pull {s:.0f}",
+                hue="lime", icon="up")
+        if len(below):
+            r = below.iloc[-1]
+            cat["magnet_below"] = Field(
+                "magnet_below", "Magnet below",
+                lambda a, v=float(r["level"]): f"{v:,.2f}",
+                lambda a, v=float(r["level"]), k=str(r["kind"]),
+                s=float(r["strength"]): f"{k} · pull {s:.0f}",
+                hue="orange", icon="down")
+
+    # --- ranked lists ---------------------------------------------------
+    bs = a.by_strike
+    if bs is not None and len(bs):
+        top = bs.reindex(bs["net_gex"].abs().sort_values(ascending=False).index)
+        top = top.head(5)
+        if len(top):
+            cat["top_gex"] = Field(
+                "top_gex", "Top 5 GEX strikes",
+                lambda a, t=top: f"{float(t.iloc[0]['strike']):,.2f}",
+                lambda a, t=top: f"heaviest of {len(bs):,} strikes",
+                hue="sky", icon="wall", span=2,
+                rows=lambda a, t=top: [
+                    (f"{float(r['strike']):,.2f}",
+                     fmt_dollars(float(r["net_gex"])),
+                     "mint" if r["net_gex"] >= 0 else "rose")
+                    for _, r in t.iterrows()])
+
+    if bs is not None and len(bs) > 2 and a.spot:
+        # a window around spot, capped: forty bars is the most that stays
+        # legible across the card, and the ones far from spot are the ones
+        # that matter least
+        near = bs[(bs["strike"] >= a.spot * 0.92) & (bs["strike"] <= a.spot * 1.08)]
+        if len(near) < 5:
+            near = bs
+        if len(near) > 40:
+            near = near.reindex(
+                (near["strike"] - a.spot).abs().sort_values().index).head(40)
+        near = near.sort_values("strike")
+        cat["gex_bars"] = Field(
+            "gex_bars", "Net GEX by strike",
+            lambda a: fmt_dollars(a.total_gex),
+            lambda a, n=len(near): f"{n} strikes around spot · green stabilizes, red amplifies",
+            hue="sky", icon="bars", span=4,
+            bars=lambda a, t=near: [(float(r.strike), float(r.net_gex))
+                                    for r in t.itertuples()])
+
+    if magnets is not None and len(magnets):
+        top_m = magnets.head(5)
+        cat["magnets"] = Field(
+            "magnets", "Magnet map",
+            lambda a, t=top_m: f"{float(t.iloc[0]['level']):,.2f}",
+            lambda a, t=top_m: f"{len(t)} levels within ±10%",
+            hue="lime", icon="target", span=2,
+            rows=lambda a, t=top_m: [
+                (f"{float(r['level']):,.2f}",
+                 f"{str(r['kind'])[:11]} {float(r['strength']):.0f}",
+                 "lime" if str(r["kind"]).startswith("magnet") else "orange")
+                for _, r in t.iterrows()])
+
+    fmove = getattr(forecast, "blended_pct", None) if forecast is not None else None
+    if fmove is not None and getattr(forecast, "status", "") == "ok":
+        cat["forecast"] = Field(
+            "forecast", "Model next-session move",
+            lambda a, p=fmove: f"±{a.spot * p:,.2f}",
+            lambda a, w=getattr(forecast, "weight", 0.0): f"{w:.0%} model weight",
+            hue="fuchsia", icon="bolt")
+    return cat
+
+
+@lru_cache(maxsize=96)
 def _font(size: int, bold: bool = False) -> ImageFont.FreeTypeFont:
     for path in _MONO_CANDIDATES[bold]:
         try:
@@ -187,7 +398,7 @@ def _caps(s: str) -> str:
 
 
 def _mix(a, b, t: float):
-    """Blend two RGB triples — used to lighten an accent for body text."""
+    """Blend two RGB triples."""
     return tuple(int(a[i] + (b[i] - a[i]) * t) for i in range(3))
 
 
@@ -196,11 +407,9 @@ def _text(d: ImageDraw.ImageDraw, xy, s, font, fill, anchor="la"):
 
 
 def _tracked(d: ImageDraw.ImageDraw, xy, s, font, fill, track: float) -> float:
-    """Draw letter-spaced text and return its width.
-
-    Mono caps read as a label rather than a value once they are tracked out;
-    Pillow has no letter-spacing, so the glyphs are placed one at a time.
-    """
+    """Draw letter-spaced text and return its width. Mono caps read as a
+    label rather than a value once tracked out; Pillow has no letter
+    spacing, so the glyphs are placed one at a time."""
     x, y = xy
     for ch in s:
         d.text((x, y), ch, font=font, fill=fill, anchor="la")
@@ -211,143 +420,19 @@ def _tracked(d: ImageDraw.ImageDraw, xy, s, font, fill, track: float) -> float:
 def _fit(d: ImageDraw.ImageDraw, s: str, max_w: float, start: int,
          floor: int, bold: bool = False) -> ImageFont.FreeTypeFont:
     """Largest font from ``start`` down to ``floor`` that keeps ``s`` inside
-    ``max_w``. Mono is wide, so long index levels need this more than the
-    proportional face did."""
+    ``max_w``. Mono is wide, so long index levels need this."""
     size = start
     while size > floor and d.textlength(s, font=_font(size * SCALE, bold)) > max_w:
         size -= 1
     return _font(size * SCALE, bold)
 
 
-def _grain(w: int, h: int, strength: float = 3.5) -> Image.Image:
-    """Deterministic fine noise. Large flat gradients on a dark card band
-    badly once the PNG is re-compressed by a chat app; a couple of levels of
-    grain hides the steps and costs nothing visually."""
-    rng = np.random.default_rng(7)
-    n = rng.normal(0, strength, (h, w, 1)).repeat(3, axis=2)
-    return Image.fromarray(np.clip(n + 128, 0, 255).astype(np.uint8), "RGB")
-
-
-def _backdrop(w: int, h: int, theme: dict) -> Image.Image:
-    """A tinted gradient with soft colour blobs — the thing the glass has
-    to refract. Without something structured behind it, a blurred panel is
-    just grey."""
-    grad = Image.new("RGB", (1, h))
-    top, bot = theme["base"], tuple(int(c * 0.4) for c in theme["base"])
-    for y in range(h):
-        f = y / max(h - 1, 1)
-        grad.putpixel((0, y), tuple(int(top[i] + (bot[i] - top[i]) * f) for i in range(3)))
-    base = grad.resize((w, h))
-
-    blobs = Image.new("RGB", (w, h), (0, 0, 0))
-    bd = ImageDraw.Draw(blobs)
-    spots = [(0.14, 0.18, 0.44), (0.86, 0.26, 0.38), (0.52, 0.94, 0.48)]
-    for (cx, cy, r), colour in zip(spots, theme["blobs"]):
-        rr = int(min(w, h) * r)
-        bd.ellipse([cx * w - rr, cy * h - rr, cx * w + rr, cy * h + rr], fill=colour)
-    blobs = blobs.filter(ImageFilter.GaussianBlur(int(min(w, h) * 0.16)))
-    # keep it dark: the blobs are a tint over near-black, not a background
-    img = Image.blend(base, blobs, 0.44)
-
-    # vignette pulls the eye to the middle and keeps the corners near black
-    vig = Image.new("L", (w, h), 0)
-    ImageDraw.Draw(vig).ellipse(
-        [-w * 0.22, -h * 0.34, w * 1.22, h * 1.34], fill=255)
-    vig = vig.filter(ImageFilter.GaussianBlur(int(min(w, h) * 0.10)))
-    img = Image.composite(img, Image.new("RGB", (w, h), (0, 0, 0)), vig)
-
-    return ImageChops.overlay(img, _grain(w, h))
-
-
-def _rounded_mask(size, radius: int) -> Image.Image:
-    m = Image.new("L", size, 0)
-    ImageDraw.Draw(m).rounded_rectangle([0, 0, size[0] - 1, size[1] - 1],
-                                        radius=radius, fill=255)
-    return m
-
-
-def _glow(img: Image.Image, box, radius: int, colour, strength: float) -> None:
-    """Bleed the tile's accent into the backdrop behind it, in place.
-
-    This is the step that makes the glass read as coloured rather than
-    merely tinted: the light appears to come through the panel and land on
-    what is behind it. Added, not blended, so black stays black.
-    """
-    x0, y0, x1, y1 = (int(v) for v in box)
-    pad = int(radius * 1.6)
-    gx0, gy0 = max(x0 - pad, 0), max(y0 - pad, 0)
-    gx1, gy1 = min(x1 + pad, img.width), min(y1 + pad, img.height)
-    w, h = gx1 - gx0, gy1 - gy0
-    if w <= 2 or h <= 2:
-        return
-    layer = Image.new("RGB", (w, h), (0, 0, 0))
-    ImageDraw.Draw(layer).rounded_rectangle(
-        [x0 - gx0, y0 - gy0, x1 - gx0 - 1, y1 - gy0 - 1], radius=radius,
-        fill=tuple(int(c * strength) for c in colour))
-    layer = layer.filter(ImageFilter.GaussianBlur(pad * 0.7))
-    img.paste(ImageChops.add(img.crop((gx0, gy0, gx1, gy1)), layer), (gx0, gy0))
-
-
-def _glass(img: Image.Image, box, radius: int, *, blur: int = 26,
-           tint: int = 16, border: int = 62, highlight: int = 78,
-           accent=None) -> None:
-    """Frost the backdrop inside ``box`` and lay glass over it, in place.
-
-    The order matters: blur what is behind, lift it slightly, add a
-    translucent white fill, then the hairline border and the top specular
-    edge. Skipping the blur gives a sticker; skipping the highlight gives a
-    flat panel. ``accent`` tints the border and the bottom inner edge, so
-    the panel picks up the colour of the number it holds.
-    """
-    x0, y0, x1, y1 = (int(v) for v in box)
-    w, h = x1 - x0, y1 - y0
-    if w <= 2 or h <= 2:
-        return
-    mask = _rounded_mask((w, h), radius)
-
-    region = img.crop((x0, y0, x1, y1)).filter(ImageFilter.GaussianBlur(blur))
-    region = Image.blend(region, Image.new("RGB", (w, h), (255, 255, 255)), 0.026)
-    img.paste(region, (x0, y0), mask)
-
-    layer = Image.new("RGBA", (w, h), (0, 0, 0, 0))
-    ld = ImageDraw.Draw(layer)
-    ld.rounded_rectangle([0, 0, w - 1, h - 1], radius=radius,
-                         fill=(255, 255, 255, tint))
-    edge = _mix((255, 255, 255), accent, 0.55) if accent else (255, 255, 255)
-    ld.rounded_rectangle([0, 0, w - 1, h - 1], radius=radius,
-                         outline=edge + (border,), width=max(1, SCALE))
-    if accent:
-        # light that entered the top edge leaving at the bottom: an accent
-        # bloom rising off the lower edge. Drawn as fading lines rather than
-        # an arc — an arc inscribed in the panel is an ellipse the size of
-        # the panel, which crosses the middle of the tile instead of hugging
-        # its edge.
-        wash = max(min(h // 4, 26 * SCALE), 1)
-        for i in range(wash):
-            alpha = int(border * 0.72 * (1 - i / wash) ** 2)
-            ld.line([(0, h - 1 - i), (w - 1, h - 1 - i)], fill=accent + (alpha,))
-
-    # specular edge: brightest at the top, fading over ~a third of the panel
-    spec = Image.new("RGBA", (w, h), (0, 0, 0, 0))
-    sd = ImageDraw.Draw(spec)
-    span = max(h // 3, 1)
-    for i in range(span):
-        alpha = int(highlight * (1 - i / span) ** 2)
-        sd.line([(0, i), (w - 1, i)], fill=(255, 255, 255, alpha))
-    layer.alpha_composite(Image.composite(
-        spec, Image.new("RGBA", (w, h), (0, 0, 0, 0)), mask))
-    img.paste(Image.alpha_composite(
-        img.crop((x0, y0, x1, y1)).convert("RGBA"), layer).convert("RGB"),
-        (x0, y0), mask)
-
-
 def _paint_rgba(img: Image.Image, box, draw_fn) -> None:
     """Run ``draw_fn`` against a transparent overlay and composite it.
 
     An RGBA fill handed straight to a draw on an RGB canvas silently loses
-    its alpha, which paints translucent shapes solid — that is what once hid
-    the verdict label inside its own pill. ``box`` bounds the overlay:
-    compositing the full 2400x1350 canvas once per translucent shape is the
+    its alpha, which paints translucent shapes solid. ``box`` bounds the
+    overlay: compositing the full canvas once per translucent shape is the
     difference between a card that renders instantly and one that stalls a
     Streamlit rerun.
     """
@@ -363,41 +448,463 @@ def _paint_rgba(img: Image.Image, box, draw_fn) -> None:
         (x0, y0))
 
 
+# --------------------------------------------------------------------------
+# backdrops
+# --------------------------------------------------------------------------
+
+def _grain(w: int, h: int, strength: float = 3.5) -> Image.Image:
+    """Deterministic fine noise. Large flat gradients on a dark card band
+    badly once a chat app re-compresses the PNG; a couple of levels of grain
+    hides the steps and costs nothing visually."""
+    rng = np.random.default_rng(7)
+    n = rng.normal(0, strength, (h, w, 1)).repeat(3, axis=2)
+    return Image.fromarray(np.clip(n + 128, 0, 255).astype(np.uint8), "RGB")
+
+
+def _backdrop(w: int, h: int, theme: dict, style: dict) -> Image.Image:
+    """The page the panels sit on."""
+    if not style["glass"]:
+        # flat near-black with a faint centre lift and a whisper of regime
+        # tint, so the card still reads long/short before a digit is parsed
+        page = np.zeros((h, w, 3), dtype=np.float32)
+        page += np.asarray(style["page"], dtype=np.float32)
+        ys, xs = np.mgrid[0:h, 0:w].astype(np.float32)
+        r = np.hypot((xs - w / 2) / (w / 2), (ys - h / 2) / (h / 2))
+        lift = np.clip(1.0 - r / 1.35, 0, 1) ** 2
+        page += lift[..., None] * np.asarray(theme["accent"], dtype=np.float32) * style["wash"]
+        img = Image.fromarray(np.clip(page, 0, 255).astype(np.uint8), "RGB")
+        return ImageChops.overlay(img, _grain(w, h, 2.2))
+
+    grad = Image.new("RGB", (1, h))
+    top, bot = theme["base"], tuple(int(c * 0.4) for c in theme["base"])
+    for y in range(h):
+        f = y / max(h - 1, 1)
+        grad.putpixel((0, y), tuple(int(top[i] + (bot[i] - top[i]) * f) for i in range(3)))
+    base = grad.resize((w, h))
+
+    blobs = Image.new("RGB", (w, h), (0, 0, 0))
+    bd = ImageDraw.Draw(blobs)
+    spots = [(0.14, 0.18, 0.44), (0.86, 0.26, 0.38), (0.52, 0.94, 0.48)]
+    for (cx, cy, r), colour in zip(spots, theme["blobs"]):
+        rr = int(min(w, h) * r)
+        bd.ellipse([cx * w - rr, cy * h - rr, cx * w + rr, cy * h + rr], fill=colour)
+    blobs = blobs.filter(ImageFilter.GaussianBlur(int(min(w, h) * 0.16)))
+    img = Image.blend(base, blobs, 0.44)
+
+    vig = Image.new("L", (w, h), 0)
+    ImageDraw.Draw(vig).ellipse([-w * 0.22, -h * 0.34, w * 1.22, h * 1.34], fill=255)
+    vig = vig.filter(ImageFilter.GaussianBlur(int(min(w, h) * 0.10)))
+    img = Image.composite(img, Image.new("RGB", (w, h), (0, 0, 0)), vig)
+    return ImageChops.overlay(img, _grain(w, h))
+
+
+# --------------------------------------------------------------------------
+# panels
+# --------------------------------------------------------------------------
+
+def _sdf(w: int, h: int, radius: float, power: float = 4.0) -> np.ndarray:
+    """Signed distance, in pixels, to a squircle-cornered rounded rectangle.
+
+    Negative inside, zero on the edge, positive outside. Everything the
+    glass does is derived from this one field: the antialiased mask, the
+    depth-from-edge that drives refraction, and — through its gradient — the
+    surface normal that makes the highlight bend around the corners.
+    """
+    ys, xs = np.mgrid[0:h, 0:w].astype(np.float32)
+    qx = np.abs(xs - (w - 1) / 2.0) - (w / 2.0 - radius)
+    qy = np.abs(ys - (h - 1) / 2.0) - (h / 2.0 - radius)
+    corner = (np.maximum(qx, 0.0) ** power
+              + np.maximum(qy, 0.0) ** power) ** (1.0 / power)
+    return np.minimum(np.maximum(qx, qy), 0.0) + corner - radius
+
+
+def _sample(src: np.ndarray, xs: np.ndarray, ys: np.ndarray) -> np.ndarray:
+    """Bilinear lookup into an HxWx3 array at fractional coordinates."""
+    h, w = src.shape[:2]
+    fx = np.clip(xs, 0, w - 1.001)
+    fy = np.clip(ys, 0, h - 1.001)
+    x0, y0 = fx.astype(np.int32), fy.astype(np.int32)
+    x1, y1 = np.minimum(x0 + 1, w - 1), np.minimum(y0 + 1, h - 1)
+    ax, ay = (fx - x0)[..., None], (fy - y0)[..., None]
+    return (src[y0, x0] * (1 - ax) * (1 - ay) + src[y0, x1] * ax * (1 - ay)
+            + src[y1, x0] * (1 - ax) * ay + src[y1, x1] * ax * ay)
+
+
+def _glow(img: Image.Image, box, radius: int, colour, strength: float) -> None:
+    """Bleed a panel's accent into the backdrop behind it, in place. Added,
+    not blended, so black stays black."""
+    x0, y0, x1, y1 = (int(v) for v in box)
+    pad = int(radius * 1.6)
+    gx0, gy0 = max(x0 - pad, 0), max(y0 - pad, 0)
+    gx1, gy1 = min(x1 + pad, img.width), min(y1 + pad, img.height)
+    w, h = gx1 - gx0, gy1 - gy0
+    if w <= 2 or h <= 2:
+        return
+    layer = Image.new("RGB", (w, h), (0, 0, 0))
+    ImageDraw.Draw(layer).rounded_rectangle(
+        [x0 - gx0, y0 - gy0, x1 - gx0 - 1, y1 - gy0 - 1], radius=radius,
+        fill=tuple(int(c * strength) for c in colour))
+    layer = layer.filter(ImageFilter.GaussianBlur(pad * 0.7))
+    img.paste(ImageChops.add(img.crop((gx0, gy0, gx1, gy1)), layer), (gx0, gy0))
+
+
+def _glass_panel(img: Image.Image, box, radius: int, *, blur: int = 26,
+                 tint: int = 10, border: int = 78, highlight: int = 96,
+                 accent=None, thickness: float = 0.32) -> None:
+    """Lay a pane of glass over ``box``, in place.
+
+    A blurred crop with a bright top edge is a frosted sticker, not glass.
+    What makes something read as a solid transparent object is that it bends
+    what is behind it: near the rim the pane acts as a lens, so the backdrop
+    is dragged outward, colour-fringed by dispersion, and the highlight
+    tracks the curvature of the edge instead of running across the top.
+    """
+    x0, y0, x1, y1 = (int(v) for v in box)
+    w, h = x1 - x0, y1 - y0
+    if w <= 2 or h <= 2:
+        return
+
+    # crop with margin: the rim bends in what sits *outside* the panel, so
+    # the sampler needs real surroundings to reach for
+    reach = int(max(radius * 0.9, 16))
+    sx0, sy0 = max(x0 - reach, 0), max(y0 - reach, 0)
+    sx1, sy1 = min(x1 + reach, img.width), min(y1 + reach, img.height)
+    src = np.asarray(
+        img.crop((sx0, sy0, sx1, sy1)).filter(ImageFilter.GaussianBlur(blur)),
+        dtype=np.float32)
+
+    d = _sdf(w, h, float(radius))
+    depth = -d                                   # distance inward from the rim
+    cover = np.clip(0.5 - d, 0.0, 1.0)           # antialiased coverage
+    gy, gx = np.gradient(d)
+    glen = np.hypot(gx, gy) + 1e-6
+    nx, ny = gx / glen, gy / glen                # unit normal, pointing outward
+
+    # Keep the lensing band narrow — spread it over most of the panel and
+    # the tile stops looking like glass and starts looking embossed.
+    edge = max(radius * 0.55, 10.0)
+    lens = np.clip(1.0 - depth / edge, 0.0, 1.0) ** 2 * (radius * thickness)
+
+    ys, xs = np.mgrid[0:h, 0:w].astype(np.float32)
+    bx, by = xs + (x0 - sx0), ys + (y0 - sy0)
+    out = np.empty((h, w, 3), dtype=np.float32)
+    for ch, disp in ((0, 1.07), (1, 1.0), (2, 0.93)):   # chromatic aberration
+        out[..., ch] = _sample(src, bx + nx * lens * disp,
+                               by + ny * lens * disp)[..., ch]
+
+    out = out * (1.0 - 0.018) + 255.0 * 0.018            # a hint of milkiness
+    out = out * (1.0 - tint / 255.0) + 255.0 * (tint / 255.0)
+
+    # speculars from the normal: bright where the surface faces the light, a
+    # dimmer accent rim where it faces away. Because the normal rotates
+    # around the corners, so does the highlight.
+    lx, ly = -0.52, -0.85
+    facing = nx * lx + ny * ly
+    lit = np.clip(facing, 0.0, 1.0) ** 3.0 * np.exp(-depth / (edge * 0.32))
+    out += (lit * highlight)[..., None]
+    if accent:
+        rim = np.clip(-facing, 0.0, 1.0) ** 3.0 * np.exp(-depth / (edge * 0.35))
+        out += rim[..., None] * np.asarray(accent, dtype=np.float32) * 0.5
+
+    line = np.exp(-((depth - 1.0 * SCALE) / (1.4 * SCALE)) ** 2)
+    edge_rgb = np.asarray(_mix((255, 255, 255), accent, 0.5) if accent
+                          else (255, 255, 255), dtype=np.float32)
+    out += (line * (border / 255.0))[..., None] * edge_rgb
+
+    img.paste(Image.fromarray(np.clip(out, 0, 255).astype(np.uint8), "RGB"),
+              (x0, y0), Image.fromarray((cover * 255).astype(np.uint8), "L"))
+
+
+def _flat_panel(img: Image.Image, box, radius: int, style: dict, *,
+                fill=None, accent=None, wash: float = 0.0) -> None:
+    """An opaque dashboard card: solid fill, hairline border, and a single
+    lighter pixel along the top edge for the suggestion of a raised surface.
+
+    ``wash`` bleeds the accent across the panel from the left — used on the
+    header so the regime is legible without colouring every tile.
+    """
+    x0, y0, x1, y1 = (int(v) for v in box)
+    w, h = x1 - x0, y1 - y0
+    if w <= 2 or h <= 2:
+        return
+    body = fill or style["panel"]
+    panel = Image.new("RGB", (w, h), body)
+    if wash and accent:
+        grad = np.linspace(1.0, 0.0, w, dtype=np.float32)[None, :, None] ** 2
+        arr = np.asarray(panel, dtype=np.float32)
+        arr += grad * np.asarray(accent, dtype=np.float32) * wash
+        panel = Image.fromarray(np.clip(arr, 0, 255).astype(np.uint8), "RGB")
+
+    mask = Image.new("L", (w, h), 0)
+    ImageDraw.Draw(mask).rounded_rectangle([0, 0, w - 1, h - 1], radius=radius,
+                                           fill=255)
+    img.paste(panel, (x0, y0), mask)
+
+    _paint_rgba(img, box, lambda od, ox, oy: (
+        od.rounded_rectangle([0, 0, w - 1, h - 1], radius=radius,
+                             outline=style["border"] + (255,), width=SCALE),
+        od.line([(radius, SCALE // 2), (w - radius, SCALE // 2)],
+                fill=(255, 255, 255, 26), width=SCALE),
+    ))
+
+
+# --------------------------------------------------------------------------
+# icon marks
+# --------------------------------------------------------------------------
+
+def _icon(d: ImageDraw.ImageDraw, box, kind: str, colour) -> None:
+    """A small geometric mark inside the tile's chip.
+
+    Glyphs are drawn rather than typed: an emoji font is not guaranteed
+    anywhere this runs, and a missing glyph renders as a tofu box.
+    """
+    x0, y0, x1, y1 = box
+    cx, cy = (x0 + x1) / 2, (y0 + y1) / 2
+    r = (x1 - x0) * 0.30
+    lw = max(int(1.6 * SCALE), 2)
+    if kind == "up":
+        d.polygon([(cx, cy - r), (cx + r, cy + r * 0.7), (cx - r, cy + r * 0.7)],
+                  fill=colour)
+    elif kind == "down":
+        d.polygon([(cx, cy + r), (cx + r, cy - r * 0.7), (cx - r, cy - r * 0.7)],
+                  fill=colour)
+    elif kind == "target":
+        d.ellipse([cx - r, cy - r, cx + r, cy + r], outline=colour, width=lw)
+        d.ellipse([cx - r * 0.3, cy - r * 0.3, cx + r * 0.3, cy + r * 0.3], fill=colour)
+    elif kind == "range":
+        d.line([(cx - r, cy), (cx + r, cy)], fill=colour, width=lw)
+        d.line([(cx - r, cy - r * 0.6), (cx - r, cy + r * 0.6)], fill=colour, width=lw)
+        d.line([(cx + r, cy - r * 0.6), (cx + r, cy + r * 0.6)], fill=colour, width=lw)
+    elif kind == "pin":
+        d.ellipse([cx - r * 0.8, cy - r, cx + r * 0.8, cy + r * 0.6],
+                  outline=colour, width=lw)
+        d.line([(cx, cy + r * 0.4), (cx, cy + r)], fill=colour, width=lw)
+    elif kind == "coin":
+        d.ellipse([cx - r, cy - r, cx + r, cy + r], outline=colour, width=lw)
+        d.line([(cx, cy - r * 0.55), (cx, cy + r * 0.55)], fill=colour, width=lw)
+    elif kind == "bolt":
+        d.polygon([(cx + r * 0.4, cy - r), (cx - r * 0.6, cy + r * 0.15),
+                   (cx, cy + r * 0.15), (cx - r * 0.4, cy + r),
+                   (cx + r * 0.6, cy - r * 0.15), (cx, cy - r * 0.15)], fill=colour)
+    elif kind == "wall":
+        for i, f in enumerate((-0.62, 0.0, 0.62)):
+            d.line([(cx - r, cy + r * f), (cx + r, cy + r * f)],
+                   fill=colour, width=lw if i == 1 else max(lw - 1, 1))
+    elif kind == "stack":
+        for f in (-0.6, 0.0, 0.6):
+            d.rounded_rectangle([cx - r, cy + r * f - lw, cx + r, cy + r * f + lw],
+                                radius=lw, fill=colour)
+    elif kind == "flag":
+        d.line([(cx - r * 0.6, cy - r), (cx - r * 0.6, cy + r)], fill=colour, width=lw)
+        d.polygon([(cx - r * 0.6, cy - r), (cx + r, cy - r * 0.45),
+                   (cx - r * 0.6, cy + r * 0.1)], fill=colour)
+    elif kind == "bars":
+        for i, f in enumerate((-0.66, 0.0, 0.66)):
+            hh = r * (0.5 if i == 1 else 1.0)
+            d.rectangle([cx + r * f - lw * 0.9, cy + r - hh * 2,
+                         cx + r * f + lw * 0.9, cy + r], fill=colour)
+    else:                                    # dot
+        d.ellipse([cx - r * 0.55, cy - r * 0.55, cx + r * 0.55, cy + r * 0.55],
+                  fill=colour)
+
+
+def _draw_bars(d: ImageDraw.ImageDraw, box, data, spot: float, sty: dict) -> None:
+    """Net GEX by strike as vertical bars off a zero line.
+
+    The zero line is placed by the data, not at the middle: a book that is
+    long gamma nearly everywhere should show one shallow red stub below a
+    wall of green, and centring the axis would misrepresent that as a
+    balanced book. Bars take their colour from their own sign, and the spot
+    is marked so every bar is read as above or below where price is.
+    """
+    x0, y0, x1, y1 = box
+    if not data:
+        return
+    vals = [v for _, v in data]
+    hi, lo = max(max(vals), 0.0), min(min(vals), 0.0)
+    span = (hi - lo) or 1.0
+    zero_y = y0 + (hi / span) * (y1 - y0)
+    bw = (x1 - x0) / len(data)
+
+    for i, (k, v) in enumerate(data):
+        cx = x0 + (i + 0.5) * bw
+        tip = zero_y - (v / span) * (y1 - y0)
+        colour = HUES["mint"] if v >= 0 else HUES["rose"]
+        d.rectangle([cx - bw * 0.33, min(tip, zero_y),
+                     cx + bw * 0.33, max(tip, zero_y)], fill=colour)
+
+    d.line([(x0, zero_y), (x1, zero_y)], fill=sty["border"], width=SCALE)
+
+    # spot: a dotted rule at where price actually is
+    ks = [k for k, _ in data]
+    if spot and ks[0] <= spot <= ks[-1] and len(ks) > 1:
+        j = max(i for i, k in enumerate(ks) if k <= spot)
+        frac = ((spot - ks[j]) / (ks[j + 1] - ks[j])) if j + 1 < len(ks) else 0.0
+        sx = x0 + (j + 0.5 + frac) * bw
+        for yy in range(int(y0), int(y1), 8 * SCALE):
+            d.line([(sx, yy), (sx, yy + 4 * SCALE)], fill=sty["label"], width=SCALE)
+
+    f = _font(12 * SCALE)
+    _text(d, (x0, y1 + 6 * SCALE), f"{ks[0]:,.0f}", f, sty["sub"], "la")
+    _text(d, (x1, y1 + 6 * SCALE), f"{ks[-1]:,.0f}", f, sty["sub"], "ra")
+
+
+_DELTA = re.compile(r"^([+\-−][\d.,]+%?)(.*)$")
+
+
+def _draw_sub(d: ImageDraw.ImageDraw, xy, text: str, font, style: dict,
+              anchor: str = "ls") -> None:
+    """Draw a caption, colouring a leading signed number green or red.
+
+    The reference dashboards all do this: the delta is the only coloured
+    thing on an otherwise monochrome card, which is what makes it readable
+    at a glance.
+    """
+    m = _DELTA.match(text)
+    if not m:
+        _text(d, xy, text, font, style["sub"], anchor)
+        return
+    head, tail = m.group(1), m.group(2)
+    colour = HUES["rose"] if head[0] in "-−" else HUES["mint"]
+    x, y = xy
+    _text(d, (x, y), head, font, colour, anchor)
+    if tail:
+        _text(d, (x + d.textlength(head, font=font), y), tail, font,
+              style["sub"], anchor)
+
+
 def _hue_of(field: Field, a: Analysis) -> tuple:
     h = field.hue(a) if callable(field.hue) else field.hue
-    return HUES.get(h, HUES["sky"]) if isinstance(h, str) else tuple(h)
+    return HUES.get(h, HUES["slate"]) if isinstance(h, str) else tuple(h)
+
+
+@dataclass(frozen=True)
+class _Tile:
+    """A resolved tile: the Field's callables already applied to the book."""
+    label: str
+    value: object
+    sub: str
+    hue: tuple
+    icon: str
+    rows: list | None
+    span: int
+    bars: list | None = None
+
+
+def _tile_need(t: _Tile) -> float:
+    """How tall this tile wants to be.
+
+    A single number is happy at ``TILE_H``. A ranked list needs room for its
+    rows — squeezing five of them into a one-number tile shrinks the type
+    until the list is unreadable, which defeats the point of putting it on
+    the card.
+    """
+    if t.bars:
+        return BARS_H
+    if not t.rows:
+        return TILE_H
+    return 22 * SCALE + 30 * SCALE + 16 * SCALE + len(t.rows) * ROW_H + 22 * SCALE
+
+
+def _place(tiles: list) -> tuple[int, list, list]:
+    """Choose a column count and flow the tiles into it, honouring spans.
+
+    Returns ``(cols, [(row, col, span), ...], [row_height, ...])``. A tile
+    that will not fit in what is left of the current row starts the next
+    one, so a two-column list tile is never split across a boundary; each
+    row is then as tall as its tallest tile.
+    """
+    widest = max(t.span for t in tiles)
+    cells = sum(t.span for t in tiles)
+    cols = max(_COLS.get(cells, 4), widest)
+    places, r, c = [], 0, 0
+    for t in tiles:
+        span = min(t.span, cols)
+        if c + span > cols:
+            r, c = r + 1, 0
+        places.append((r, c, span))
+        c += span
+        if c >= cols:
+            r, c = r + 1, 0
+    n_rows = r + (1 if c else 0)
+    heights = [TILE_H] * n_rows
+    for t, (rr, _, _) in zip(tiles, places):
+        heights[rr] = max(heights[rr], _tile_need(t))
+    return cols, places, heights
 
 
 def build_share_card(a: Analysis, ticker: str = "", *,
                      extras: list | None = None,
                      fields: list | None = None,
-                     footnote: str = "") -> bytes:
+                     footnote: str = "",
+                     style: str = DEFAULT_STYLE,
+                     size: str = DEFAULT_SIZE,
+                     subtitle: str | None = None) -> bytes:
     """Render the headline read as a PNG and return its bytes.
 
-    ``fields`` overrides the tile set (defaults to ``CARD_FIELDS``);
-    ``extras`` appends ready-made ``(label, value, sub)`` tuples for
-    numbers that do not live on the Analysis — a dominant block type, a
-    model forecast, whatever gets added next. A fourth element may carry an
-    accent name from ``HUES``; without one the tiles cycle through
-    ``_EXTRA_HUES``.
+    ``fields`` is the tile set and its order (defaults to ``CARD_FIELDS``);
+    ``card_catalog`` builds the menu it is chosen from. ``extras`` appends
+    ready-made ``(label, value, sub[, hue])`` tuples for numbers that do not
+    live on the Analysis. ``style`` picks the look, ``subtitle`` overrides
+    the header's second line, ``footnote`` adds a line under the grid — all
+    of it driven from the dashboard's card controls.
     """
+    sty = STYLES.get(style, STYLES[DEFAULT_STYLE])
     theme = THEMES.get(a.regime, THEMES["long_gamma"])
-    w, h = CARD_W * SCALE, CARD_H * SCALE
     pad = 44 * SCALE
+    glass = sty["glass"]
+    rad = sty["radius"] * SCALE
 
-    img = _backdrop(w, h, theme)
-    ink = (255, 255, 255)
+    spec = fields if fields is not None else CARD_FIELDS
+    tiles = [_Tile(f.label, f.value(a), (f.sub(a) if f.sub else ""),
+                   _hue_of(f, a), f.icon,
+                   f.rows(a) if f.rows else None, max(1, f.span),
+                   f.bars(a) if f.bars else None)
+             for f in spec]
+    for i, extra in enumerate(extras or []):
+        lab, val, sb = extra[0], extra[1], (extra[2] if len(extra) > 2 else "")
+        hue = extra[3] if len(extra) > 3 else _EXTRA_HUES[i % len(_EXTRA_HUES)]
+        tiles.append(_Tile(lab, val, sb,
+                           HUES.get(hue, HUES["fuchsia"]) if isinstance(hue, str)
+                           else tuple(hue), "dot", None, 1))
+    if not tiles:
+        tiles = [_Tile("", "—", "", HUES["slate"], "dot", None, 1)]
+
+    # Column count avoids a lonely tile on the last row and keeps the grid
+    # wide rather than tall; the card then grows to fit the rows that fall
+    # out of it. A fixed canvas would either crop a nine-tile card or leave
+    # a lake of empty page under a three-tile one.
+    cols, places, row_h = _place(tiles)
+    head_h = 112 * SCALE
+    gap = 20 * SCALE
+    head_gap = 24 * SCALE
+    foot_h = 46 * SCALE if footnote else 0
+    w = SIZES.get(size, SIZES[DEFAULT_SIZE]) * SCALE
+    h = int(pad + head_h + head_gap + sum(row_h) + (len(row_h) - 1) * gap
+            + foot_h + pad)
+    tw = (w - 2 * pad - gap * (cols - 1)) / cols
+    # y of each grid row, so a tall list row pushes what follows it down
+    row_y = []
+    _y = pad + head_h + head_gap
+    for rh in row_h:
+        row_y.append(_y)
+        _y += rh + gap
+
+    img = _backdrop(w, h, theme, sty)
 
     # --- header ---------------------------------------------------------
-    head_h = 112 * SCALE
     head_box = (pad, pad, w - pad, pad + head_h)
-    _glow(img, head_box, 28 * SCALE, theme["accent"], 0.16)
-    _glass(img, head_box, 28 * SCALE, blur=30, accent=theme["accent"])
+    if glass:
+        _glow(img, head_box, rad, theme["accent"], 0.16)
+        _glass_panel(img, head_box, rad, blur=30, accent=theme["accent"])
+    else:
+        _flat_panel(img, head_box, rad, sty, fill=sty["panel_head"],
+                    accent=theme["accent"], wash=0.11)
     d = ImageDraw.Draw(img)
     hx, hy = pad + 32 * SCALE, pad + head_h // 2
     label = (ticker or "").upper().strip() or "OPTIONS BOOK"
     tf = _font(38 * SCALE, True)
-    _text(d, (hx, hy - 20 * SCALE), label, tf, ink, "lm")
+    _text(d, (hx, hy - 20 * SCALE), label, tf, sty["value"], "lm")
     lw = d.textlength(label, font=tf)
     _text(d, (hx + lw + 20 * SCALE, hy - 19 * SCALE), f"{a.spot:,.2f}",
           _font(29 * SCALE, True), theme["accent"], "lm")
@@ -405,17 +912,20 @@ def build_share_card(a: Analysis, ticker: str = "", *,
     inst = detect_instrument(ticker)
     # the multiplier changes every dollar figure on the card, so it is stated
     # rather than assumed: an NQ card and a QQQ card are otherwise identical
-    mult = a.multiplier
-    inst_bit = f"{inst.name} · ×{mult:g}" if inst.root else f"×{mult:g} per contract"
-    sub = f"{inst_bit} · {a.asof:%d %b %Y} · {a.n_contracts:,} contracts"
-    _text(d, (hx, hy + 25 * SCALE), sub,
-          _fit(d, sub, w - 2 * pad - 300 * SCALE, 16, 11),
-          _mix((255, 255, 255), theme["accent"], 0.35), "lm")
+    if subtitle is None:
+        inst_bit = (f"{inst.name} · ×{a.multiplier:g}" if inst.root
+                    else f"×{a.multiplier:g} per contract")
+        subtitle = f"{inst_bit} · {a.asof:%d %b %Y} · {a.n_contracts:,} contracts"
+    if subtitle:
+        _text(d, (hx, hy + 25 * SCALE), subtitle,
+              _fit(d, subtitle, w - 2 * pad - 300 * SCALE, 16, 11),
+              sty["label"], "lm")
 
     # verdict pill, right-aligned in the header
     vtxt = theme["verdict"]
     vf = _font(21 * SCALE, True)
-    vw = d.textlength(vtxt, font=vf) + 3 * 1.6 * SCALE + 40 * SCALE
+    track = 1.6 * SCALE
+    vw = d.textlength(vtxt, font=vf) + 3 * track + 40 * SCALE
     vx1 = w - pad - 30 * SCALE
     vy0 = pad + head_h // 2 - 40 * SCALE
     pill = (vx1 - vw, vy0, vx1, vy0 + 44 * SCALE)
@@ -424,91 +934,101 @@ def build_share_card(a: Analysis, ticker: str = "", *,
         radius=22 * SCALE, fill=theme["accent"] + (54,),
         outline=theme["accent"] + (215,), width=max(2, SCALE)))
     d = ImageDraw.Draw(img)
-    pw = d.textlength(vtxt, font=vf) + 3 * 1.6 * SCALE
+    pw = d.textlength(vtxt, font=vf) + 3 * track
     _tracked(d, ((pill[0] + pill[2]) / 2 - pw / 2,
                  (pill[1] + pill[3]) / 2 - 13 * SCALE),
-             vtxt, vf, theme["accent"], 1.6 * SCALE)
-    # tagline sits inside the header panel, not below it
+             vtxt, vf, theme["accent"], track)
     tag = theme["tagline"]
     _text(d, (vx1, pad + head_h - 24 * SCALE), tag,
-          _fit(d, tag, w / 2 - 40 * SCALE, 15, 10),
-          _mix((235, 235, 245), theme["accent"], 0.28), "rs")
+          _fit(d, tag, w / 2 - 40 * SCALE, 15, 10), sty["sub"], "rs")
 
     # --- tiles ----------------------------------------------------------
-    spec = fields if fields is not None else CARD_FIELDS
-    tiles = [(f.label, f.value(a), (f.sub(a) if f.sub else ""), _hue_of(f, a))
-             for f in spec]
-    for i, extra in enumerate(extras or []):
-        lab, val, sb = extra[0], extra[1], (extra[2] if len(extra) > 2 else "")
-        hue = extra[3] if len(extra) > 3 else _EXTRA_HUES[i % len(_EXTRA_HUES)]
-        tiles.append((lab, val, sb, HUES.get(hue, HUES["fuchsia"])
-                      if isinstance(hue, str) else tuple(hue)))
-
-    # Column count is chosen to avoid a lonely tile on the last row and to
-    # keep the grid at two rows for as long as it can: a third row cuts tile
-    # height by a third, and it is height that decides whether the value can
-    # be set large enough to read at chat-thumbnail size.
-    cols = _COLS.get(len(tiles), 4)
-    rows = max(1, math.ceil(len(tiles) / cols))
-    top = pad + head_h + 24 * SCALE
-    foot_h = 46 * SCALE
-    grid_h = h - top - pad - foot_h
-    gap = 20 * SCALE
-    tw = (w - 2 * pad - gap * (cols - 1)) / cols
-    th = (grid_h - gap * (rows - 1)) / rows
-
-    for i, (lab, val, sb, hue) in enumerate(tiles):
-        r, c = divmod(i, cols)
+    for t, (r, c, span) in zip(tiles, places):
+        lab, val, sb, hue, icon = t.label, t.value, t.sub, t.hue, t.icon
         x0 = pad + c * (tw + gap)
-        y0 = top + r * (th + gap)
-        box = (x0, y0, x0 + tw, y0 + th)
-        _glow(img, box, 24 * SCALE, hue, 0.13)
-        _glass(img, box, 24 * SCALE, accent=hue)
+        y0 = row_y[r]
+        th = row_h[r]
+        tile_w = span * tw + (span - 1) * gap
+        box = (x0, y0, x0 + tile_w, y0 + th)
+        if glass:
+            _glow(img, box, rad, hue, 0.13)
+            _glass_panel(img, box, rad, accent=hue)
+        else:
+            _flat_panel(img, box, rad, sty)
         d = ImageDraw.Draw(img)
-        cx = x0 + 26 * SCALE
+        cx = x0 + 24 * SCALE
         # everything inside the tile is placed as a fraction of its height:
         # a seventh tile pushes the grid to a third row, and fixed offsets
-        # then stack the label, the value and the caption on top of one
-        # another instead of shrinking with the box
+        # then stack the label, the value and the caption on each other
         inset = min(22 * SCALE, th * 0.11)
 
-        # accent rule above the label — the tile's colour stated as a mark of
-        # its own, so the hue is not the only thing carrying it
-        ry = y0 + inset
-        rule = (cx, ry, cx + 26 * SCALE, ry + 3 * SCALE)
-        _paint_rgba(img, rule, lambda od, ox, oy, r=rule, c=hue: od.rounded_rectangle(
-            [r[0] - ox, r[1] - oy, r[2] - ox - 1, r[3] - oy - 1],
-            radius=SCALE, fill=c + (235,)))
+        # chip + label on one row, the way a dashboard card opens
+        chip = 30 * SCALE
+        cbox = (cx, y0 + inset, cx + chip, y0 + inset + chip)
+        _paint_rgba(img, cbox, lambda od, ox, oy, b=cbox, c=hue: od.rounded_rectangle(
+            [b[0] - ox, b[1] - oy, b[2] - ox - 1, b[3] - oy - 1],
+            radius=9 * SCALE, fill=c + (34,), outline=c + (92,), width=max(1, SCALE)))
+        _paint_rgba(img, cbox, lambda od, ox, oy, b=cbox, c=hue, k=icon: _icon(
+            od, (b[0] - ox, b[1] - oy, b[2] - ox, b[3] - oy), k, c + (255,)))
         d = ImageDraw.Draw(img)
-        _tracked(d, (cx, ry + 12 * SCALE), _caps(str(lab)),
-                 _font(13 * SCALE, True), hue + (215,), 1.1 * SCALE)
+        _tracked(d, (cx + chip + 12 * SCALE, y0 + inset + chip / 2 - 7 * SCALE),
+                 _caps(str(lab)), _font(13 * SCALE, True), sty["label"], 1.1 * SCALE)
 
-        # the value gets whatever vertical room is left between the label and
-        # the caption, so it is capped by height as well as by width
-        val = str(val)
-        cap_h = (18 * SCALE if sb else 0)
-        room = th - inset - 34 * SCALE - cap_h
-        vfont = _fit(d, val, tw - 52 * SCALE,
-                     max(int(min(36, room / SCALE * 0.62)), 16), 15, bold=True)
-        _text(d, (cx, ry + 34 * SCALE + (room - cap_h * 0.2) / 2), val, vfont,
-              _mix(ink, hue, 0.22), "lm")
-        if sb:
-            sb = str(sb)
-            _text(d, (cx, y0 + th - inset), sb,
-                  _fit(d, sb, tw - 44 * SCALE, 14, 9),
-                  (255, 255, 255, 150), "ls")
+        # Value and caption stack down from the label row rather than
+        # floating in the middle of the panel — the reading order is
+        # label, number, delta, and centring the number breaks it.
+        vy = y0 + inset + chip + 16 * SCALE
+        room = th - (vy - y0) - inset
+
+        if t.bars:
+            _draw_bars(d, (cx, vy, x0 + tile_w - 24 * SCALE,
+                           y0 + th - inset - 20 * SCALE),
+                       t.bars, a.spot, sty)
+            if sb:
+                _draw_sub(d, (x0 + tile_w - 24 * SCALE, y0 + inset + chip / 2 + 5 * SCALE),
+                          str(sb), _font(13 * SCALE), sty, "rm")
+        elif t.rows:
+            # a ranked list: level on the left, the number that ranks it on
+            # the right, its own colour on the number. Row height comes from
+            # the room left over so the list never overruns the panel.
+            # a fixed rhythm, not room/n: two list tiles side by side must
+            # share a baseline grid, and a three-row list dividing the same
+            # room as a five-row one drifts out of step with it
+            n = len(t.rows)
+            rh = min(ROW_H, room / max(n, 1))
+            rf = _font(max(int(min(15, rh / SCALE * 0.62)), 9) * SCALE)
+            rb = _font(rf.size, True)
+            for j, row in enumerate(t.rows):
+                left, right = str(row[0]), str(row[1])
+                rhue = row[2] if len(row) > 2 else None
+                colour = (HUES.get(rhue, hue) if isinstance(rhue, str)
+                          else (tuple(rhue) if rhue else hue))
+                ry = vy + j * rh + rh / 2
+                _text(d, (cx, ry), left, rb, sty["value"], "lm")
+                _text(d, (x0 + tile_w - 24 * SCALE, ry), right, rf, colour, "rm")
+        else:
+            val = str(val)
+            cap_h = 22 * SCALE if sb else 0
+            vsize = max(int(min(38, (room - cap_h) / SCALE * 0.86)), 15)
+            vfont = _fit(d, val, tile_w - 48 * SCALE, vsize, 15, bold=True)
+            _text(d, (cx, vy), val, vfont, sty["value"], "la")
+            if sb:
+                sb = str(sb)
+                _draw_sub(d, (cx, vy + vfont.size * 1.16 + 10 * SCALE), sb,
+                          _fit(d, sb, tile_w - 44 * SCALE, 14, 9), sty, "la")
 
     # --- footer ---------------------------------------------------------
-    d = ImageDraw.Draw(img)
-    note = footnote or "positioning analysis from the option book — not trading advice"
-    dot = (pad + 4 * SCALE, h - pad + 1 * SCALE,
-           pad + 11 * SCALE, h - pad + 8 * SCALE)
-    _paint_rgba(img, dot, lambda od, ox, oy: od.ellipse(
-        [dot[0] - ox, dot[1] - oy, dot[2] - ox - 1, dot[3] - oy - 1],
-        fill=theme["accent"] + (230,)))
-    d = ImageDraw.Draw(img)
-    _text(d, (pad + 22 * SCALE, h - pad + 9 * SCALE), note, _font(14 * SCALE),
-          (255, 255, 255, 140), "ls")
+    # Nothing by default: the card is the numbers. A caller that wants a
+    # line under them passes ``footnote``.
+    if footnote:
+        dot = (pad + 4 * SCALE, h - pad + 1 * SCALE,
+               pad + 11 * SCALE, h - pad + 8 * SCALE)
+        _paint_rgba(img, dot, lambda od, ox, oy: od.ellipse(
+            [dot[0] - ox, dot[1] - oy, dot[2] - ox - 1, dot[3] - oy - 1],
+            fill=theme["accent"] + (230,)))
+        d = ImageDraw.Draw(img)
+        _text(d, (pad + 22 * SCALE, h - pad + 9 * SCALE), footnote,
+              _font(14 * SCALE), sty["sub"], "ls")
 
     buf = io.BytesIO()
     # compress_level=6 rather than optimize=True: the grain makes the card
@@ -516,6 +1036,22 @@ def build_share_card(a: Analysis, ticker: str = "", *,
     # to save 4% — long enough to be felt on every Streamlit rerun.
     img.save(buf, format="PNG", compress_level=6)
     return buf.getvalue()
+
+
+def card_size(n_tiles: int, footnote: str = "",
+              size: str = DEFAULT_SIZE) -> tuple[int, int]:
+    """The pixel size a card with ``n_tiles`` tiles will come out at.
+
+    Exposed so a caller can reserve layout for the picture — and so a test
+    can state the height rule rather than hard-coding a number.
+    """
+    n = max(1, n_tiles)
+    _, _, row_h = _place([_Tile("", "", "", HUES["slate"], "dot", None, 1)] * n)
+    w = SIZES.get(size, SIZES[DEFAULT_SIZE]) * SCALE
+    pad, head_h, gap, head_gap = 44 * SCALE, 112 * SCALE, 20 * SCALE, 24 * SCALE
+    foot_h = 46 * SCALE if footnote else 0
+    return (w, int(pad + head_h + head_gap + sum(row_h) + (len(row_h) - 1) * gap
+                   + foot_h + pad))
 
 
 def card_filename(a: Analysis, ticker: str = "") -> str:

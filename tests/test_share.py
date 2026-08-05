@@ -1,5 +1,6 @@
 """The shareable card: a real PNG, driven by a field list."""
 
+import copy
 import io
 import math
 from datetime import date
@@ -12,9 +13,11 @@ from PIL import Image
 from dealer_gex.analytics import analyze
 from dealer_gex.parsing import read_chain
 from dealer_gex.share import (
-    CARD_FIELDS, CARD_H, CARD_W, HUES, SCALE, THEMES, Field,
-    build_share_card, card_filename,
+    CARD_FIELDS, DEFAULT_SIZE, HUES, SCALE, SIZES, THEMES, Field,
+    build_share_card, card_catalog, card_filename, card_size,
 )
+
+CARD_W = SIZES[DEFAULT_SIZE]
 
 ASOF = date(2026, 7, 17)
 
@@ -34,7 +37,8 @@ def test_card_is_a_real_png_at_the_declared_size(sample):
     assert png[:8] == b"\x89PNG\r\n\x1a\n"
     im = _open(png)
     assert im.format == "PNG"
-    assert im.size == (CARD_W * SCALE, CARD_H * SCALE)
+    assert im.size == card_size(len(CARD_FIELDS))
+    assert im.width == CARD_W * SCALE
 
 
 def test_card_is_not_a_flat_rectangle(sample):
@@ -45,6 +49,14 @@ def test_card_is_not_a_flat_rectangle(sample):
     colours = {small.getpixel((x, y)) for x in range(60) for y in range(34)}
     assert len(colours) > 300          # a gradient plus blurred blobs
     assert im.getextrema()[0][1] > 200  # something bright: the text and glass
+
+
+def test_the_default_keys_are_all_offered(sample):
+    """DEFAULT_KEYS seeds the picker, so every one of them has to resolve
+    against a catalogue built from a book that can answer them."""
+    from dealer_gex.share import DEFAULT_KEYS
+    cat = card_catalog(sample)
+    assert [k for k in DEFAULT_KEYS if k in cat] == DEFAULT_KEYS
 
 
 def test_regime_picks_the_palette(sample):
@@ -64,10 +76,10 @@ def test_regime_picks_the_palette(sample):
 
 def test_tiles_come_from_the_field_list(sample):
     """Adding a number to the card has to be one entry, not a layout edit."""
-    one = build_share_card(sample, "SPY", fields=CARD_FIELDS[:1])
-    six = build_share_card(sample, "SPY", fields=CARD_FIELDS)
-    assert one != six
-    assert _open(one).size == _open(six).size      # the grid reflows, not the card
+    one = _open(build_share_card(sample, "SPY", fields=CARD_FIELDS[:1]))
+    six = _open(build_share_card(sample, "SPY", fields=CARD_FIELDS))
+    assert one.width == six.width == CARD_W * SCALE   # the width is the frame
+    assert one.height < six.height                    # the height follows the rows
 
 
 def test_extras_append_without_touching_the_defaults(sample):
@@ -87,12 +99,13 @@ def test_a_custom_field_renders(sample):
 
 def test_missing_numbers_do_not_break_the_card(sample):
     """A book with no flip and no expected move still has to produce a card."""
-    object.__setattr__(sample, "gamma_flip", None)
-    object.__setattr__(sample, "flip_levels", [])
-    object.__setattr__(sample, "expected_move", None)
-    object.__setattr__(sample, "nearest_expiry", None)
-    png = build_share_card(sample, "SPY")
-    assert _open(png).size == (CARD_W * SCALE, CARD_H * SCALE)
+    blank = copy.copy(sample)
+    object.__setattr__(blank, "gamma_flip", None)
+    object.__setattr__(blank, "flip_levels", [])
+    object.__setattr__(blank, "expected_move", None)
+    object.__setattr__(blank, "nearest_expiry", None)
+    png = build_share_card(blank, "SPY")
+    assert _open(png).size == card_size(len(CARD_FIELDS))
 
 
 def test_rendering_is_deterministic(sample):
@@ -103,7 +116,7 @@ def test_long_values_are_shrunk_to_fit(sample):
     """A 12-digit index level must not run out of its tile."""
     wide = build_share_card(sample, "SPY", fields=[
         Field("x", "Huge", lambda a: "1,234,567,890.12", None)])
-    assert _open(wide).size == (CARD_W * SCALE, CARD_H * SCALE)
+    assert _open(wide).size == card_size(1)
 
 
 def test_filename_carries_ticker_and_date(sample):
@@ -202,11 +215,169 @@ def test_a_seventh_tile_does_not_collide_with_the_caption(sample):
     """Tile internals are placed as a fraction of tile height; a fixed
     offset stacks the value on the caption once the grid reflows."""
     png = build_share_card(sample, "SPY", extras=[
-        ("Block book", "M2M FLR", "78% of block premium")])
-    assert _open(png).size == (CARD_W * SCALE, CARD_H * SCALE)
+        ("Extra", "M2M FLR", "78% of block premium")])
+    assert _open(png).size == card_size(len(CARD_FIELDS) + 1)
 
 
 def test_extras_may_name_their_own_accent(sample):
     a = build_share_card(sample, "SPY", extras=[("X", "1", "", "lime")])
     b = build_share_card(sample, "SPY", extras=[("X", "1", "", "orange")])
     assert a != b
+
+
+def test_the_catalog_only_offers_numbers_the_file_can_answer(sample):
+    """The picker is built from this, so an entry that would render as an em
+    dash must not be in it."""
+    from dealer_gex.analytics import magnet_levels, oi_walls
+    cat = card_catalog(sample, oi=oi_walls(sample), magnets=magnet_levels(sample))
+    assert set(CARD_FIELDS[i].key for i in range(len(CARD_FIELDS))) <= set(cat)
+    assert len(cat) > len(CARD_FIELDS)          # more than the default six
+    for key, f in cat.items():
+        assert f.key == key                     # keyed by its own name
+        assert str(f.value(sample)) != "—"
+
+
+def test_the_catalog_drops_tiles_whose_inputs_are_missing(sample):
+    blank = copy.copy(sample)
+    object.__setattr__(blank, "expected_move", None)
+    object.__setattr__(blank, "gamma_flip", None)
+    cat = card_catalog(blank)
+    assert "em_band" not in cat                 # needs an expected move
+    assert "flip_distance" not in cat           # needs a flip
+    assert "call_oi_wall" not in cat            # needs the OI walls passed in
+    assert "flip" not in cat                    # and neither of the defaults
+    assert "expected_move" not in cat
+    assert "max_pain" in cat                    # the answerable ones stay
+
+
+def test_every_style_renders_and_they_differ(sample):
+    from dealer_gex.share import STYLES
+    seen = {name: build_share_card(sample, "SPY", style=name) for name in STYLES}
+    for png in seen.values():
+        assert png[:8] == b"\x89PNG\r\n\x1a\n"
+    assert len(set(seen.values())) == len(STYLES)
+
+
+def test_the_card_stays_dark_in_every_style(sample):
+    from dealer_gex.share import STYLES
+    for name in STYLES:
+        px = np.asarray(_open(build_share_card(sample, "SPY", style=name)
+                              ).convert("L"), dtype=float)
+        assert px.mean() < 70, name
+        assert px.max() > 230, name
+
+
+def test_title_subtitle_and_footnote_are_the_callers(sample):
+    plain = build_share_card(sample, "SPY")
+    assert build_share_card(sample, "SPY", subtitle="my own line") != plain
+    assert build_share_card(sample, "SPY", footnote="desk note") != plain
+    # a footnote adds a footer band, so the card grows
+    assert (_open(build_share_card(sample, "SPY", footnote="x")).height
+            > _open(plain).height)
+
+
+def test_a_signed_caption_is_coloured_by_its_sign():
+    """The delta is the only coloured text on a midnight tile — that is what
+    makes it readable at a glance, so the sign has to drive it."""
+    from dealer_gex.share import _DELTA
+    assert _DELTA.match("+3.21% vs spot").group(1) == "+3.21%"
+    assert _DELTA.match("-4.44% vs spot").group(1) == "-4.44%"
+    assert _DELTA.match("positive = stabilizing") is None
+
+
+def test_no_row_is_left_with_a_single_straggler():
+    """A last row holding one tile out of four reads as a mistake."""
+    from dealer_gex.share import _COLS
+    for n in range(2, 13):
+        cols = _COLS.get(n, 4)
+        last = n % cols or cols
+        assert last > 1 or n == 1, (n, cols, last)
+
+
+def test_ranked_list_tiles_are_offered_and_render(sample):
+    """Top-5 GEX strikes and the magnet map are lists, not single numbers."""
+    from dealer_gex.analytics import magnet_levels
+    cat = card_catalog(sample, magnets=magnet_levels(sample))
+    assert "top_gex" in cat and "magnets" in cat
+    for key in ("top_gex", "magnets"):
+        f = cat[key]
+        assert f.span == 2                       # a list needs the width
+        rows = f.rows(sample)
+        assert 1 <= len(rows) <= 5
+        assert all(len(r) == 3 for r in rows)    # left, right, hue
+    png = build_share_card(sample, "SPY",
+                           fields=[cat["top_gex"], cat["magnets"]])
+    assert png[:8] == b"\x89PNG\r\n\x1a\n"
+
+
+def test_top_gex_strikes_are_the_heaviest_ones(sample):
+    """Ranked by absolute net GEX — a big negative strike matters as much as
+    a big positive one, and sorting signed would bury it."""
+    cat = card_catalog(sample)
+    got = [float(r[0].replace(",", "")) for r in cat["top_gex"].rows(sample)]
+    bs = sample.by_strike
+    want = list(bs.reindex(bs["net_gex"].abs().sort_values(ascending=False).index)
+                .head(5)["strike"].astype(float))
+    assert got == want
+
+
+def test_a_list_tile_gets_a_taller_row(sample):
+    """Five rows squeezed into a one-number tile shrink the type until the
+    list is unreadable, which defeats putting it on the card."""
+    from dealer_gex.share import TILE_H, _place, _Tile
+    plain = _Tile("x", "1", "", HUES["slate"], "dot", None, 1)
+    listy = _Tile("y", "1", "", HUES["slate"], "dot", [("a", "b", "mint")] * 5, 2)
+    _, _, heights = _place([plain, listy])
+    assert heights[0] > TILE_H
+
+
+def test_a_wide_tile_is_never_split_across_a_row(sample):
+    from dealer_gex.share import _place, _Tile
+    plain = _Tile("x", "1", "", HUES["slate"], "dot", None, 1)
+    wide = _Tile("y", "1", "", HUES["slate"], "dot", [("a", "b")], 2)
+    cols, places, _ = _place([plain, plain, plain, wide])
+    for (r, c, span), t in zip(places, [plain, plain, plain, wide]):
+        assert c + span <= cols                  # fits in the row it starts
+
+
+def test_the_gex_bar_tile_is_offered_and_renders(sample):
+    cat = card_catalog(sample)
+    assert "gex_bars" in cat
+    f = cat["gex_bars"]
+    bars = f.bars(sample)
+    assert 5 <= len(bars) <= 40             # capped so the bars stay legible
+    assert all(len(b) == 2 for b in bars)
+    assert bars == sorted(bars)             # strike-ordered, left to right
+    png = build_share_card(sample, "SPY", fields=[f])
+    assert png[:8] == b"\x89PNG\r\n\x1a\n"
+
+
+def test_the_bar_tile_gets_a_chart_sized_row(sample):
+    from dealer_gex.share import BARS_H, TILE_H, _place, _Tile
+    bar = _Tile("g", "1", "", HUES["sky"], "bars", None, 4, [(1.0, 2.0)])
+    _, _, heights = _place([bar])
+    assert heights[0] == BARS_H > TILE_H
+
+
+def test_every_size_renders_at_its_declared_width(sample):
+    from dealer_gex.share import SIZES
+    for name, px in SIZES.items():
+        im = _open(build_share_card(sample, "SPY", size=name))
+        assert im.width == px * SCALE, name
+        assert im.size == card_size(len(CARD_FIELDS), size=name)
+
+
+def test_the_zero_line_follows_the_data_not_the_middle():
+    """A book that is long gamma nearly everywhere should show one shallow
+    red stub under a wall of green — centring the axis would draw that as a
+    balanced book."""
+    from PIL import Image as _I, ImageDraw as _D
+    from dealer_gex.share import STYLES, _draw_bars
+    im = _I.new("RGB", (200, 100), (0, 0, 0))
+    d = _D.Draw(im)
+    _draw_bars(d, (0, 0, 200, 100), [(1.0, 10.0), (2.0, 9.0), (3.0, -1.0)],
+               2.0, STYLES["midnight"])
+    px = np.asarray(im.convert("L"), dtype=float)
+    lit = np.flatnonzero(px.max(axis=1) > 20)
+    # most of the ink sits above the zero line, which is low in the frame
+    assert lit.size and np.median(lit) < 60
