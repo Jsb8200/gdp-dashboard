@@ -76,6 +76,128 @@ SYNONYMS = {
 }
 
 
+# --- futures / underlying candles -------------------------------------------
+#
+# OHLC exports carry a local wall-clock stamp with no zone on it. A futures
+# feed quoted in IST and an options tape stamped in UTC are the same session
+# five and a half hours apart, so a naive join silently misfiles every bar:
+# 19:15 IST is 09:45 New York, the open — not 19:15 anything.
+OHLC_TZ_DEFAULT = "Asia/Kolkata"          # IST, UTC+05:30
+SESSION_TZ_DEFAULT = "America/New_York"   # the session the option book trades
+
+# A combined stamp, a calendar date and a time-of-day are three different
+# things and two of them are spelled "time". Keeping the vocabularies
+# disjoint stops a "Date" column claiming the slot a "Time" column needed —
+# which silently collapses every bar in a session onto midnight.
+OHLC_STAMP_NAMES = {"datetime", "timestamp", "datetimeist", "opentime",
+                    "candletime", "bartime"}
+OHLC_DATE_NAMES = {"date", "day", "tradedate", "sessiondate"}
+OHLC_CLOCK_NAMES = {"time", "clock"}
+
+OHLC_SYNONYMS = {
+    "open": ["open", "o", "openprice", "op"],
+    "high": ["high", "h", "highprice", "hi"],
+    "low": ["low", "l", "lowprice", "lo"],
+    "close": ["close", "c", "closeprice", "last", "lastprice", "settle"],
+    "volume": ["volume", "vol", "v", "qty", "quantity", "contracts"],
+    "ticker": ["ticker", "symbol", "instrument", "contract", "name"],
+}
+
+
+def _ohlc_match(colname: str) -> str | None:
+    n = _norm(_strip_dup_suffix(colname))
+    for field, names in OHLC_SYNONYMS.items():
+        if n in names:
+            return field
+    return None
+
+
+def _ohlc_header_row(text: str) -> int:
+    """First line that looks like a candle header. Charting exports often
+    carry a title or a blank line above it, and the chain's header finder
+    hunts for a Strike column that candles will never have."""
+    for i, line in enumerate(text.splitlines()[:10]):
+        cells = {_norm(c) for c in line.split(",")}
+        hits = sum(bool(cells & set(OHLC_SYNONYMS[k]))
+                   for k in ("open", "high", "low", "close"))
+        if hits >= 3:
+            return i
+    return 0
+
+
+def is_ohlc(raw: pd.DataFrame) -> bool:
+    """Candles, not a chain: OHLC columns and no strike/expiry."""
+    fields = {_ohlc_match(c) for c in raw.columns}
+    chain_ish = {_match_field(c) for c in raw.columns}
+    has_stamp = any(_norm(_strip_dup_suffix(c)) in
+                    (OHLC_STAMP_NAMES | OHLC_DATE_NAMES | OHLC_CLOCK_NAMES)
+                    for c in raw.columns)
+    return ({"open", "high", "low", "close"} <= fields and has_stamp
+            and not {"strike", "expiry"} & chain_ish)
+
+
+def parse_ohlc(data, tz: str = OHLC_TZ_DEFAULT) -> pd.DataFrame:
+    """Normalize an underlying/futures candle export.
+
+    ``tz`` is the zone the file's clock is written in — **IST by default**,
+    because that is what the futures exports here carry. Naive stamps are
+    localized to it and converted to UTC; a stamp that already declares an
+    offset is respected and merely converted, never shifted twice.
+
+    Returns time (UTC), open, high, low, close, volume, ticker — sorted,
+    with unparseable rows dropped.
+    """
+    if isinstance(data, (bytes, bytearray)):
+        text = data.decode("utf-8-sig", errors="replace")
+    else:
+        text = str(data)
+    raw = pd.read_csv(io.StringIO(text), skiprows=_ohlc_header_row(text))
+    if not is_ohlc(raw):
+        raise ChainParseError(
+            "Not a candle file — expected open/high/low/close columns.")
+
+    cols: dict[str, str] = {}
+    for c in raw.columns:
+        f = _ohlc_match(c)
+        if f and f not in cols:
+            cols[f] = c
+
+    def _pick(names):
+        return next((c for c in raw.columns if _norm(_strip_dup_suffix(c)) in names), None)
+
+    stamp_col, date_col, clock_col = (_pick(OHLC_STAMP_NAMES),
+                                      _pick(OHLC_DATE_NAMES),
+                                      _pick(OHLC_CLOCK_NAMES))
+    if stamp_col is not None:
+        stamp = raw[stamp_col].astype(str)
+    elif date_col is not None and clock_col is not None:
+        # the common futures shape: a Date column and a Time column
+        stamp = (raw[date_col].astype(str).str.strip() + " "
+                 + raw[clock_col].astype(str).str.strip())
+    elif date_col is not None:
+        stamp = raw[date_col].astype(str)
+    elif clock_col is not None:
+        stamp = raw[clock_col].astype(str)
+    else:
+        raise ChainParseError("Candle file has no timestamp column.")
+
+    ts = pd.to_datetime(stamp, errors="coerce", format="mixed")
+    if getattr(ts.dtype, "tz", None) is None:
+        ts = ts.dt.tz_localize(tz, ambiguous="NaT", nonexistent="shift_forward")
+    df = pd.DataFrame({
+        "time": ts.dt.tz_convert("UTC"),
+        "open": _to_num(raw[cols["open"]]),
+        "high": _to_num(raw[cols["high"]]),
+        "low": _to_num(raw[cols["low"]]),
+        "close": _to_num(raw[cols["close"]]),
+        "volume": _to_num(raw[cols["volume"]]) if "volume" in cols else float("nan"),
+        "ticker": (raw[cols["ticker"]].astype(str).str.strip().str.upper()
+                   if "ticker" in cols else ""),
+    })
+    df = df[df["time"].notna() & df["close"].notna()]
+    return df.sort_values("time").reset_index(drop=True)
+
+
 def _yes(s: pd.Series) -> pd.Series:
     return s.astype(str).str.strip().str.upper().isin(["YES", "TRUE", "Y", "1"])
 

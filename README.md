@@ -42,6 +42,15 @@ Four file shapes are auto-detected — no configuration:
   and `TIED_` prefixes — the mechanism).
 - **Dark-pool / equity blocks** — price + size per print, no strike. Used as a
   confluence *overlay* on an options analysis (upload alongside a chain).
+- **Underlying candles (OHLC)** — futures or index bars for the same days,
+  uploaded alongside. Everything the app calls a session "range" is otherwise
+  *reconstructed* from print reference prices; real candles replace that, so
+  the level hit-rate and the expected-move model are scored against actual
+  sessions. **Timezone matters and is a setting** — futures exports carry a
+  local wall clock with no zone on it, and the default is **IST**: 19:15 in
+  the file is the 09:45 New York open, so reading it as UTC would misfile
+  every bar by five and a half hours. Sessions are cut on the *exchange*
+  date, so a 02:30 IST bar lands in the previous US session where it belongs.
 
 If auto-detection fails, a manual column-mapping form appears. Missing greeks
 are filled with Black-Scholes gamma from each contract's IV. Multiple files
@@ -247,7 +256,7 @@ estimate — this is positioning analysis, **not trading advice**.
 
 ```
 pip install pytest
-python -m pytest tests/                 # 205 tests
+python -m pytest tests/                 # 216 tests
 python scripts/make_sample_chain.py     # regenerate the bundled sample chain
 ```
 

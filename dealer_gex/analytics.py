@@ -1729,6 +1729,53 @@ def session_range(prints: pd.DataFrame) -> tuple[float, float, float, float] | N
     return lo, hi, float(sub["ref_price"].iloc[-1]), float(sub["ref_price"].iloc[0])
 
 
+def session_ohlc(candles: pd.DataFrame,
+                 session_tz: str = "America/New_York") -> pd.DataFrame:
+    """Collapse candles into one true OHLC row per trading session.
+
+    Sessions are cut on the **exchange** date, not the file's local date:
+    a bar stamped 19:15 IST belongs to that day's New York session at
+    09:45, and grouping on the IST calendar day would file the US
+    afternoon under tomorrow.
+
+    Aggregation is by time, not row order — open is the first bar's open
+    and close the last bar's close after sorting, so an unsorted export
+    cannot invert them.
+
+    Columns: date, open, high, low, close, volume, bars.
+    """
+    cols = ["date", "open", "high", "low", "close", "volume", "bars"]
+    if candles is None or candles.empty or "time" not in candles:
+        return pd.DataFrame(columns=cols)
+    c = candles.dropna(subset=["time"]).sort_values("time")
+    if c.empty:
+        return pd.DataFrame(columns=cols)
+    local = pd.to_datetime(c["time"], utc=True).dt.tz_convert(session_tz)
+    c = c.assign(_d=local.dt.date)
+    g = c.groupby("_d").agg(
+        open=("open", "first"), high=("high", "max"),
+        low=("low", "min"), close=("close", "last"),
+        volume=("volume", "sum"), bars=("close", "size"),
+    ).reset_index().rename(columns={"_d": "date"})
+    return g[cols].sort_values("date").reset_index(drop=True)
+
+
+def range_from_ohlc(candles: pd.DataFrame, day,
+                    session_tz: str = "America/New_York"):
+    """``(low, high, close, open)`` for one session from real candles —
+    the same shape ``session_range`` reconstructs from print reference
+    prices, but measured rather than inferred. ``None`` when that session
+    is not in the file."""
+    sess = session_ohlc(candles, session_tz)
+    if sess.empty:
+        return None
+    row = sess[sess["date"] == day]
+    if row.empty:
+        return None
+    r = row.iloc[0]
+    return float(r["low"]), float(r["high"]), float(r["close"]), float(r["open"])
+
+
 def _role_kind(role: str) -> str:
     if "pin" in role or role in ("Regime pivot", "At spot"):
         return "pin"

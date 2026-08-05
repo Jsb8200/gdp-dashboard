@@ -18,6 +18,7 @@ from dealer_gex.analytics import (
     block_moneyness_breakdown, block_oi_breakdown, block_strike_ladder,
     block_tier_summary, block_type_behaviour, block_type_breakdown,
     block_window_breakdown, block_window_summary, data_quality,
+    range_from_ohlc, session_ohlc,
     flow_books, flow_type_breakdown, fmt_dollars, institutional_mask,
     intraday_flow, level_hit_rate, magnet_levels, oi_levels, oi_walls,
     tuned_layer_weights,
@@ -28,7 +29,8 @@ from dealer_gex.forecast import (
     ExpectedMoveForecast, forecast_expected_move, lightgbm_available,
 )
 from dealer_gex.parsing import (
-    ChainParseError, ParsedFile, aggregate_prints, normalize_chain, parse_file,
+    OHLC_TZ_DEFAULT, ChainParseError, ParsedFile, aggregate_prints,
+    normalize_chain, parse_file, parse_ohlc,
 )
 from dealer_gex.instruments import (
     DEFAULT_INSTRUMENT, detect_instrument, instrument_choices,
@@ -1717,6 +1719,37 @@ def main() -> None:
             help="Time-to-expiry is measured from this date. For flow exports this "
                  "defaults to the file's last trade date.",
         )
+    # Underlying candles. Everything the app calls a "range" is otherwise
+    # reconstructed from print reference prices — a documented proxy. Real
+    # OHLC replaces it for the hit-rate and the expected-move model.
+    st.sidebar.markdown("**Underlying candles** (optional)")
+    ohlc_file = st.sidebar.file_uploader(
+        "OHLC / candles CSV", type=["csv", "txt"], key="ohlc_upload",
+        help="Futures or index candles for the same days. Replaces the range "
+             "reconstructed from print reference prices, so the level "
+             "hit-rate and the expected-move model measure real sessions.",
+    )
+    ohlc_tz = st.sidebar.selectbox(
+        "Candle timezone", ["Asia/Kolkata (IST)", "UTC", "America/New_York (ET)",
+                            "Europe/London", "Asia/Singapore", "Asia/Tokyo"],
+        index=0, key="ohlc_tz",
+        help="The zone the candle file's clock is written in. Futures exports "
+             "carry a local wall clock with no zone on it — IST 19:15 is the "
+             "09:45 New York open, and reading it as UTC misfiles every bar.",
+    )
+    candles = None
+    if ohlc_file is not None:
+        tz = ohlc_tz.split(" (")[0]
+        try:
+            candles = parse_ohlc(ohlc_file.getvalue(), tz=tz)
+        except ChainParseError as exc:
+            st.sidebar.error(str(exc))
+        else:
+            sess = session_ohlc(candles)
+            st.sidebar.success(
+                f"{len(candles):,} bars · {len(sess)} session(s) "
+                f"{sess['date'].min()} → {sess['date'].max()}", icon="🕯️")
+
     rate = st.sidebar.number_input("Risk-free rate (%)", 0.0, 15.0, 4.5, 0.25) / 100
     # Instrument preset: the multiplier is not 100 outside equities, and it
     # scales every dollar figure in the app. Detected from the ticker
@@ -1844,7 +1877,11 @@ def main() -> None:
                 campaign_days.append((pf.asof, dp))
             # per-day confluence + reconstructed range for hit-rate validation
             *_, day_master = _derive(ai, dp)
-            rng = session_range(dp) if dp is not None else None
+            # real candles beat the reconstruction whenever they cover the day
+            rng = range_from_ohlc(candles, pf.asof) if candles is not None else None
+            rng_source = "candles" if rng is not None else "prints"
+            if rng is None and dp is not None:
+                rng = session_range(dp)
             if rng is not None:
                 hr_days.append({"date": pf.asof, "master": day_master,
                                 "low": rng[0], "high": rng[1], "close": rng[2]})
@@ -1854,6 +1891,7 @@ def main() -> None:
                 "close": rng[2] if rng is not None else sp,
                 "low": rng[0] if rng is not None else None,
                 "high": rng[1] if rng is not None else None,
+                "range_source": rng_source,
             })
         if not analyses:
             st.error("No day could be analyzed — check that each file carries "
@@ -1880,6 +1918,19 @@ def main() -> None:
                     dark_lvls if not dark_lvls.empty else None, weights=tuned_w)
         if len(fc_days) >= 2:
             forecast = forecast_expected_move(fc_days)
+        n_real = sum(1 for d in fc_days if d.get("range_source") == "candles")
+        if fc_days:
+            if n_real == len(fc_days):
+                st.success(
+                    f"🕯️ Ranges measured from real candles on all "
+                    f"{n_real} day(s) — the hit-rate and the expected-move "
+                    "model are scored against actual sessions, not "
+                    "reconstructed ones.", icon="🕯️")
+            elif n_real:
+                st.info(
+                    f"🕯️ {n_real} of {len(fc_days)} day(s) use real candles; "
+                    "the rest fall back to ranges reconstructed from print "
+                    "reference prices.", icon="🕯️")
     else:
         try:
             a, magnets, oi_lvls, blk_books, blk_lvls, dark_lvls, master, dq = _main_bundle(
