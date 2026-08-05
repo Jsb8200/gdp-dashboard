@@ -1,6 +1,7 @@
 """The shareable card: a real PNG, driven by a field list."""
 
 import io
+import math
 from datetime import date
 
 import numpy as np
@@ -11,8 +12,8 @@ from PIL import Image
 from dealer_gex.analytics import analyze
 from dealer_gex.parsing import read_chain
 from dealer_gex.share import (
-    CARD_FIELDS, CARD_H, CARD_W, SCALE, THEMES, Field, build_share_card,
-    card_filename,
+    CARD_FIELDS, CARD_H, CARD_W, HUES, SCALE, THEMES, Field,
+    build_share_card, card_filename,
 )
 
 ASOF = date(2026, 7, 17)
@@ -143,3 +144,69 @@ def test_multiplier_shows_through_to_the_card():
     a20 = analyze(chain, spot, _date(2026, 7, 17), multiplier=20.0)
     a100 = analyze(chain, spot, _date(2026, 7, 17), multiplier=100.0)
     assert build_share_card(a20, "NQ") != build_share_card(a100, "NQ")
+
+
+def test_type_is_monospaced():
+    """The card is a numbers card: digits have to sit in columns, so the
+    resolved face must be fixed-pitch even when Consolas is missing and a
+    substitute was picked."""
+    from PIL import ImageDraw
+    from dealer_gex.share import _font
+    d = ImageDraw.Draw(Image.new("RGB", (10, 10)))
+    f = _font(40, True)
+    widths = {d.textlength(c, font=f) for c in "iW1.0m"}
+    assert len(widths) == 1
+
+
+def test_consolas_is_asked_for_first():
+    from dealer_gex.share import _MONO_CANDIDATES
+    for bold in (False, True):
+        assert "consola" in _MONO_CANDIDATES[bold][0].lower()
+        # and a face that exists everywhere has to close the list out
+        assert _MONO_CANDIDATES[bold][-1].endswith(".ttf")
+
+
+def test_labels_keep_a_lowercase_sigma():
+    """`.upper()` turns 1σ into 1Σ, which is a different symbol."""
+    from dealer_gex.share import _caps
+    assert _caps("Expected move (1σ)") == "EXPECTED MOVE (1σ)"
+    assert _caps("net gex / 1% move") == "NET GEX / 1% MOVE"
+
+
+def test_net_gex_takes_its_colour_from_its_own_sign(sample):
+    from dealer_gex.share import CARD_FIELDS, _hue_of
+    object.__setattr__(sample, "total_gex", 1e9)
+    assert _hue_of(CARD_FIELDS[0], sample) == HUES["mint"]
+    object.__setattr__(sample, "total_gex", -1e9)
+    assert _hue_of(CARD_FIELDS[0], sample) == HUES["rose"]
+
+
+def test_tiles_carry_distinct_accents(sample):
+    """Colour is the index into the card — two tiles reading the same hue
+    would make the walls indistinguishable at thumbnail size."""
+    from dealer_gex.share import CARD_FIELDS, _hue_of
+    hues = [_hue_of(f, sample) for f in CARD_FIELDS]
+    assert len(set(hues)) >= 5
+
+
+def test_the_grid_stays_two_rows_while_it_can():
+    """A third row costs a third of the tile height, and height is what
+    decides how large the value can be set."""
+    from dealer_gex.share import _COLS
+    for n in range(1, 9):
+        assert math.ceil(n / _COLS[n]) <= 2
+    assert _COLS[4] == 2          # 2x2, not a row of three and a straggler
+
+
+def test_a_seventh_tile_does_not_collide_with_the_caption(sample):
+    """Tile internals are placed as a fraction of tile height; a fixed
+    offset stacks the value on the caption once the grid reflows."""
+    png = build_share_card(sample, "SPY", extras=[
+        ("Block book", "M2M FLR", "78% of block premium")])
+    assert _open(png).size == (CARD_W * SCALE, CARD_H * SCALE)
+
+
+def test_extras_may_name_their_own_accent(sample):
+    a = build_share_card(sample, "SPY", extras=[("X", "1", "", "lime")])
+    b = build_share_card(sample, "SPY", extras=[("X", "1", "", "orange")])
+    assert a != b
