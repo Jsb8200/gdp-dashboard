@@ -1558,8 +1558,6 @@ def share_card_section(a: Analysis, ticker: str,
     """The headline read as one downloadable picture — tiles, order, style
     and wording all chosen here rather than baked into the renderer."""
     st.subheader("🪟 Share card")
-    cat = card_catalog(a, oi=oi_walls(a), magnets=magnets, forecast=forecast)
-    keys = list(cat)
 
     with st.expander("⚙️ Customise the card", expanded=False):
         c1, c2, c3, c4 = st.columns([1, 1, 1, 1])
@@ -1569,11 +1567,51 @@ def share_card_section(a: Analysis, ticker: str,
         size = c2.selectbox("Size", list(SIZES), index=0, key="card_size",
                             format_func=lambda k: f"{k} · {SIZES[k]}px",
                             help="Card width. Height follows the tiles you pick.")
-        title = c3.text_input("Title", value=ticker, key="card_title",
-                              help="Defaults to the ticker.")
-        footnote = c4.text_input("Footnote", value="", key="card_footnote",
+        footnote = c3.text_input("Footnote", value="", key="card_footnote",
                                  placeholder="none",
                                  help="A line under the grid. Empty means no footer.")
+
+        # Quote the card on the contract actually traded. Card-only by
+        # design: the dashboard stays on the chain's own scale, so the
+        # levels you reason from never move under you — only the picture
+        # you hand someone gets restated.
+        f1, f2, f3 = st.columns([1, 1, 1])
+        fut_choices = ["— underlying"] + list(PRESETS)
+        fut_pick = f1.selectbox(
+            "Quote levels as", fut_choices, index=0, key="card_fut",
+            format_func=lambda k: (k if k == fut_choices[0]
+                                   else f"{k} · {PRESETS[k]['note']}"),
+            help="Converts the card's price levels onto a futures contract. "
+                 "Affects the card only — the dashboard above is unchanged.")
+        conv = Conversion()
+        if fut_pick != fut_choices[0]:
+            preset = PRESETS[fut_pick]
+            mode = f2.radio("Basis type", MODES,
+                            index=MODES.index(preset["mode"]), horizontal=True,
+                            key=f"card_fut_mode::{fut_pick}",
+                            help="`offset` for an index and its own future "
+                                 "(ES = SPX + carry). `ratio` for an ETF against "
+                                 "a future, where the two track the same thing at "
+                                 "different unit sizes (NQ = QQQ × 41.765).")
+            val = f3.number_input("Basis", value=float(preset["value"]),
+                                  step=0.001, format="%.4f",
+                                  key=f"card_fut_val::{fut_pick}::{mode}",
+                                  help="The basis moves daily — the preset is a "
+                                       "starting point, not a constant.")
+            conv = Conversion(fut_pick, mode, float(val))
+
+        # everything below is built from the converted book, so the tile
+        # menu, the ladder and the strike lists all agree with the header
+        if conv.active:
+            a = convert_analysis(a, conv)
+            magnets = convert_frame(magnets, conv, a.spot)
+        cat = card_catalog(a, oi=oi_walls(a), magnets=magnets, forecast=forecast)
+        keys = list(cat)
+
+        title = st.text_input(
+            "Title", value=conv.target if conv.active else ticker,
+            key=f"card_title::{conv.target}",
+            help="Defaults to the ticker, or to the contract when converting.")
         picked = st.multiselect(
             "Tiles — the card follows this order", options=keys,
             default=[k for k in DEFAULT_KEYS if k in cat], key="card_tiles",
@@ -1584,6 +1622,22 @@ def share_card_section(a: Analysis, ticker: str,
             "Subtitle", value="", key="card_subtitle",
             placeholder="auto — instrument · multiplier · date · contracts",
             help="Leave empty to keep the generated line.")
+        if conv.active:
+            st.caption(
+                f"🔁 Card levels on **{conv.target}** — {conv.label()}. Dollar "
+                f"figures stay in {ticker or 'chain'} money. The dashboard "
+                "above is unchanged.")
+
+    # A converted card names the contract in the header, so the generated
+    # subtitle must not also hand the multiplier to `detect_instrument` —
+    # it would read "S&P 500 E-mini · x100" when ES is x50. The dollar
+    # figures never converted, so the money is still the chain's: say so.
+    if subtitle == "" and conv.active:
+        inst = detect_instrument(ticker)
+        chain_bit = (f"{inst.name} ×{a.multiplier:g}" if inst.root
+                     else f"×{a.multiplier:g} per contract")
+        subtitle = (f"levels on {conv.target} · {chain_bit} · "
+                    f"{a.asof:%d %b %Y} · {a.n_contracts:,} contracts")
 
     fields = [cat[k] for k in picked]
     png = build_share_card(a, title, fields=fields, style=style, size=size,
@@ -1809,42 +1863,6 @@ def main() -> None:
         + (f" {picked.name}: {picked.note}." if picked.note else ""),
     )
 
-    # Quote levels on the contract actually being traded. The chain is
-    # priced on SPX/QQQ/GLD; the screen in front of you is ES/NQ/GC. This is
-    # a display conversion applied after the analysis — see dealer_gex.futures
-    # on why re-pricing the chain at a shifted spot would be wrong.
-    st.sidebar.markdown("**Quote levels as**")
-    fut_choices = ["— underlying"] + list(PRESETS)
-    fut_pick = st.sidebar.selectbox(
-        "Contract", fut_choices, index=0, key="fut_target",
-        format_func=lambda k: (k if k == fut_choices[0]
-                               else f"{k} · {PRESETS[k]['note']}"),
-        help="Converts every price level — spot, flip, walls, max pain, "
-             "magnets, the strike ladder — onto the futures contract. Dollar "
-             "figures are money and do not convert.",
-    )
-    conv = Conversion()
-    if fut_pick != fut_choices[0]:
-        preset = PRESETS[fut_pick]
-        mode = st.sidebar.radio(
-            "Basis type", MODES,
-            index=MODES.index(preset["mode"]), horizontal=True,
-            key=f"fut_mode::{fut_pick}",
-            help="`offset` for an index and its own future (ES = SPX + carry). "
-                 "`ratio` for an ETF against a future, where the two track the "
-                 "same thing at different unit sizes (NQ = QQQ × 41.765). "
-                 "Using one where the other belongs is not a small error.",
-        )
-        val = st.sidebar.number_input(
-            "Basis", value=float(preset["value"]), step=0.001, format="%.4f",
-            key=f"fut_val::{fut_pick}::{mode}",
-            help="The basis moves daily — the preset is a starting point, "
-                 "not a constant.",
-        )
-        conv = Conversion(fut_pick, mode, float(val))
-        if conv.active:
-            st.sidebar.caption(f"↔ {conv.label()}")
-
     has_flow = ("net_customer_size" in chain.columns
                 and chain["net_customer_size"].abs().sum() > 0)
     weight_options = ["Open interest (positioning)", "Volume (intraday / 0DTE flow)"]
@@ -1948,12 +1966,6 @@ def main() -> None:
             *_, day_master = _derive(ai, dp)
             # real candles beat the reconstruction whenever they cover the day
             rng = range_from_ohlc(candles, pf.asof) if candles is not None else None
-            # Candles of the *future* against a chain priced on the
-            # underlying is the one way this goes quietly wrong: the
-            # hit-rate would test SPX-derived levels against an ES range.
-            # Read them back onto the chain's scale first.
-            if rng is not None and conv.active:
-                rng = tuple(conv.back(v) for v in rng)
             rng_source = "candles" if rng is not None else "prints"
             if rng is None and dp is not None:
                 rng = session_range(dp)
@@ -2022,31 +2034,6 @@ def main() -> None:
             "No underlying price found in the file — set the spot price in the "
             "sidebar. All levels depend on it.", icon="📍",
         )
-
-    # Convert once, here: every section downstream reads these, so the
-    # whole dashboard, the report and the card follow without further edits.
-    if conv.active:
-        a = convert_analysis(a, conv)
-        # distances are recomputed against the converted spot, which an
-        # offset changes and a ratio does not
-        magnets = convert_frame(magnets, conv, a.spot)
-        oi_lvls = convert_frame(oi_lvls, conv, a.spot)
-        blk_lvls = convert_frame(blk_lvls, conv, a.spot)
-        dark_lvls = convert_frame(dark_lvls, conv, a.spot)
-        master = convert_frame(master, conv, a.spot)
-        blk_books = {k: convert_analysis(v, conv) for k, v in (blk_books or {}).items()}
-        # the per-print tables carry strikes and reference prices of their
-        # own; leaving them behind would show a strike ladder on one scale
-        # beside walls on another
-        if merged_prints is not None:
-            merged_prints = convert_frame(merged_prints, conv)
-            if "ref_price" in merged_prints.columns:
-                merged_prints = merged_prints.assign(
-                    ref_price=merged_prints["ref_price"].astype(float).map(conv.level))
-        ticker = conv.target
-        st.info(f"Levels quoted on **{conv.target}** — {conv.label()}. "
-                "Dollar figures (GEX, DEX, vanna, charm, block premium) are "
-                "money and are unconverted.", icon="🔁")
 
     # --- render ---
     verdict_banner(a)
