@@ -32,6 +32,9 @@ from dealer_gex.parsing import (
     OHLC_TZ_DEFAULT, ChainParseError, ParsedFile, aggregate_prints,
     normalize_chain, parse_file, parse_ohlc,
 )
+from dealer_gex.futures import (
+    MODES, PRESETS, Conversion, convert_analysis, convert_frame,
+)
 from dealer_gex.instruments import (
     DEFAULT_INSTRUMENT, detect_instrument, instrument_choices,
     instrument_from_choice,
@@ -1806,6 +1809,42 @@ def main() -> None:
         + (f" {picked.name}: {picked.note}." if picked.note else ""),
     )
 
+    # Quote levels on the contract actually being traded. The chain is
+    # priced on SPX/QQQ/GLD; the screen in front of you is ES/NQ/GC. This is
+    # a display conversion applied after the analysis — see dealer_gex.futures
+    # on why re-pricing the chain at a shifted spot would be wrong.
+    st.sidebar.markdown("**Quote levels as**")
+    fut_choices = ["— underlying"] + list(PRESETS)
+    fut_pick = st.sidebar.selectbox(
+        "Contract", fut_choices, index=0, key="fut_target",
+        format_func=lambda k: (k if k == fut_choices[0]
+                               else f"{k} · {PRESETS[k]['note']}"),
+        help="Converts every price level — spot, flip, walls, max pain, "
+             "magnets, the strike ladder — onto the futures contract. Dollar "
+             "figures are money and do not convert.",
+    )
+    conv = Conversion()
+    if fut_pick != fut_choices[0]:
+        preset = PRESETS[fut_pick]
+        mode = st.sidebar.radio(
+            "Basis type", MODES,
+            index=MODES.index(preset["mode"]), horizontal=True,
+            key=f"fut_mode::{fut_pick}",
+            help="`offset` for an index and its own future (ES = SPX + carry). "
+                 "`ratio` for an ETF against a future, where the two track the "
+                 "same thing at different unit sizes (NQ = QQQ × 41.765). "
+                 "Using one where the other belongs is not a small error.",
+        )
+        val = st.sidebar.number_input(
+            "Basis", value=float(preset["value"]), step=0.001, format="%.4f",
+            key=f"fut_val::{fut_pick}::{mode}",
+            help="The basis moves daily — the preset is a starting point, "
+                 "not a constant.",
+        )
+        conv = Conversion(fut_pick, mode, float(val))
+        if conv.active:
+            st.sidebar.caption(f"↔ {conv.label()}")
+
     has_flow = ("net_customer_size" in chain.columns
                 and chain["net_customer_size"].abs().sum() > 0)
     weight_options = ["Open interest (positioning)", "Volume (intraday / 0DTE flow)"]
@@ -1909,6 +1948,12 @@ def main() -> None:
             *_, day_master = _derive(ai, dp)
             # real candles beat the reconstruction whenever they cover the day
             rng = range_from_ohlc(candles, pf.asof) if candles is not None else None
+            # Candles of the *future* against a chain priced on the
+            # underlying is the one way this goes quietly wrong: the
+            # hit-rate would test SPX-derived levels against an ES range.
+            # Read them back onto the chain's scale first.
+            if rng is not None and conv.active:
+                rng = tuple(conv.back(v) for v in rng)
             rng_source = "candles" if rng is not None else "prints"
             if rng is None and dp is not None:
                 rng = session_range(dp)
@@ -1977,6 +2022,31 @@ def main() -> None:
             "No underlying price found in the file — set the spot price in the "
             "sidebar. All levels depend on it.", icon="📍",
         )
+
+    # Convert once, here: every section downstream reads these, so the
+    # whole dashboard, the report and the card follow without further edits.
+    if conv.active:
+        a = convert_analysis(a, conv)
+        # distances are recomputed against the converted spot, which an
+        # offset changes and a ratio does not
+        magnets = convert_frame(magnets, conv, a.spot)
+        oi_lvls = convert_frame(oi_lvls, conv, a.spot)
+        blk_lvls = convert_frame(blk_lvls, conv, a.spot)
+        dark_lvls = convert_frame(dark_lvls, conv, a.spot)
+        master = convert_frame(master, conv, a.spot)
+        blk_books = {k: convert_analysis(v, conv) for k, v in (blk_books or {}).items()}
+        # the per-print tables carry strikes and reference prices of their
+        # own; leaving them behind would show a strike ladder on one scale
+        # beside walls on another
+        if merged_prints is not None:
+            merged_prints = convert_frame(merged_prints, conv)
+            if "ref_price" in merged_prints.columns:
+                merged_prints = merged_prints.assign(
+                    ref_price=merged_prints["ref_price"].astype(float).map(conv.level))
+        ticker = conv.target
+        st.info(f"Levels quoted on **{conv.target}** — {conv.label()}. "
+                "Dollar figures (GEX, DEX, vanna, charm, block premium) are "
+                "money and are unconverted.", icon="🔁")
 
     # --- render ---
     verdict_banner(a)
