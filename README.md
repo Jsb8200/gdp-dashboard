@@ -208,15 +208,25 @@ history** instead.
 - **Scenario simulator** — re-price the whole book at a hypothetical spot/IV to
   see the regime, flip, and forced hedge flow *before* the market goes there.
 - **0DTE mode** — restrict to same-day expiry (per-hour charm, move to the close).
-- **Contract multiplier** — 100 for equities/index, 50 ES, 20 NQ… (levels are
-  scale-invariant; only dollar figures scale).
+- **Instrument presets (futures)** — the multiplier is not 100 outside
+  equities and it scales every dollar figure: GEX, DEX, vanna, charm, block
+  premium. Picked from a list or auto-detected from the ticker with the
+  contract month stripped (`ESU6` → ES, `NQZ25` → NQ, `/MESH6` → MES).
+  Covers **ES 50 · MES 5 · NQ 20 · MNQ 2 · RTY 50 · YM 5 · GC 100 · MGC 10 ·
+  SI 5000 · CL 1000 · NG 10000** alongside the cash indices and their ETFs.
+  Micros resolve before their parents (MNQ is never NQ), and a lookalike
+  ticker like `ESGV` or `GLDM` keeps the 100 default rather than being
+  silently mispriced. Levels are unaffected either way.
 - **Weighting** — open interest / volume / signed order flow.
 - **Report** — downloadable `.md` / `.html` with the TL;DR, master levels,
   playbook, and every table.
 - **Share card** — the headline read as one downloadable **PNG**, in the
-  liquid-glass idiom: translucent panels over a blurred, regime-tinted
-  backdrop, each one actually frosting the pixels behind it with a specular
-  top edge. Spot, verdict, net GEX, gamma flip, both walls, expected move and
+  liquid-glass idiom: near-black, with translucent panels that actually frost
+  the pixels behind them and catch a specular top edge. The tint is carried by
+  low-alpha colour over near-black rather than by the background, so the only
+  saturated pixels are the spot price and the verdict pill. The instrument and
+  its multiplier are printed on the card — an NQ book and a QQQ book are
+  otherwise the same picture with different dollar figures. Spot, verdict, net GEX, gamma flip, both walls, expected move and
   max pain — the numbers you would paste into a chat, not the twenty tables.
   Pure Pillow, which already ships with Streamlit, so it costs no dependency.
   The tile set is a list (`share.CARD_FIELDS`): adding a number is one entry,
@@ -237,11 +247,12 @@ estimate — this is positioning analysis, **not trading advice**.
 
 ```
 pip install pytest
-python -m pytest tests/                 # 193 tests
+python -m pytest tests/                 # 205 tests
 python scripts/make_sample_chain.py     # regenerate the bundled sample chain
 ```
 
-Layout: `dealer_gex/` (parsing, analytics, forecast, report, share) ·
+Layout: `dealer_gex/` (parsing, analytics, forecast, instruments, report,
+share) ·
 `streamlit_app.py` (UI) · `tests/` · `data/` (bundled sample).
 
 `lightgbm` is only needed for the expected-move model; the rest of the app —

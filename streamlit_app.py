@@ -30,6 +30,10 @@ from dealer_gex.forecast import (
 from dealer_gex.parsing import (
     ChainParseError, ParsedFile, aggregate_prints, normalize_chain, parse_file,
 )
+from dealer_gex.instruments import (
+    DEFAULT_INSTRUMENT, detect_instrument, instrument_choices,
+    instrument_from_choice,
+)
 from dealer_gex.share import build_share_card, card_filename
 from dealer_gex.report import (
     build_markdown, build_playbook, executive_summary, key_ladder,
@@ -1714,11 +1718,29 @@ def main() -> None:
                  "defaults to the file's last trade date.",
         )
     rate = st.sidebar.number_input("Risk-free rate (%)", 0.0, 15.0, 4.5, 0.25) / 100
+    # Instrument preset: the multiplier is not 100 outside equities, and it
+    # scales every dollar figure in the app. Detected from the ticker
+    # (futures month codes stripped) and overridable.
+    detected = detect_instrument(ticker)
+    choices = instrument_choices()
+    default_label = detected.label if detected.root else choices[0]
+    inst_choice = st.sidebar.selectbox(
+        "Instrument", choices,
+        index=choices.index(default_label) if default_label in choices else 0,
+        key=f"instrument::{ticker}",
+        help="Sets the contract multiplier. Futures differ: ES = 50, NQ = 20, "
+             "MNQ = 2, GC = 100, CL = 1000. Auto-detected from the ticker "
+             "(ESU6 → ES); override here or with the box below.",
+    )
+    picked = (instrument_from_choice(inst_choice)
+              if inst_choice != choices[0] else DEFAULT_INSTRUMENT)
     multiplier = st.sidebar.number_input(
-        "Contract multiplier", min_value=1.0, value=100.0, step=1.0,
-        help="Units of underlying per contract: stocks/ETFs/index options = 100, "
-             "ES = 50, NQ = 20, CL = 1000. Only dollar figures scale with this; "
-             "levels are unaffected.",
+        "Contract multiplier", min_value=0.01, value=float(picked.multiplier),
+        step=1.0, key=f"multiplier::{ticker}::{picked.root}",
+        help="Units of underlying per contract. Only dollar figures scale "
+             "with this — GEX, DEX, vanna, charm and block premium; levels "
+             "are unaffected."
+        + (f" {picked.name}: {picked.note}." if picked.note else ""),
     )
 
     has_flow = ("net_customer_size" in chain.columns

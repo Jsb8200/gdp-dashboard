@@ -114,3 +114,32 @@ def test_every_theme_is_complete():
     for name, t in THEMES.items():
         assert {"base", "blobs", "accent", "verdict", "tagline"} <= set(t)
         assert len(t["blobs"]) == 3
+
+
+def test_card_is_dark(sample):
+    """'Dark' is measurable: the backdrop should sit near black, with the
+    bright pixels confined to text, glass edges and the accent."""
+    im = _open(build_share_card(sample, "SPY")).convert("L")
+    px = np.asarray(im, dtype=float)
+    assert px.mean() < 70                      # overall near-black
+    assert np.percentile(px, 50) < 60          # the typical pixel is dark
+    assert px.max() > 230                      # text still reads white
+
+
+def test_the_instrument_is_named_on_the_card(sample):
+    """An NQ card and a QQQ card would otherwise be identical pictures with
+    different dollar figures — the multiplier has to be stated."""
+    nq = build_share_card(sample, "NQ")
+    qqq = build_share_card(sample, "QQQ")
+    assert nq != qqq
+
+
+def test_multiplier_shows_through_to_the_card():
+    from datetime import date as _date
+
+    from dealer_gex.analytics import analyze
+    from dealer_gex.parsing import read_chain
+    chain, spot = read_chain(open("data/sample_option_chain.csv", "rb").read())
+    a20 = analyze(chain, spot, _date(2026, 7, 17), multiplier=20.0)
+    a100 = analyze(chain, spot, _date(2026, 7, 17), multiplier=100.0)
+    assert build_share_card(a20, "NQ") != build_share_card(a100, "NQ")

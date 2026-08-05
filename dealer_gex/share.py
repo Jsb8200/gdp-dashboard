@@ -27,6 +27,7 @@ from datetime import date
 from PIL import Image, ImageDraw, ImageFilter, ImageFont
 
 from dealer_gex.analytics import Analysis, fmt_dollars
+from dealer_gex.instruments import detect_instrument
 
 # Rendered at 2x and kept there: the card is meant to survive being
 # screenshotted, cropped and re-posted.
@@ -48,17 +49,20 @@ _FONT_CANDIDATES = {
     ],
 }
 
-#: Palette per regime — the backdrop is tinted by what the book is doing,
-#: so the card reads before a single number is parsed.
+#: Palette per regime. Near-black base with the tint carried by low-alpha
+#: blobs rather than the background itself — the card reads dark, and the
+#: colour is a signal (which way dealers are forced to hedge) rather than a
+#: wash. The accent is reserved for the spot price and the verdict pill, so
+#: the only saturated pixels on the card are the two that matter.
 THEMES = {
     "long_gamma": {
-        "base": (14, 24, 38), "blobs": [(34, 150, 120), (26, 92, 168), (18, 60, 120)],
-        "accent": (74, 222, 168), "verdict": "LONG GAMMA",
+        "base": (9, 12, 16), "blobs": [(16, 74, 62), (14, 46, 84), (10, 30, 58)],
+        "accent": (86, 230, 176), "verdict": "LONG GAMMA",
         "tagline": "dealers hedge against the move — dampening",
     },
     "short_gamma": {
-        "base": (30, 14, 22), "blobs": [(190, 60, 78), (150, 40, 110), (90, 24, 60)],
-        "accent": (255, 122, 130), "verdict": "SHORT GAMMA",
+        "base": (14, 9, 11), "blobs": [(92, 26, 36), (72, 20, 54), (44, 12, 30)],
+        "accent": (255, 118, 128), "verdict": "SHORT GAMMA",
         "tagline": "dealers hedge with the move — amplifying",
     },
 }
@@ -136,7 +140,8 @@ def _backdrop(w: int, h: int, theme: dict) -> Image.Image:
         rr = int(min(w, h) * r)
         bd.ellipse([cx * w - rr, cy * h - rr, cx * w + rr, cy * h + rr], fill=colour)
     blobs = blobs.filter(ImageFilter.GaussianBlur(int(min(w, h) * 0.16)))
-    return Image.blend(base, Image.blend(base, blobs, 0.55), 0.9)
+    # keep it dark: the blobs are a tint over near-black, not a background
+    return Image.blend(base, blobs, 0.42)
 
 
 def _rounded_mask(size, radius: int) -> Image.Image:
@@ -147,7 +152,7 @@ def _rounded_mask(size, radius: int) -> Image.Image:
 
 
 def _glass(img: Image.Image, box, radius: int, *, blur: int = 26,
-           tint: int = 30, border: int = 74, highlight: int = 96) -> None:
+           tint: int = 16, border: int = 62, highlight: int = 70) -> None:
     """Frost the backdrop inside ``box`` and lay glass over it, in place.
 
     The order matters: blur what is behind, lift it slightly, add a
@@ -162,7 +167,7 @@ def _glass(img: Image.Image, box, radius: int, *, blur: int = 26,
     mask = _rounded_mask((w, h), radius)
 
     region = img.crop((x0, y0, x1, y1)).filter(ImageFilter.GaussianBlur(blur))
-    region = Image.blend(region, Image.new("RGB", (w, h), (255, 255, 255)), 0.05)
+    region = Image.blend(region, Image.new("RGB", (w, h), (255, 255, 255)), 0.028)
     img.paste(region, (x0, y0), mask)
 
     layer = Image.new("RGBA", (w, h), (0, 0, 0, 0))
@@ -214,9 +219,14 @@ def build_share_card(a: Analysis, ticker: str = "", *,
     lw = d.textlength(label, font=_font(40 * SCALE, True))
     _text(d, (hx + lw + 18 * SCALE, hy - 18 * SCALE), f"{a.spot:,.2f}",
           _font(30 * SCALE, True), theme["accent"], "lm")
+    inst = detect_instrument(ticker)
+    # the multiplier changes every dollar figure on the card, so it is stated
+    # rather than assumed: an NQ card and a QQQ card are otherwise identical
+    mult = a.multiplier
+    inst_bit = f"{inst.name} · ×{mult:g}" if inst.root else f"×{mult:g} per contract"
     _text(d, (hx, hy + 24 * SCALE),
-          f"dealer positioning · {a.asof:%d %b %Y} · {a.n_contracts:,} contracts",
-          _font(17 * SCALE), (255, 255, 255, 165), "lm")
+          f"{inst_bit} · {a.asof:%d %b %Y} · {a.n_contracts:,} contracts",
+          _font(17 * SCALE), (226, 230, 240), "lm")
 
     # verdict pill, right-aligned in the header. Drawn on an RGBA layer and
     # composited: an RGBA fill passed straight to a draw on an RGB canvas
