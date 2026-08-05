@@ -213,6 +213,14 @@ history** instead.
 - **Weighting** — open interest / volume / signed order flow.
 - **Report** — downloadable `.md` / `.html` with the TL;DR, master levels,
   playbook, and every table.
+- **Share card** — the headline read as one downloadable **PNG**, in the
+  liquid-glass idiom: translucent panels over a blurred, regime-tinted
+  backdrop, each one actually frosting the pixels behind it with a specular
+  top edge. Spot, verdict, net GEX, gamma flip, both walls, expected move and
+  max pain — the numbers you would paste into a chat, not the twenty tables.
+  Pure Pillow, which already ships with Streamlit, so it costs no dependency.
+  The tile set is a list (`share.CARD_FIELDS`): adding a number is one entry,
+  and `extras=` appends ready-made tiles for anything off the Analysis.
 
 ## Assumptions & caveats
 
@@ -229,11 +237,11 @@ estimate — this is positioning analysis, **not trading advice**.
 
 ```
 pip install pytest
-python -m pytest tests/                 # 182 tests
+python -m pytest tests/                 # 193 tests
 python scripts/make_sample_chain.py     # regenerate the bundled sample chain
 ```
 
-Layout: `dealer_gex/` (parsing, analytics, forecast, report) ·
+Layout: `dealer_gex/` (parsing, analytics, forecast, report, share) ·
 `streamlit_app.py` (UI) · `tests/` · `data/` (bundled sample).
 
 `lightgbm` is only needed for the expected-move model; the rest of the app —

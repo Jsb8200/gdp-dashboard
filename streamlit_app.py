@@ -30,6 +30,7 @@ from dealer_gex.forecast import (
 from dealer_gex.parsing import (
     ChainParseError, ParsedFile, aggregate_prints, normalize_chain, parse_file,
 )
+from dealer_gex.share import build_share_card, card_filename
 from dealer_gex.report import (
     build_markdown, build_playbook, executive_summary, key_ladder,
     markdown_to_html, regime_text,
@@ -1540,6 +1541,27 @@ def tables(a: Analysis) -> None:
         st.dataframe(top, use_container_width=True, hide_index=True)
 
 
+def share_card_section(a: Analysis, ticker: str, dom: dict | None = None) -> None:
+    """The headline read as one downloadable picture."""
+    st.subheader("🪟 Share card")
+    extras = []
+    if dom and dom.get("leader"):
+        extras.append(("Block book", dom["leader"],
+                       "leads " + ("2 of 3" if dom.get("lenses_won", 0) >= 2
+                                   else "one") + " lenses"))
+    png = build_share_card(a, ticker, extras=extras)
+    st.image(png, use_container_width=True)
+    c1, c2 = st.columns([1, 4])
+    c1.download_button("⬇️ Download card (.png)", png,
+                       file_name=card_filename(a, ticker), mime="image/png")
+    c2.caption(
+        "The headline numbers only — spot, regime, flip, walls, expected move "
+        "and max pain — sized for pasting into a chat. Tell me which other "
+        "columns you want and they become tiles; the set is a list, not a "
+        "layout."
+    )
+
+
 def report_section(a: Analysis, ticker: str, hist: pd.DataFrame | None = None,
                    blk_books: dict | None = None,
                    blk_lvls: pd.DataFrame | None = None,
@@ -1895,6 +1917,8 @@ def main() -> None:
         notable_flow_section(merged_prints, a.spot)
 
     playbook_section(a, master)
+    share_card_section(a, ticker,
+                       block_dominance(merged_prints, a.spot) if merged_prints is not None else None)
     tables(a)
     report_section(a, ticker, hist, blk_books, blk_lvls, master, dq,
                    dark_lvls, forecast,
