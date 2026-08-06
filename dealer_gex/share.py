@@ -75,6 +75,10 @@ _MONO_CANDIDATES = {
         "/System/Library/Fonts/Menlo.ttc",
         "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf",
         "/usr/share/fonts/truetype/liberation/LiberationMono-Regular.ttf",
+        # bare names last: PIL searches the system font directories for
+        # these, which catches installs the absolute paths above miss
+        "consola.ttf", "Consolas.ttf", "DejaVuSansMono.ttf",
+        "LiberationMono-Regular.ttf", "cour.ttf",
     ],
     True: [
         "C:/Windows/Fonts/consolab.ttf",
@@ -87,6 +91,8 @@ _MONO_CANDIDATES = {
         "/System/Library/Fonts/Menlo.ttc",
         "/usr/share/fonts/truetype/dejavu/DejaVuSansMono-Bold.ttf",
         "/usr/share/fonts/truetype/liberation/LiberationMono-Bold.ttf",
+        "consolab.ttf", "Consolas Bold.ttf", "DejaVuSansMono-Bold.ttf",
+        "LiberationMono-Bold.ttf", "courbd.ttf",
     ],
 }
 
@@ -455,6 +461,46 @@ def _font(size: int, bold: bool = False) -> ImageFont.FreeTypeFont:
     return ImageFont.load_default(size)
 
 
+#: ASCII stand-ins for the characters a fallback font may not carry. PIL's
+#: built-in bitmap font — what you get when no mono face resolves at all —
+#: has no sigma, em dash, en dash or multiplication sign, and draws each as
+#: a .notdef box. A card full of tofu is worse than a card that says "sd".
+_GLYPH_FALLBACK = {"σ": "sd", "—": "-", "–": "-", "×": "x", "·": "-",
+                   "±": "+/-", "≈": "~", "→": "->", "↔": "<->", "≥": ">=",
+                   "≤": "<="}
+_MISSING: dict = {}
+
+
+def _safe(s: str, font) -> str:
+    """Swap out any character ``font`` cannot draw.
+
+    Coverage is probed by rendering U+FFFF — a permanently unassigned code
+    point, so every font draws its .notdef box for it — and comparing each
+    candidate's bitmap against that box. Cached per face, because it costs
+    a rasterisation per character.
+    """
+    if not s or s.isascii():
+        return s
+    key = (getattr(font, "path", ""), getattr(font, "size", 0))
+    miss = _MISSING.get(key)
+    if miss is None:
+        miss = set()
+        try:
+            ref = bytes(bytearray(font.getmask("\uFFFF")))
+        except Exception:                            # noqa: BLE001
+            ref = None
+        for ch in _GLYPH_FALLBACK:
+            try:
+                if ref is not None and bytes(bytearray(font.getmask(ch))) == ref:
+                    miss.add(ch)
+            except Exception:                        # noqa: BLE001
+                miss.add(ch)
+        _MISSING[key] = miss
+    if not miss:
+        return s
+    return "".join(_GLYPH_FALLBACK.get(c, c) if c in miss else c for c in s)
+
+
 def _caps(s: str) -> str:
     """Upper-case the Latin letters and leave everything else alone.
 
@@ -471,7 +517,7 @@ def _mix(a, b, t: float):
 
 
 def _text(d: ImageDraw.ImageDraw, xy, s, font, fill, anchor="la"):
-    d.text(xy, s, font=font, fill=fill, anchor=anchor)
+    d.text(xy, _safe(str(s), font), font=font, fill=fill, anchor=anchor)
 
 
 def _tracked(d: ImageDraw.ImageDraw, xy, s, font, fill, track: float) -> float:
@@ -479,7 +525,7 @@ def _tracked(d: ImageDraw.ImageDraw, xy, s, font, fill, track: float) -> float:
     label rather than a value once tracked out; Pillow has no letter
     spacing, so the glyphs are placed one at a time."""
     x, y = xy
-    for ch in s:
+    for ch in _safe(str(s), font):
         d.text((x, y), ch, font=font, fill=fill, anchor="la")
         x += d.textlength(ch, font=font) + track
     return x - xy[0]
@@ -490,7 +536,10 @@ def _fit(d: ImageDraw.ImageDraw, s: str, max_w: float, start: int,
     """Largest font from ``start`` down to ``floor`` that keeps ``s`` inside
     ``max_w``. Mono is wide, so long index levels need this."""
     size = start
-    while size > floor and d.textlength(s, font=_font(size * SCALE, bold)) > max_w:
+    while size > floor:
+        f = _font(size * SCALE, bold)
+        if d.textlength(_safe(s, f), font=f) <= max_w:
+            break
         size -= 1
     return _font(size * SCALE, bold)
 
@@ -861,10 +910,11 @@ def _draw_bars(d: ImageDraw.ImageDraw, box, data, spot: float, sty: dict) -> Non
         m[0] = ly
     for ly, cy, txt, colour in marks:
         tw = d.textlength(txt, font=fb)
+        mid = (px1 + x1) / 2
         if abs(ly - cy) > 1.5 * SCALE:
-            d.line([(px1 + 4 * SCALE, cy), (x1 - tw - 7 * SCALE, ly)],
+            d.line([(px1 + 4 * SCALE, cy), (mid - tw / 2 - 5 * SCALE, ly)],
                    fill=_mix(colour, dim, 0.45), width=max(1, SCALE // 2))
-        _text(d, (x1, ly), txt, fb, colour, "rm")
+        _text(d, (mid, ly), txt, fb, colour, "mm")
 
     d.line([(zero_x, y0), (zero_x, y1)], fill=sty["border"], width=SCALE)
 
@@ -892,7 +942,7 @@ def _draw_table(img: Image.Image, d: ImageDraw.ImageDraw, box, columns, rows,
     x0, y0, x1, y1 = box
     n = len(rows) + 1
     rh = min(ROW_H, (y1 - y0) / max(n, 1))
-    size = max(int(min(14, rh / SCALE * 0.60)), 9)
+    size = max(int(min(17, rh / SCALE * 0.72)), 9)
     f, fb = _font(size * SCALE), _font(size * SCALE, True)
 
     ncol = len(columns)
@@ -1322,7 +1372,7 @@ def build_share_card(a: Analysis, ticker: str = "", *,
             # room as a five-row one drifts out of step with it
             n = len(t.rows)
             rh = min(ROW_H, room / max(n, 1))
-            rf = _font(max(int(min(15, rh / SCALE * 0.62)), 9) * SCALE)
+            rf = _font(max(int(min(18, rh / SCALE * 0.74)), 9) * SCALE)
             rb = _font(rf.size, True)
             for j, row in enumerate(t.rows):
                 left, right = str(row[0]), str(row[1])

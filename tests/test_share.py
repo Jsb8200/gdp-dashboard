@@ -655,3 +655,54 @@ def test_sentences_split_on_a_capital_not_on_any_period(sample):
     heads = _playbook_heads(sample, confluence_levels(sample, m, o))
     flip = next((h for h in heads if "gamma flip" in h), None)
     assert flip is not None and f"{sample.gamma_flip:,.2f}" in flip
+
+
+def test_missing_glyphs_are_replaced_not_drawn_as_tofu():
+    """PIL's built-in bitmap font — what you get when no mono face resolves
+    at all — has no sigma, em dash, en dash or multiplication sign, and
+    draws each as a .notdef box. A card full of tofu is worse than one that
+    says "sd"."""
+    from PIL import ImageFont
+    from dealer_gex.share import _safe
+    poor = ImageFont.load_default(28)
+    rich = ImageFont.truetype(
+        "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf", 28)
+    src = "Regime — long gamma · ±392.39 (1σ) × 100"
+    got = _safe(src, poor)
+    assert "σ" not in got and "—" not in got and "×" not in got
+    assert "1sd" in got
+    assert _safe(src, rich) == src          # a capable face is left alone
+    assert _safe("plain ascii", poor) == "plain ascii"
+
+
+def test_a_card_survives_having_no_mono_font_at_all(monkeypatch):
+    """The whole card must still render — and render readably — on a box
+    where none of the candidate faces exist."""
+    import dealer_gex.share as S
+    S._font.cache_clear()
+    monkeypatch.setattr(S, "_MONO_CANDIDATES", {False: ["/nope.ttf"],
+                                                True: ["/nope.ttf"]})
+    try:
+        chain, spot = read_chain(open("data/sample_option_chain.csv", "rb").read())
+        a = analyze(chain, spot, ASOF)
+        png = build_share_card(a, "SPX", fields=CARD_FIELDS)
+        assert png[:8] == b"\x89PNG\r\n\x1a\n"
+        px = np.asarray(_open(png).convert("L"), dtype=float)
+        assert px.max() > 200               # text still drew
+    finally:
+        S._font.cache_clear()
+
+
+def test_the_ladder_strike_labels_are_centred_in_their_gutter(sample):
+    """Right-aligned at the panel edge they float away from the bars they
+    belong to."""
+    from dealer_gex.share import STYLES, _draw_bars
+    from PIL import Image as _I, ImageDraw as _D
+    bars = card_catalog(sample)["gex_bars"].bars(sample)
+    im = _I.new("RGB", (600, 400), STYLES["midnight"]["panel"])
+    _draw_bars(_D.Draw(im), (0, 0, 600, 400), bars, sample.spot, STYLES["midnight"])
+    px = np.asarray(im.convert("L"), dtype=float)
+    lit = np.flatnonzero(px[:, -70:].max(axis=0) > 140)
+    assert lit.size
+    # ink sits away from both edges of the gutter, i.e. it is centred
+    assert lit.min() > 2 and lit.max() < 68
