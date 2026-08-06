@@ -741,6 +741,28 @@ def _icon(d: ImageDraw.ImageDraw, box, kind: str, colour) -> None:
                   fill=colour)
 
 
+def _spread(ys, sep: float, lo: float, hi: float) -> list[float]:
+    """Push overlapping label positions apart to at least ``sep``, keeping
+    their order and staying inside ``[lo, hi]``.
+
+    ``ys`` must be sorted. Labels are placed greedily downward, then the
+    whole stack is shifted back up if it overran the bottom — shifting is
+    what keeps the order intact, where clamping each label individually
+    would pile them all on the last row.
+    """
+    out = []
+    for y in ys:
+        out.append(max(y, out[-1] + sep) if out else y)
+    if out:
+        over = out[-1] - hi
+        if over > 0:
+            out = [max(y - over, lo) for y in out]
+            # re-spread downward in case the clamp at ``lo`` recreated an overlap
+            for i in range(1, len(out)):
+                out[i] = max(out[i], out[i - 1] + sep)
+    return out
+
+
 def _draw_bars(d: ImageDraw.ImageDraw, box, data, spot: float, sty: dict) -> None:
     """Net GEX by strike as a price ladder: strike up the vertical axis,
     each strike's gamma as a horizontal bar off a zero line.
@@ -753,6 +775,11 @@ def _draw_bars(d: ImageDraw.ImageDraw, box, data, spot: float, sty: dict) -> Non
     The zero line is placed by the data, not down the middle: a book that
     is long gamma nearly everywhere should show one shallow red stub beside
     a wall of green, and centring the axis would draw that as balanced.
+
+    Only the five heaviest strikes are named. Labelling twenty-six of them
+    turns the axis into a wall of digits and hides the thing worth reading;
+    the rest stay dimmed so the top five carry the eye, and the top and
+    bottom of the window are marked so the range is still legible.
     """
     x0, y0, x1, y1 = box
     if not data:
@@ -760,28 +787,59 @@ def _draw_bars(d: ImageDraw.ImageDraw, box, data, spot: float, sty: dict) -> Non
     vals = [v for _, v in data]
     hi, lo = max(max(vals), 0.0), min(min(vals), 0.0)
     span = (hi - lo) or 1.0
-    zero_x = x0 + (-lo / span) * (x1 - x0)
+
+    f = _font(12 * SCALE)
+    fb = _font(12 * SCALE, True)
+    ks = [k for k, _ in data]
+    # a gutter on the right for the strike labels, so the longest bar cannot
+    # run into its own number
+    gutter = max(d.textlength(f"{k:,.0f}", font=fb) for k in ks) + 14 * SCALE
+    px1 = x1 - gutter
+    zero_x = x0 + (-lo / span) * (px1 - x0)
     bh = (y1 - y0) / len(data)
 
+    # rank by absolute gamma: a big negative strike matters as much as a big
+    # positive one, and ranking signed would bury it
+    top = set(sorted(range(len(vals)), key=lambda i: -abs(vals[i]))[:5])
+    dim = sty["panel"] or (20, 20, 24)
+
     # highest strike at the top: the data arrives strike-ascending
+    marks = []
     for i, (k, v) in enumerate(data):
         cy = y1 - (i + 0.5) * bh
-        tip = zero_x + (v / span) * (x1 - x0)
+        tip = zero_x + (v / span) * (px1 - x0)
         colour = HUES["mint"] if v >= 0 else HUES["rose"]
+        if i not in top:
+            colour = _mix(colour, dim, 0.55)
         d.rectangle([min(tip, zero_x), cy - bh * 0.33,
                      max(tip, zero_x), cy + bh * 0.33], fill=colour)
+        if i in top:
+            marks.append([cy, cy, f"{k:,.0f}",
+                          HUES["mint"] if v >= 0 else HUES["rose"]])
+
+    # The heaviest strikes cluster, so three of the five can land on
+    # neighbouring rows and overprint each other. Push the labels apart to a
+    # legible spacing, then run a leader back to the bar each one belongs to
+    # — a moved label with nothing tying it to its row is worse than none.
+    marks.sort(key=lambda m: m[1])
+    for m, ly in zip(marks, _spread([m[1] for m in marks], 15 * SCALE, y0, y1)):
+        m[0] = ly
+    for ly, cy, txt, colour in marks:
+        tw = d.textlength(txt, font=fb)
+        if abs(ly - cy) > 1.5 * SCALE:
+            d.line([(px1 + 4 * SCALE, cy), (x1 - tw - 7 * SCALE, ly)],
+                   fill=_mix(colour, dim, 0.45), width=max(1, SCALE // 2))
+        _text(d, (x1, ly), txt, fb, colour, "rm")
 
     d.line([(zero_x, y0), (zero_x, y1)], fill=sty["border"], width=SCALE)
 
-    ks = [k for k, _ in data]
-    f = _font(12 * SCALE)
     if spot and len(ks) > 1 and ks[0] <= spot <= ks[-1]:
         j = max(i for i, k in enumerate(ks) if k <= spot)
         frac = ((spot - ks[j]) / (ks[j + 1] - ks[j])) if j + 1 < len(ks) else 0.0
         sy = y1 - (j + 0.5 + frac) * bh
-        for xx in range(int(x0), int(x1), 8 * SCALE):
+        for xx in range(int(x0), int(px1), 8 * SCALE):
             d.line([(xx, sy), (xx + 4 * SCALE, sy)], fill=sty["label"], width=SCALE)
-        _text(d, (x1, sy - 4 * SCALE), f"{spot:,.0f}", f, sty["label"], "rd")
+        _text(d, (x0, sy - 4 * SCALE), f"{spot:,.0f}", f, sty["label"], "ld")
 
     _text(d, (x0, y0), f"{ks[-1]:,.0f}", f, sty["sub"], "la")
     _text(d, (x0, y1), f"{ks[0]:,.0f}", f, sty["sub"], "ld")

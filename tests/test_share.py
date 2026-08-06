@@ -571,3 +571,36 @@ def test_the_assumptions_table_renders_on_a_card(sample):
     png = build_share_card(sample, "SPX", fields=[cat["assumptions"]])
     assert png[:8] == b"\x89PNG\r\n\x1a\n"
     assert _open(png).width == SIZES[DEFAULT_SIZE] * SCALE
+
+
+def test_label_spacing_keeps_order_and_bounds():
+    """The heaviest strikes cluster, so three of the top five can land on
+    neighbouring rows; pushing them apart must not reorder them."""
+    from dealer_gex.share import _spread
+    got = _spread([10.0, 11.0, 12.0, 60.0, 61.0], 15.0, 0.0, 100.0)
+    assert got == sorted(got)
+    assert all(b - a >= 15.0 - 1e-9 for a, b in zip(got, got[1:]))
+    assert min(got) >= 0.0 and max(got) <= 100.0
+
+
+def test_label_spacing_shifts_the_stack_rather_than_piling_it_up():
+    """Clamping each label to the bottom would stack them all on one row."""
+    from dealer_gex.share import _spread
+    got = _spread([90.0, 91.0, 92.0], 15.0, 0.0, 100.0)
+    assert len(set(got)) == 3
+    assert all(b - a >= 15.0 - 1e-9 for a, b in zip(got, got[1:]))
+    assert max(got) <= 100.0
+
+
+def test_only_five_strikes_are_named_on_the_ladder(sample):
+    """Labelling twenty-six turns the axis into a wall of digits."""
+    from dealer_gex.share import STYLES, _draw_bars
+    from PIL import Image as _I, ImageDraw as _D
+    bars = card_catalog(sample)["gex_bars"].bars(sample)
+    im = _I.new("RGB", (600, 400), STYLES["midnight"]["panel"])
+    _draw_bars(_D.Draw(im), (0, 0, 600, 400), bars, sample.spot, STYLES["midnight"])
+    # the gutter is the right-hand strip; count rows carrying bright ink
+    px = np.asarray(im.convert("L"), dtype=float)[:, -70:]
+    lit = px.max(axis=1) > 140
+    runs = int(np.sum(lit[1:] & ~lit[:-1])) + int(lit[0])
+    assert 1 <= runs <= 5, runs
