@@ -739,9 +739,9 @@ def test_the_level_ladder_tile_matches_the_dashboard_table(sample):
     want = key_ladder(sample)
     assert len(rows) == len(want)
     assert [r[0] for r in rows] == list(want["Level"])       # same order
-    assert rows[0][1] == f"{float(want.iloc[0]['Price']):,.2f}"
+    assert rows[0][1][0] == f"{float(want.iloc[0]['Price']):,.2f}"
     # price-sorted, highest first
-    prices = [float(r[1].replace(",", "")) for r in rows]
+    prices = [float(r[1][0].replace(",", "")) for r in rows]
     assert prices == sorted(prices, reverse=True)
 
 
@@ -822,3 +822,40 @@ def test_block_tiles_come_from_the_real_flow_export(flow_prints):
     png = build_share_card(a, "SPX", fields=[cat["block_types"],
                                              cat["block_strikes"]])
     assert png[:8] == b"\x89PNG\r\n\x1a\n"
+
+
+def test_the_ladder_price_is_coloured_by_which_side_of_spot_it_is(sample):
+    """The ladder is price-sorted, so the colour break marks where price
+    actually is without having to find the Spot row."""
+    cat = card_catalog(sample)
+    rows = cat["level_ladder"].rows(sample)
+    seen_spot = False
+    for level, price, _reading in rows:
+        assert isinstance(price, tuple)          # (text, hue)
+        text, hue = price
+        value = float(text.replace(",", ""))
+        if value > sample.spot:
+            assert hue == "mint", level
+            assert not seen_spot                 # greens all come first
+        elif value < sample.spot:
+            assert hue == "rose", level
+        else:
+            assert hue == "slate" and level == "Spot"
+            seen_spot = True
+    assert seen_spot
+
+
+def test_a_table_cell_may_be_plain_or_coloured():
+    """Block tables pass strings; the ladder passes pairs. Both have to
+    render, and the width measurement has to cope with either."""
+    from dealer_gex.share import STYLES, _draw_table
+    from PIL import Image as _I, ImageDraw as _D
+    im = _I.new("RGB", (800, 200), STYLES["midnight"]["panel"])
+    _draw_table(im, _D.Draw(im), (0, 0, 800, 200), ("A", "B", "C"),
+                [("plain", "text", "here"),
+                 ("mixed", ("999.99", "mint"), "and prose")],
+                STYLES["midnight"])
+    px = np.asarray(im.convert("RGB"))
+    mint = np.asarray(HUES["mint"])
+    close = (np.abs(px.astype(int) - mint).sum(axis=2) < 90).sum()
+    assert close > 20                            # the coloured cell drew

@@ -545,8 +545,15 @@ def card_catalog(a: Analysis, *, oi=None, magnets=None, forecast=None,
             lambda a: "",
             hue="sky", icon="wall", span=6,
             columns=("Level", "Price", "Reading"),
+            # green above spot, red below, white on the spot row itself —
+            # the ladder is price-sorted, so the colour break marks where
+            # price actually is without needing to find the row
             rows=lambda a, t=ladder: [
-                (str(r["Level"]), f"{float(r['Price']):,.2f}", str(r["Reading"]))
+                (str(r["Level"]),
+                 (f"{float(r['Price']):,.2f}",
+                  "mint" if float(r["Price"]) > a.spot
+                  else "rose" if float(r["Price"]) < a.spot else "slate"),
+                 str(r["Reading"]))
                 for _, r in t.iterrows()])
 
     fmove = getattr(forecast, "blended_pct", None) if forecast is not None else None
@@ -1046,7 +1053,14 @@ def _draw_table(img: Image.Image, d: ImageDraw.ImageDraw, box, columns, rows,
     price ladder and reads as a mess for prose. Columns are sized to their
     own widest cell, and the last one takes whatever is left, so a short
     key column does not steal room from a sentence.
+
+    A cell may be a plain string or a ``(text, hue)`` pair; the pair form
+    lets a column carry meaning in its colour — a price ladder reads much
+    faster when what sits above spot is green and what sits below is red.
     """
+    def _cell(v):
+        return (str(v[0]), v[1]) if isinstance(v, tuple) else (str(v), None)
+
     x0, y0, x1, y1 = box
     n = len(rows) + 1
     rh = min(ROW_H, (y1 - y0) / max(n, 1))
@@ -1058,8 +1072,9 @@ def _draw_table(img: Image.Image, d: ImageDraw.ImageDraw, box, columns, rows,
     # every column but the last is as wide as its widest cell
     widths = []
     for i in range(ncol - 1):
-        cells = [str(columns[i])] + [str(r[i]) for r in rows if len(r) > i]
-        widths.append(max(d.textlength(c, font=fb) for c in cells) + pad_c * 2)
+        cells = [str(columns[i])] + [_cell(r[i])[0] for r in rows if len(r) > i]
+        widths.append(max(d.textlength(_safe(c, fb), font=fb) for c in cells)
+                      + pad_c * 2)
     widths.append(max((x1 - x0) - sum(widths), pad_c * 4))
 
     # header band, then a rule under it and one between each pair of rows
@@ -1081,11 +1096,14 @@ def _draw_table(img: Image.Image, d: ImageDraw.ImageDraw, box, columns, rows,
         ry = y0 + (j + 1) * rh + rh / 2
         cx = x0
         for i in range(ncol):
-            cell = str(row[i]) if len(row) > i else ""
-            # the first column names the thing; the rest report it
-            colour = sty["value"] if i == 0 else sty["sub"]
-            _text(d, (cx + pad_c, ry),
-                  cell, fb if i == 0 else f, colour, "lm")
+            cell, hue = _cell(row[i]) if len(row) > i else ("", None)
+            # the first column names the thing; the rest report it, unless
+            # the cell carries a hue of its own
+            colour = (HUES.get(hue, sty["value"]) if isinstance(hue, str)
+                      else tuple(hue) if hue
+                      else (sty["value"] if i == 0 else sty["sub"]))
+            _text(d, (cx + pad_c, ry), cell,
+                  fb if (i == 0 or hue) else f, colour, "lm")
             cx += widths[i]
 
 
