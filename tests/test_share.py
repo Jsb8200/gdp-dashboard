@@ -742,3 +742,39 @@ def test_the_level_ladder_tile_matches_the_dashboard_table(sample):
     # price-sorted, highest first
     prices = [float(r[1].replace(",", "")) for r in rows]
     assert prices == sorted(prices, reverse=True)
+
+
+@pytest.mark.parametrize("weight", ["open_interest", "volume"])
+def test_every_playbook_line_classifies_under_every_weighting(weight):
+    """`build_playbook` adds a line explaining the weighting when it is not
+    open interest. Two unclassified lines would collide on the same key and
+    become indistinguishable in the picker."""
+    from dealer_gex.analytics import confluence_levels, magnet_levels, oi_levels
+    from dealer_gex.share import playbook_choices
+    chain, spot = read_chain(open("data/sample_option_chain.csv", "rb").read())
+    a = analyze(chain, spot, ASOF, weight=weight)
+    m, o = magnet_levels(a), oi_levels(a)
+    keys = [k for k, _ in playbook_choices(a, confluence_levels(a, m, o))]
+    assert "other" not in keys, weight
+    assert len(set(keys)) == len(keys), (weight, keys)
+
+
+def test_the_weighting_view_lines_classify():
+    """`build_playbook` adds a line explaining the weighting when it is not
+    open interest. Signed-flow needs side codes the sample chain lacks, so
+    its line is checked against the classifier directly rather than through
+    an analysis that cannot be built."""
+    from dealer_gex.share import _playbook_key
+    assert _playbook_key(
+        "Volume-weighted (intraday) view — levels reflect today's traded flow"
+    ) == "volume_view"
+    assert _playbook_key(
+        "Signed order-flow view — dealer positioning is inferred from actual"
+    ) == "flow_view"
+    # and every lead is distinct, or two lines would share a key
+    from dealer_gex.share import PLAYBOOK_LINES
+    leads = list(PLAYBOOK_LINES.values())
+    assert len(set(leads)) == len(leads)
+    for i, a in enumerate(leads):
+        for b in leads[i + 1:]:
+            assert not a.startswith(b) and not b.startswith(a), (a, b)

@@ -258,6 +258,9 @@ PLAYBOOK_LINES = {
     "magnets": "Nearest magnets",
     "oi": "Raw OI structure",
     "flows": "Passive flows",
+    # only present under the matching weighting
+    "volume_view": "Volume-weighted",
+    "flow_view": "Signed order-flow",
 }
 
 

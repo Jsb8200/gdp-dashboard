@@ -1553,15 +1553,47 @@ def tables(a: Analysis) -> None:
         st.dataframe(top, use_container_width=True, hide_index=True)
 
 
+#: Card view presets. Each is a weighting the book can be read under —
+#: what is standing before the bell, what has actually traded today, and
+#: (when more than one session is loaded) the session before this one.
+CARD_VIEWS = {
+    "Pre-market": ("open_interest", "standing book — open interest"),
+    "Intraday": ("volume", "today's tape — volume weighted"),
+    "Historical": ("", "the previous session in the upload"),
+}
+
+
 def share_card_section(a: Analysis, ticker: str,
                        magnets: pd.DataFrame | None = None,
                        forecast=None,
-                       master: pd.DataFrame | None = None) -> None:
+                       master: pd.DataFrame | None = None,
+                       rebuild=None,
+                       prev: Analysis | None = None) -> None:
     """The headline read as one downloadable picture — tiles, order, style
     and wording all chosen here rather than baked into the renderer."""
     st.subheader("🪟 Share card")
 
     with st.expander("⚙️ Customise the card", expanded=False):
+        # Which read of the book the card shows. Card-only: the dashboard
+        # keeps whatever weighting is set in the sidebar.
+        views = [v for v in CARD_VIEWS
+                 if v != "Historical" or prev is not None]
+        view = st.radio(
+            "View", views, index=0, horizontal=True, key="card_view",
+            format_func=lambda v: f"{v} — {CARD_VIEWS[v][1]}",
+            help="Pre-market reads the standing book (open interest); "
+                 "intraday weights by what has traded today. Historical "
+                 "appears when the upload covers more than one session.")
+        if view == "Historical" and prev is not None:
+            a, magnets, master = prev
+        elif rebuild is not None and CARD_VIEWS[view][0] != a.weight_mode:
+            # the magnets and the confluence table are derived from the
+            # weighting too — swapping only the Analysis would leave the
+            # magnet map describing a book the headline no longer shows
+            swapped = rebuild(CARD_VIEWS[view][0])
+            if swapped is not None:
+                a, magnets, master = swapped
+
         c1, c2, c3, c4 = st.columns([1, 1, 1, 1])
         style = c1.selectbox("Style", list(STYLES), index=0, key="card_style",
                              help="`midnight` is the flat dashboard look; "
@@ -2105,7 +2137,22 @@ def main() -> None:
         notable_flow_section(merged_prints, a.spot)
 
     playbook_section(a, master)
-    share_card_section(a, ticker, magnets, forecast, master)
+    def _card_view(weight_mode):
+        """Re-read the book under a different weighting, for the card only."""
+        try:
+            ai = _analyze_cached(chain, spot, asof, rate, weight_mode, multiplier)
+        except ValueError:
+            return None
+        mg, _oi, _bb, _bl, _dl, ms = _derive(ai, merged_prints, dark_t)
+        return ai, mg, ms
+
+    prev_view = None
+    if history and len(analyses) > 1:
+        pa = analyses[-2]
+        pm, _o2, _b2, _l2, _d2, pms = _derive(pa, None)
+        prev_view = (pa, pm, pms)
+    share_card_section(a, ticker, magnets, forecast, master,
+                       rebuild=_card_view, prev=prev_view)
     tables(a)
     report_section(a, ticker, hist, blk_books, blk_lvls, master, dq,
                    dark_lvls, forecast,
