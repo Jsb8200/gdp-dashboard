@@ -604,3 +604,34 @@ def test_only_five_strikes_are_named_on_the_ladder(sample):
     lit = px.max(axis=1) > 140
     runs = int(np.sum(lit[1:] & ~lit[:-1])) + int(lit[0])
     assert 1 <= runs <= 5, runs
+
+
+def test_the_interpretation_tile_keeps_the_numbers(sample):
+    """Taking the bold lead looks tidier and loses data: the confluence
+    bullet nests bold inside bold, and "**Passive flows:**" puts both dollar
+    figures outside the bold entirely."""
+    from dealer_gex.analytics import confluence_levels, magnet_levels, oi_levels
+    m, o = magnet_levels(sample), oi_levels(sample)
+    master = confluence_levels(sample, m, o)
+    cat = card_catalog(sample, magnets=m, master=master)
+    lines = [r[0] for r in cat["interpretation"].rows(sample)]
+    assert lines and cat["interpretation"].span == 4
+    assert not any("**" in ln for ln in lines)          # markdown stripped
+    joined = " ".join(lines)
+    assert "Passive flows" in joined
+    passive = next(ln for ln in lines if "Passive flows" in ln)
+    assert "vanna" in passive and "charm" in passive    # the figures survived
+    conf = next((ln for ln in lines if "confluence" in ln), None)
+    if conf is not None:
+        assert f"{master.iloc[0]['level']:,.2f}" in conf
+
+
+def test_sentences_split_on_a_capital_not_on_any_period(sample):
+    """"700.03" and "±9.40" are full of periods — splitting on all of them
+    truncates the line at its first number."""
+    from dealer_gex.share import _playbook_heads
+    from dealer_gex.analytics import confluence_levels, magnet_levels, oi_levels
+    m, o = magnet_levels(sample), oi_levels(sample)
+    heads = _playbook_heads(sample, confluence_levels(sample, m, o))
+    flip = next((h for h in heads if "gamma flip" in h), None)
+    assert flip is not None and f"{sample.gamma_flip:,.2f}" in flip

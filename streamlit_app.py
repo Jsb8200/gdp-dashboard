@@ -1554,7 +1554,8 @@ def tables(a: Analysis) -> None:
 
 def share_card_section(a: Analysis, ticker: str,
                        magnets: pd.DataFrame | None = None,
-                       forecast=None) -> None:
+                       forecast=None,
+                       master: pd.DataFrame | None = None) -> None:
     """The headline read as one downloadable picture — tiles, order, style
     and wording all chosen here rather than baked into the renderer."""
     st.subheader("🪟 Share card")
@@ -1605,7 +1606,9 @@ def share_card_section(a: Analysis, ticker: str,
         if conv.active:
             a = convert_analysis(a, conv)
             magnets = convert_frame(magnets, conv, a.spot)
-        cat = card_catalog(a, oi=oi_walls(a), magnets=magnets, forecast=forecast)
+            master = convert_frame(master, conv, a.spot)
+        cat = card_catalog(a, oi=oi_walls(a), magnets=magnets, forecast=forecast,
+                           master=master)
         keys = list(cat)
 
         title = st.text_input(
@@ -2091,7 +2094,7 @@ def main() -> None:
         notable_flow_section(merged_prints, a.spot)
 
     playbook_section(a, master)
-    share_card_section(a, ticker, magnets, forecast)
+    share_card_section(a, ticker, magnets, forecast, master)
     tables(a)
     report_section(a, ticker, hist, blk_books, blk_lvls, master, dq,
                    dark_lvls, forecast,

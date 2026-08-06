@@ -238,8 +238,33 @@ def _em_band(a: Analysis) -> str:
     return f"{a.spot - a.expected_move:,.0f} – {a.spot + a.expected_move:,.0f}"
 
 
+def _playbook_heads(a: Analysis, master) -> list[str]:
+    """The bold lead of each trading-interpretation bullet.
+
+    The dashboard's bullets run two or three sentences each — the reasoning
+    belongs on a screen you can scroll. What survives on a card is the first
+    sentence, which carries the numbers.
+
+    Taking the **bold** lead instead looks tidier and loses data: the
+    confluence bullet nests bold inside bold, and "**Passive flows:**" puts
+    its two dollar figures outside the bold entirely, so both would arrive
+    on the card as a heading with nothing under it.
+
+    Sentences are split on a period followed by a capital, not on any
+    period — "700.03" and "±9.40" are full of them.
+    """
+    from dealer_gex.report import build_playbook
+    heads = []
+    for line in build_playbook(a, master=master):
+        plain = re.sub(r"\*\*", "", line)
+        plain = re.sub(r"\s+", " ", plain).strip()
+        first = re.split(r"\.\s+(?=[A-Z])", plain, maxsplit=1)[0]
+        heads.append(first.strip().rstrip("."))
+    return heads
+
+
 def card_catalog(a: Analysis, *, oi=None, magnets=None,
-                 forecast=None) -> dict[str, Field]:
+                 forecast=None, master=None) -> dict[str, Field]:
     """Every tile this analysis can support, keyed by name.
 
     The dashboard renders the keys as checkboxes; anything the current file
@@ -399,6 +424,15 @@ def card_catalog(a: Analysis, *, oi=None, magnets=None,
             ("Book", f"{a.n_contracts:,} contracts · {len(a.expiries)} expiries",
              "expired contracts excluded"),
         ])
+
+    heads = _playbook_heads(a, master)
+    if heads:
+        cat["interpretation"] = Field(
+            "interpretation", "Trading interpretation",
+            lambda a: "read",
+            lambda a: "",
+            hue="amber", icon="flag", span=4,
+            rows=lambda a, h=heads: [(f"· {t}", "", "slate") for t in h])
 
     fmove = getattr(forecast, "blended_pct", None) if forecast is not None else None
     if fmove is not None and getattr(forecast, "status", "") == "ok":
