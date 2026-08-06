@@ -305,8 +305,8 @@ def playbook_choices(a: Analysis, master=None) -> list[tuple[str, str]]:
     return [(_playbook_key(h), h) for h in _playbook_heads(a, master)]
 
 
-def card_catalog(a: Analysis, *, oi=None, magnets=None,
-                 forecast=None, master=None, lines=None) -> dict[str, Field]:
+def card_catalog(a: Analysis, *, oi=None, magnets=None, forecast=None,
+                 master=None, lines=None, prints=None) -> dict[str, Field]:
     """Every tile this analysis can support, keyed by name.
 
     The dashboard renders the keys as checkboxes; anything the current file
@@ -476,6 +476,63 @@ def card_catalog(a: Analysis, *, oi=None, magnets=None,
             lambda a: "",
             hue="amber", icon="flag", span=6,
             rows=lambda a, h=heads: [(f"· {t}", "", "slate") for t in h])
+
+    # --- blocks ---------------------------------------------------------
+    if prints is not None and len(prints):
+        from dealer_gex.analytics import (block_dominance, block_strike_ladder,
+                                          block_tier_summary,
+                                          block_type_breakdown)
+        dom = block_dominance(prints, a.spot)
+        if dom and dom.get("leader"):
+            cat["block_book"] = Field(
+                "block_book", "Block book",
+                lambda a, d=dom: d["leader"],
+                # ``lenses`` is a count, not a list — premium, open interest
+                # and impact are the three the leader is judged on
+                lambda a, d=dom: (f"leads {d.get('lenses_won', 0)} of "
+                                  f"{d.get('lenses', 3)} lenses · "
+                                  f"{d.get('tier_leader', '')} "
+                                  f"{d.get('tier_share', 0):.0%}"),
+                hue="fuchsia", icon="stack")
+
+        bt = block_type_breakdown(prints, a.spot)
+        if bt is not None and not bt.empty:
+            top = bt.head(5)
+            cat["block_types"] = Field(
+                "block_types", "Block types",
+                lambda a, t=top: str(t.iloc[0]["block_type"]),
+                lambda a: "", hue="fuchsia", icon="stack", span=3,
+                columns=("Type", "Premium", "Share"),
+                rows=lambda a, t=top: [
+                    (str(r["block_type"]), fmt_dollars(float(r["premium"])),
+                     f"{float(r['premium_share']):.0%}")
+                    for _, r in t.iterrows()])
+
+            tiers = block_tier_summary(bt)
+            if tiers is not None and not tiers.empty:
+                cat["block_tiers"] = Field(
+                    "block_tiers", "Block tiers",
+                    lambda a, t=tiers: str(t.iloc[0]["tier"]),
+                    lambda a: "", hue="violet", icon="wall", span=3,
+                    columns=("Tier", "Premium", "Share"),
+                    rows=lambda a, t=tiers: [
+                        (str(r["tier"]), fmt_dollars(float(r["premium"])),
+                         f"{float(r['premium_share']):.0%}")
+                        for _, r in t.iterrows()])
+
+        ladder_b = block_strike_ladder(prints, a.spot)
+        if ladder_b is not None and not ladder_b.empty:
+            topb = ladder_b.head(5)
+            cat["block_strikes"] = Field(
+                "block_strikes", "Block strikes",
+                lambda a, t=topb: f"{float(t.iloc[0]['strike']):,.2f}",
+                lambda a: "", hue="orange", icon="wall", span=3,
+                columns=("Strike", "Premium", "Contracts"),
+                rows=lambda a, t=topb: [
+                    (f"{float(r['strike']):,.2f}",
+                     fmt_dollars(float(r["premium"])),
+                     f"{int(r['contracts']):,}")
+                    for _, r in t.iterrows()])
 
     # The dashboard's level ladder, as it appears on the page: every
     # actionable level in one price-sorted table with what it means.

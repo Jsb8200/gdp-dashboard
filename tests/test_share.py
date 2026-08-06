@@ -2,6 +2,7 @@
 
 import copy
 import io
+import os
 import math
 from datetime import date
 
@@ -778,3 +779,46 @@ def test_the_weighting_view_lines_classify():
     for i, a in enumerate(leads):
         for b in leads[i + 1:]:
             assert not a.startswith(b) and not b.startswith(a), (a, b)
+
+
+@pytest.fixture(scope="module")
+def flow_prints():
+    from dealer_gex.parsing import parse_file
+    path = ("/root/.claude/uploads/c39ce9c9-b3cb-5bd5-9d5e-e27db2e98dad/"
+            "f9f9e43a-QuantData_OptionsOrderFlow_2026_07_30_to_2026_07_31_2.csv")
+    if not os.path.exists(path):
+        pytest.skip("real flow export not present")
+    pf = parse_file(open(path, "rb").read())
+    return pf.prints[pf.prints["ticker"] == "SPX"], pf.spots.get("SPX"), pf.asof
+
+
+def test_block_tiles_appear_only_when_prints_are_given(sample):
+    """A chain-only upload has no prints, so there is no block book to show
+    and the picker must not offer one."""
+    assert not [k for k in card_catalog(sample) if k.startswith("block")]
+
+
+def test_block_tiles_come_from_the_real_flow_export(flow_prints):
+    from dealer_gex.analytics import block_type_breakdown
+    from dealer_gex.parsing import aggregate_prints
+    prints, spot, asof = flow_prints
+    a = analyze(aggregate_prints(prints), spot, asof, multiplier=100.0)
+    cat = card_catalog(a, prints=prints)
+    assert {"block_book", "block_types", "block_tiers",
+            "block_strikes"} <= set(cat)
+
+    bt = block_type_breakdown(prints, a.spot)
+    rows = cat["block_types"].rows(a)
+    assert [r[0] for r in rows] == list(bt.head(5)["block_type"])
+    # premium-ranked, biggest first
+    assert cat["block_types"].value(a) == str(bt.iloc[0]["block_type"])
+
+    # the dominance sub-line reports counts, and `lenses` is an int not a list
+    sub = cat["block_book"].sub(a)
+    assert "of 3 lenses" in sub
+
+    strikes = [float(r[0].replace(",", "")) for r in cat["block_strikes"].rows(a)]
+    assert len(strikes) <= 5
+    png = build_share_card(a, "SPX", fields=[cat["block_types"],
+                                             cat["block_strikes"]])
+    assert png[:8] == b"\x89PNG\r\n\x1a\n"

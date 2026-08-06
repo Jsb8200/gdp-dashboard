@@ -1568,7 +1568,8 @@ def share_card_section(a: Analysis, ticker: str,
                        forecast=None,
                        master: pd.DataFrame | None = None,
                        rebuild=None,
-                       prev: Analysis | None = None) -> None:
+                       prev: Analysis | None = None,
+                       prints: pd.DataFrame | None = None) -> None:
     """The headline read as one downloadable picture — tiles, order, style
     and wording all chosen here rather than baked into the renderer."""
     st.subheader("🪟 Share card")
@@ -1651,7 +1652,7 @@ def share_card_section(a: Analysis, ticker: str,
             help="Only used by the Trading interpretation tile.")
 
         cat = card_catalog(a, oi=oi_walls(a), magnets=magnets, forecast=forecast,
-                           master=master, lines=set(picked_lines))
+                           master=master, lines=set(picked_lines), prints=prints)
         keys = list(cat)
 
         title = st.text_input(
@@ -2152,7 +2153,7 @@ def main() -> None:
         pm, _o2, _b2, _l2, _d2, pms = _derive(pa, None)
         prev_view = (pa, pm, pms)
     share_card_section(a, ticker, magnets, forecast, master,
-                       rebuild=_card_view, prev=prev_view)
+                       rebuild=_card_view, prev=prev_view, prints=merged_prints)
     tables(a)
     report_section(a, ticker, hist, blk_books, blk_lvls, master, dq,
                    dark_lvls, forecast,
