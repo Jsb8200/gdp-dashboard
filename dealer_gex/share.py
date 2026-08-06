@@ -128,9 +128,10 @@ TILE_H = 158 * SCALE
 ROW_H = 26 * SCALE
 BARS_H = 268 * SCALE
 
-#: Tiles per row, by tile count. Anything past eight takes four columns.
-_COLS = {1: 1, 2: 2, 3: 3, 4: 2, 5: 3, 6: 3, 7: 4, 8: 4, 9: 3,
-         10: 4, 11: 4, 12: 4}
+#: The grid is six columns wide and every row is filled: a tile's ``span``
+#: is how many sixths of the card it asks for, and whatever slack is left on
+#: a row is shared out among the tiles on it. See ``_place``.
+GRID_COLS = 6
 
 #: The two looks. ``glass`` panels are lenses over a tinted backdrop;
 #: ``midnight`` panels are opaque and flat, which is what a dashboard card
@@ -359,7 +360,7 @@ def card_catalog(a: Analysis, *, oi=None, magnets=None,
                 "top_gex", "Top 5 GEX strikes",
                 lambda a, t=top: f"{float(t.iloc[0]['strike']):,.2f}",
                 lambda a, t=top: f"heaviest of {len(bs):,} strikes",
-                hue="sky", icon="wall", span=2,
+                hue="sky", icon="wall", span=3,
                 rows=lambda a, t=top: [
                     (f"{float(r['strike']):,.2f}",
                      fmt_dollars(float(r["net_gex"])),
@@ -381,7 +382,7 @@ def card_catalog(a: Analysis, *, oi=None, magnets=None,
             "gex_bars", "Net GEX by strike",
             lambda a: fmt_dollars(a.total_gex),
             lambda a, n=len(near): f"{n} strikes around spot",
-            hue="sky", icon="bars", span=1, rowspan=2,
+            hue="sky", icon="bars", span=2, rowspan=2,
             bars=lambda a, t=near: [(float(r.strike), float(r.net_gex))
                                     for r in t.itertuples()])
 
@@ -391,7 +392,7 @@ def card_catalog(a: Analysis, *, oi=None, magnets=None,
             "magnets", "Magnet map",
             lambda a, t=top_m: f"{float(t.iloc[0]['level']):,.2f}",
             lambda a, t=top_m: f"{len(t)} levels within ±10%",
-            hue="lime", icon="target", span=2,
+            hue="lime", icon="target", span=3,
             rows=lambda a, t=top_m: [
                 (f"{float(r['level']):,.2f}",
                  f"{str(r['kind'])[:11]} {float(r['strength']):.0f}",
@@ -408,7 +409,7 @@ def card_catalog(a: Analysis, *, oi=None, magnets=None,
         "assumptions", "Assumptions",
         lambda a: "estimate",
         lambda a: "levels are model output, not observed prices",
-        hue="slate", icon="flag", span=2,
+        hue="slate", icon="flag", span=3,
         columns=("Assumption", "Setting", "If it is wrong"),
         rows=lambda a: [
             ("Dealer sign", "long calls / short puts",
@@ -431,7 +432,7 @@ def card_catalog(a: Analysis, *, oi=None, magnets=None,
             "interpretation", "Trading interpretation",
             lambda a: "read",
             lambda a: "",
-            hue="amber", icon="flag", span=4,
+            hue="amber", icon="flag", span=6,
             rows=lambda a, h=heads: [(f"· {t}", "", "slate") for t in h])
 
     fmove = getattr(forecast, "blended_pct", None) if forecast is not None else None
@@ -1053,9 +1054,7 @@ def _place(tiles: list) -> tuple[int, list, list]:
     left edge with the single-number tiles flowing to its right; threading
     it into the reading order instead would leave a hole wherever it landed.
     """
-    widest = max(t.span for t in tiles)
-    cells = sum(t.span * t.rowspan for t in tiles)
-    cols = max(_COLS.get(cells, 4), widest)
+    cols = max(GRID_COLS, max(t.span for t in tiles))
 
     grid: list[list[bool]] = []
 
@@ -1085,6 +1084,36 @@ def _place(tiles: list) -> tuple[int, list, list]:
 
     while grid and not any(grid[-1]):
         grid.pop()
+
+    # No row may end short. First-fit leaves a tail whenever the next tile
+    # is wider than the gap, and an empty cell reads as a missing tile
+    # rather than as spare room. The slack is shared out evenly across the
+    # single-row tiles on that row and the row is re-flowed left to right;
+    # tiles that span rows keep their column, since widening one of those
+    # would punch a hole in the other row it occupies.
+    for r in range(len(grid)):
+        on_row = sorted((i for i, p in enumerate(places)
+                         if p[0] <= r < p[0] + p[3]), key=lambda i: places[i][1])
+        if not on_row:
+            continue
+        used = sum(places[i][2] for i in on_row)
+        slack = cols - used
+        growable = [i for i in on_row if places[i][3] == 1]
+        if slack <= 0 or not growable:
+            continue
+        for n, i in enumerate(growable):
+            r0, c0, sp0, rs0 = places[i]
+            extra = slack // len(growable) + (1 if n < slack % len(growable) else 0)
+            places[i] = (r0, c0, sp0 + extra, rs0)
+        c = 0
+        for i in on_row:
+            r0, c0, sp0, rs0 = places[i]
+            if rs0 > 1:                       # anchored: it owns another row too
+                c = c0 + sp0
+                continue
+            places[i] = (r0, c, sp0, rs0)
+            c += sp0
+
     heights = [TILE_H] * len(grid)
     # A tile spanning rows takes its height from the rows it covers, so only
     # single-row tiles get a say in how tall a row has to be.

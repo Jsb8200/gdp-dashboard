@@ -77,9 +77,11 @@ def test_regime_picks_the_palette(sample):
 def test_tiles_come_from_the_field_list(sample):
     """Adding a number to the card has to be one entry, not a layout edit."""
     one = _open(build_share_card(sample, "SPY", fields=CARD_FIELDS[:1]))
-    six = _open(build_share_card(sample, "SPY", fields=CARD_FIELDS))
-    assert one.width == six.width == CARD_W * SCALE   # the width is the frame
-    assert one.height < six.height                    # the height follows the rows
+    many = _open(build_share_card(
+        sample, "SPY", fields=CARD_FIELDS,
+        extras=[("a", "1"), ("b", "2"), ("c", "3")]))
+    assert one.width == many.width == CARD_W * SCALE  # the width is the frame
+    assert one.height < many.height                   # the height follows the rows
 
 
 def test_extras_append_without_touching_the_defaults(sample):
@@ -202,13 +204,28 @@ def test_tiles_carry_distinct_accents(sample):
     assert len(set(hues)) >= 5
 
 
-def test_the_grid_stays_two_rows_while_it_can():
-    """A third row costs a third of the tile height, and height is what
-    decides how large the value can be set."""
-    from dealer_gex.share import _COLS
-    for n in range(1, 9):
-        assert math.ceil(n / _COLS[n]) <= 2
-    assert _COLS[4] == 2          # 2x2, not a row of three and a straggler
+def test_no_row_is_ever_left_short(sample):
+    """First-fit leaves a tail whenever the next tile is wider than the gap,
+    and an empty cell reads as a missing tile rather than as spare room."""
+    from dealer_gex.share import GRID_COLS, _place, _Tile
+
+    def mk(span=1, rowspan=1):
+        return _Tile("x", "1", "", HUES["slate"], "dot", None, span, None, rowspan)
+
+    for tiles in ([mk()], [mk()] * 2, [mk()] * 5, [mk()] * 7,
+                  [mk(2, 2)] + [mk()] * 6,
+                  [mk(2, 2), mk(3), mk(), mk(), mk(6), mk(3)],
+                  [mk(6)], [mk(3), mk()], [mk(2, 2)] + [mk()] * 3 + [mk(3)]):
+        cols, places, heights = _place(tiles)
+        assert cols == GRID_COLS
+        filled = [[False] * cols for _ in heights]
+        for (r, c, sp, rs) in places:
+            for rr in range(r, r + rs):
+                for cc in range(c, c + sp):
+                    assert not filled[rr][cc], "tiles overlap"
+                    filled[rr][cc] = True
+        for r, row in enumerate(filled):
+            assert all(row), f"row {r} left short: {row}"
 
 
 def test_a_seventh_tile_does_not_collide_with_the_caption(sample):
@@ -285,13 +302,16 @@ def test_a_signed_caption_is_coloured_by_its_sign():
     assert _DELTA.match("positive = stabilizing") is None
 
 
-def test_no_row_is_left_with_a_single_straggler():
-    """A last row holding one tile out of four reads as a mistake."""
-    from dealer_gex.share import _COLS
-    for n in range(2, 13):
-        cols = _COLS.get(n, 4)
-        last = n % cols or cols
-        assert last > 1 or n == 1, (n, cols, last)
+def test_slack_is_shared_out_rather_than_dumped_on_one_tile():
+    """Growing only the last tile in a row would leave one narrow tile
+    beside a very wide one."""
+    from dealer_gex.share import _place, _Tile
+    mk = lambda: _Tile("x", "1", "", HUES["slate"], "dot", None, 1, None, 1)
+    _, places, _ = _place([mk(), mk()])
+    spans = sorted(p[2] for p in places)
+    assert spans == [3, 3]                      # six columns, split evenly
+    _, places, _ = _place([mk(), mk(), mk(), mk()])
+    assert sorted(p[2] for p in places) == [1, 1, 2, 2], (n, cols, last)
 
 
 def test_ranked_list_tiles_are_offered_and_render(sample):
@@ -301,7 +321,7 @@ def test_ranked_list_tiles_are_offered_and_render(sample):
     assert "top_gex" in cat and "magnets" in cat
     for key in ("top_gex", "magnets"):
         f = cat[key]
-        assert f.span == 2                       # a list needs the width
+        assert f.span == 3                       # a list needs half the row
         rows = f.rows(sample)
         assert 1 <= len(rows) <= 5
         assert all(len(r) == 3 for r in rows)    # left, right, hue
@@ -389,7 +409,7 @@ def test_the_gex_ladder_is_a_tall_left_hand_tile(sample):
     from dealer_gex.share import _place, _Tile
     cat = card_catalog(sample)
     f = cat["gex_bars"]
-    assert f.span == 1 and f.rowspan == 2
+    assert f.span == 2 and f.rowspan == 2
     tiles = [_Tile(x.label, "1", "", HUES["slate"], "dot", None, x.span, None,
                    x.rowspan) for x in CARD_FIELDS]
     ladder = _Tile(f.label, "1", "", HUES["sky"], "bars", None, f.span,
@@ -517,13 +537,13 @@ def test_the_assumptions_tile_reports_the_real_settings(sample):
     fixed blurb."""
     cat = card_catalog(sample)
     assert cat["assumptions"].columns == ("Assumption", "Setting", "If it is wrong")
+    assert cat["assumptions"].span == 3
     rows = dict((r[0], r[1]) for r in cat["assumptions"].rows(sample))
     assert all(len(r) == 3 for r in cat["assumptions"].rows(sample))
     assert f"×{sample.multiplier:g}" in rows["Multiplier"]
     assert f"{sample.rate:.2%}" in rows["Rate"]
     assert f"{sample.n_contracts:,}" in rows["Book"]
     assert "long calls / short puts" == rows["Dealer sign"]
-    assert cat["assumptions"].span == 2
 
 
 def test_the_assumptions_follow_the_weighting_and_multiplier(sample):
@@ -615,7 +635,7 @@ def test_the_interpretation_tile_keeps_the_numbers(sample):
     master = confluence_levels(sample, m, o)
     cat = card_catalog(sample, magnets=m, master=master)
     lines = [r[0] for r in cat["interpretation"].rows(sample)]
-    assert lines and cat["interpretation"].span == 4
+    assert lines and cat["interpretation"].span == 6   # full width
     assert not any("**" in ln for ln in lines)          # markdown stripped
     joined = " ".join(lines)
     assert "Passive flows" in joined
