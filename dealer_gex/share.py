@@ -245,6 +245,29 @@ def _em_band(a: Analysis) -> str:
     return f"{a.spot - a.expected_move:,.0f} – {a.spot + a.expected_move:,.0f}"
 
 
+#: Which interpretation line is which, so the card can offer them
+#: individually. Matched on the opening phrase because ``build_playbook``
+#: returns prose, not records — keep in step with it.
+PLAYBOOK_LINES = {
+    "confluence": "Key levels by confluence",
+    "regime": "Regime",
+    "flip": "Watch",
+    "no_flip": "No gamma flip",
+    "range": "Range frame",
+    "expected_move": "Options price",
+    "magnets": "Nearest magnets",
+    "oi": "Raw OI structure",
+    "flows": "Passive flows",
+}
+
+
+def _playbook_key(line: str) -> str:
+    for key, lead in PLAYBOOK_LINES.items():
+        if line.startswith(lead):
+            return key
+    return "other"
+
+
 def _playbook_heads(a: Analysis, master) -> list[str]:
     """The bold lead of each trading-interpretation bullet.
 
@@ -270,8 +293,17 @@ def _playbook_heads(a: Analysis, master) -> list[str]:
     return heads
 
 
+def playbook_choices(a: Analysis, master=None) -> list[tuple[str, str]]:
+    """``(key, sentence)`` for every interpretation line this book produces.
+
+    The dashboard lists these so a card can carry three of them rather than
+    all eight — which line matters depends on what you are showing someone.
+    """
+    return [(_playbook_key(h), h) for h in _playbook_heads(a, master)]
+
+
 def card_catalog(a: Analysis, *, oi=None, magnets=None,
-                 forecast=None, master=None) -> dict[str, Field]:
+                 forecast=None, master=None, lines=None) -> dict[str, Field]:
     """Every tile this analysis can support, keyed by name.
 
     The dashboard renders the keys as checkboxes; anything the current file
@@ -432,7 +464,8 @@ def card_catalog(a: Analysis, *, oi=None, magnets=None,
              "expired contracts excluded"),
         ])
 
-    heads = _playbook_heads(a, master)
+    heads = [h for h in _playbook_heads(a, master)
+             if lines is None or _playbook_key(h) in lines]
     if heads:
         cat["interpretation"] = Field(
             "interpretation", "Trading interpretation",
@@ -440,6 +473,21 @@ def card_catalog(a: Analysis, *, oi=None, magnets=None,
             lambda a: "",
             hue="amber", icon="flag", span=6,
             rows=lambda a, h=heads: [(f"· {t}", "", "slate") for t in h])
+
+    # The dashboard's level ladder, as it appears on the page: every
+    # actionable level in one price-sorted table with what it means.
+    from dealer_gex.report import key_ladder
+    ladder = key_ladder(a)
+    if ladder is not None and not ladder.empty:
+        cat["level_ladder"] = Field(
+            "level_ladder", "Level ladder",
+            lambda a: "levels",
+            lambda a: "",
+            hue="sky", icon="wall", span=6,
+            columns=("Level", "Price", "Reading"),
+            rows=lambda a, t=ladder: [
+                (str(r["Level"]), f"{float(r['Price']):,.2f}", str(r["Reading"]))
+                for _, r in t.iterrows()])
 
     fmove = getattr(forecast, "blended_pct", None) if forecast is not None else None
     if fmove is not None and getattr(forecast, "status", "") == "ok":

@@ -41,6 +41,7 @@ from dealer_gex.instruments import (
 )
 from dealer_gex.share import (
     DEFAULT_KEYS, SIZES, STYLES, build_share_card, card_catalog, card_filename,
+    playbook_choices,
 )
 from dealer_gex.report import (
     build_markdown, build_playbook, executive_summary, key_ladder,
@@ -1607,8 +1608,18 @@ def share_card_section(a: Analysis, ticker: str,
             a = convert_analysis(a, conv)
             magnets = convert_frame(magnets, conv, a.spot)
             master = convert_frame(master, conv, a.spot)
+        # which interpretation lines the card carries — the dashboard shows
+        # all eight, a card is usually making one point
+        choices = playbook_choices(a, master)
+        line_labels = {k: t for k, t in choices}
+        picked_lines = st.multiselect(
+            "Interpretation lines", options=[k for k, _ in choices],
+            default=[k for k, _ in choices], key="card_lines",
+            format_func=lambda k: line_labels[k][:70],
+            help="Only used by the Trading interpretation tile.")
+
         cat = card_catalog(a, oi=oi_walls(a), magnets=magnets, forecast=forecast,
-                           master=master)
+                           master=master, lines=set(picked_lines))
         keys = list(cat)
 
         title = st.text_input(

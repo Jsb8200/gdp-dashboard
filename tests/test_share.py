@@ -706,3 +706,39 @@ def test_the_ladder_strike_labels_are_centred_in_their_gutter(sample):
     assert lit.size
     # ink sits away from both edges of the gutter, i.e. it is centred
     assert lit.min() > 2 and lit.max() < 68
+
+
+def test_interpretation_lines_can_be_chosen_individually(sample):
+    """The dashboard shows all eight; a card is usually making one point."""
+    from dealer_gex.analytics import confluence_levels, magnet_levels, oi_levels
+    from dealer_gex.share import playbook_choices
+    m, o = magnet_levels(sample), oi_levels(sample)
+    master = confluence_levels(sample, m, o)
+    choices = playbook_choices(sample, master)
+    keys = [k for k, _ in choices]
+    assert len(set(keys)) == len(keys)          # keys identify a line uniquely
+    assert "other" not in keys                  # every line was classified
+
+    few = card_catalog(sample, magnets=m, master=master, lines={"regime", "flip"})
+    got = [r[0] for r in few["interpretation"].rows(sample)]
+    assert len(got) == 2
+    assert any("Regime" in g for g in got) and any("gamma flip" in g for g in got)
+
+    # no lines selected drops the tile rather than drawing an empty panel
+    assert "interpretation" not in card_catalog(sample, magnets=m, master=master,
+                                                lines=set())
+
+
+def test_the_level_ladder_tile_matches_the_dashboard_table(sample):
+    from dealer_gex.report import key_ladder
+    cat = card_catalog(sample)
+    f = cat["level_ladder"]
+    assert f.columns == ("Level", "Price", "Reading") and f.span == 6
+    rows = f.rows(sample)
+    want = key_ladder(sample)
+    assert len(rows) == len(want)
+    assert [r[0] for r in rows] == list(want["Level"])       # same order
+    assert rows[0][1] == f"{float(want.iloc[0]['Price']):,.2f}"
+    # price-sorted, highest first
+    prices = [float(r[1].replace(",", "")) for r in rows]
+    assert prices == sorted(prices, reverse=True)
