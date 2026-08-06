@@ -997,8 +997,11 @@ def build_share_card(a: Analysis, ticker: str = "", *,
     tf = _font(38 * SCALE, True)
     _text(d, (hx, hy - 20 * SCALE), label, tf, sty["value"], "lm")
     lw = d.textlength(label, font=tf)
-    _text(d, (hx + lw + 20 * SCALE, hy - 19 * SCALE), f"{a.spot:,.2f}",
-          _font(29 * SCALE, True), theme["accent"], "lm")
+    sf = _font(29 * SCALE, True)
+    spot_txt = f"{a.spot:,.2f}"
+    spot_x = hx + lw + 20 * SCALE
+    _text(d, (spot_x, hy - 19 * SCALE), spot_txt, sf, theme["accent"], "lm")
+    left_end = spot_x + d.textlength(spot_txt, font=sf)
 
     inst = detect_instrument(ticker)
     # the multiplier changes every dollar figure on the card, so it is stated
@@ -1013,10 +1016,10 @@ def build_share_card(a: Analysis, ticker: str = "", *,
               sty["label"], "lm")
 
     vx1 = w - pad - 30 * SCALE
-    # Profile in the upper-right corner. When one is set it takes the top
-    # line and the verdict pill drops to the second, where it displaces the
-    # tagline — the header holds two lines, and whose card this is outranks
-    # a sentence restating what the pill already says.
+    # Profile in the upper-right corner, and nothing else on that side: the
+    # corner belongs to whoever made the card. The verdict pill moves inline
+    # after the spot price, which reads as one phrase — "SPX 7,484.84, long
+    # gamma" — and the tagline goes, since the pill already says it.
     has_profile = bool(username or avatar)
     if has_profile:
         av = 40 * SCALE
@@ -1029,13 +1032,17 @@ def build_share_card(a: Analysis, ticker: str = "", *,
             _text(d, (vx1 - av - 14 * SCALE, acy), handle,
                   _fit(d, handle, w / 3, 19, 11, bold=True), sty["value"], "rm")
 
-    # verdict pill, right-aligned in the header
     vtxt = theme["verdict"]
     vf = _font(21 * SCALE, True)
     track = 1.6 * SCALE
     vw = d.textlength(vtxt, font=vf) + 3 * track + 40 * SCALE
-    vy0 = (hy + 3 * SCALE) if has_profile else (pad + head_h // 2 - 40 * SCALE)
-    pill = (vx1 - vw, vy0, vx1, vy0 + 44 * SCALE)
+    if has_profile:
+        vy0 = hy - 42 * SCALE
+        pill = (left_end + 22 * SCALE, vy0,
+                left_end + 22 * SCALE + vw, vy0 + 44 * SCALE)
+    else:
+        vy0 = pad + head_h // 2 - 40 * SCALE
+        pill = (vx1 - vw, vy0, vx1, vy0 + 44 * SCALE)
     _paint_rgba(img, pill, lambda od, ox, oy: od.rounded_rectangle(
         [pill[0] - ox, pill[1] - oy, pill[2] - ox - 1, pill[3] - oy - 1],
         radius=22 * SCALE, fill=theme["accent"] + (54,),

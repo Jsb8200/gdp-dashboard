@@ -468,13 +468,40 @@ def test_a_broken_avatar_still_produces_a_card(sample):
     assert broken == build_share_card(sample, "SPX", username="jsb")
 
 
-def test_the_profile_and_the_verdict_do_not_share_a_line(sample):
-    """The header holds two lines. With a profile in the corner the pill has
-    to drop, and the tagline yields to it rather than being overprinted."""
-    a = _open(build_share_card(sample, "SPX"))
-    b = _open(build_share_card(sample, "SPX", username="jsb8200"))
-    assert a.size == b.size            # the header does not grow
-    assert a.tobytes() != b.tobytes()
+def test_the_profile_side_of_the_header_holds_only_the_profile(sample):
+    """The upper-right corner belongs to whoever made the card: the verdict
+    pill moves inline after the spot and the tagline goes, so nothing else
+    is drawn on that side."""
+    im = _open(build_share_card(sample, "SPX", username="jsb8200")).convert("L")
+    px = np.asarray(im, dtype=float)
+    # header spans y in [pad, pad+head_h]; the profile sits on its top line,
+    # so the band under it on the right must be empty
+    pad, head_h = 44 * SCALE, 112 * SCALE
+    band = px[pad + head_h // 2 + 12 * SCALE: pad + head_h - 4 * SCALE,
+              im.width // 2:]
+    assert band.max() < 90, band.max()
+
+    plain = _open(build_share_card(sample, "SPX")).convert("L")
+    same = np.asarray(plain, dtype=float)[
+        pad + head_h // 2 + 12 * SCALE: pad + head_h - 4 * SCALE, im.width // 2:]
+    assert same.max() > 90            # without a profile that band is used
+
+
+def test_a_long_handle_does_not_collide_with_the_pill(sample):
+    """Narrowest card, longest verdict, longest handle — the one case where
+    the inline pill and the profile could meet."""
+    short = copy.copy(sample)
+    object.__setattr__(short, "regime", "short_gamma")
+    png = build_share_card(short, "SPX", size="share",
+                           username="@a_very_long_handle_here",
+                           avatar=_avatar_bytes())
+    im = _open(png).convert("L")
+    px = np.asarray(im, dtype=float)
+    pad, head_h = 44 * SCALE, 112 * SCALE
+    row = px[pad + 20 * SCALE: pad + head_h // 2, :]
+    # a gap of dark pixels must survive between the pill and the handle
+    dark_cols = (row.max(axis=0) < 60)
+    assert dark_cols.any()
 
 
 def test_a_pil_image_is_accepted_as_an_avatar(sample):
