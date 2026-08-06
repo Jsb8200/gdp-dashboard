@@ -516,7 +516,9 @@ def test_the_assumptions_tile_reports_the_real_settings(sample):
     travel with it — and they have to be the settings actually used, not a
     fixed blurb."""
     cat = card_catalog(sample)
+    assert cat["assumptions"].columns == ("Assumption", "Setting", "If it is wrong")
     rows = dict((r[0], r[1]) for r in cat["assumptions"].rows(sample))
+    assert all(len(r) == 3 for r in cat["assumptions"].rows(sample))
     assert f"×{sample.multiplier:g}" in rows["Multiplier"]
     assert f"{sample.rate:.2%}" in rows["Rate"]
     assert f"{sample.n_contracts:,}" in rows["Book"]
@@ -535,3 +537,37 @@ def test_the_assumptions_follow_the_weighting_and_multiplier(sample):
     assert "×50" in b_rows["Multiplier"]
     assert build_share_card(sample, "SPX", fields=[card_catalog(sample)["assumptions"]]) \
         != build_share_card(other, "SPX", fields=[card_catalog(other)["assumptions"]])
+
+
+def test_a_table_tile_draws_a_header_band_and_rules(sample):
+    """The ranked-list layout puts one value hard right, which reads as a
+    mess for prose — a table needs a header and columns."""
+    from dealer_gex.share import ROW_H, STYLES, _draw_table
+    from PIL import Image as _I, ImageDraw as _D
+    im = _I.new("RGB", (700, 260), STYLES["midnight"]["panel"])
+    _draw_table(im, _D.Draw(im), (0, 0, 700, 260),
+                ("A", "B", "C"),
+                [("one", "two", "three"), ("four", "five", "six")],
+                STYLES["midnight"])
+    px = np.asarray(im.convert("L"), dtype=float)
+    rh = min(ROW_H, 260 / 3)
+    header = px[2:int(rh) - 2].mean()
+    body = px[int(rh) + 4:int(rh * 2) - 4].mean()
+    assert header > body          # the band is lighter than the rows
+
+
+def test_a_table_row_is_reserved_for_the_header(sample):
+    """Otherwise the header eats a data row's space and the last row is cut."""
+    from dealer_gex.share import _Tile, _tile_need
+    rows = [("a", "b", "c")] * 4
+    plain = _Tile("x", "1", "", HUES["slate"], "dot", rows, 2)
+    table = _Tile("x", "1", "", HUES["slate"], "dot", rows, 2, None, 1,
+                  ("A", "B", "C"))
+    assert _tile_need(table) > _tile_need(plain)
+
+
+def test_the_assumptions_table_renders_on_a_card(sample):
+    cat = card_catalog(sample)
+    png = build_share_card(sample, "SPX", fields=[cat["assumptions"]])
+    assert png[:8] == b"\x89PNG\r\n\x1a\n"
+    assert _open(png).width == SIZES[DEFAULT_SIZE] * SCALE

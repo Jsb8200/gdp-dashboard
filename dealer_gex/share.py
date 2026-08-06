@@ -185,6 +185,10 @@ class Field:
     hue: object = "slate"
     icon: str = "dot"
     rows: object = None
+    #: Column headers. Set these and ``rows`` renders as a real table —
+    #: header band, hairline rules, left-aligned columns — instead of the
+    #: two-column ranked list.
+    columns: tuple = ()
     #: ``(strike, value)`` pairs drawn as a price ladder — see ``_draw_bars``.
     bars: object = None
     span: int = 1
@@ -380,14 +384,20 @@ def card_catalog(a: Analysis, *, oi=None, magnets=None,
         lambda a: "estimate",
         lambda a: "levels are model output, not observed prices",
         hue="slate", icon="flag", span=2,
+        columns=("Assumption", "Setting", "If it is wrong"),
         rows=lambda a: [
-            ("Dealer sign", "long calls / short puts", "slate"),
-            ("Weighting", _weights.get(a.weight_mode, a.weight_mode), "slate"),
-            ("Multiplier", f"×{a.multiplier:g} per contract", "slate"),
-            ("Rate", f"{a.rate:.2%} risk-free", "slate"),
-            ("Greeks", "Black-Scholes, each contract's IV held fixed", "slate"),
-            ("Book", f"{a.n_contracts:,} contracts · {len(a.expiries)} expiries"
-                     " · expired excluded", "slate"),
+            ("Dealer sign", "long calls / short puts",
+             "every GEX sign flips"),
+            ("Weighting", _weights.get(a.weight_mode, a.weight_mode),
+             "levels describe a different book"),
+            ("Multiplier", f"×{a.multiplier:g}",
+             "every dollar figure rescales"),
+            ("Rate", f"{a.rate:.2%}",
+             "only fills missing greeks"),
+            ("Greeks", "Black-Scholes, IV fixed",
+             "no vol response as spot moves"),
+            ("Book", f"{a.n_contracts:,} contracts · {len(a.expiries)} expiries",
+             "expired contracts excluded"),
         ])
 
     fmove = getattr(forecast, "blended_pct", None) if forecast is not None else None
@@ -777,6 +787,57 @@ def _draw_bars(d: ImageDraw.ImageDraw, box, data, spot: float, sty: dict) -> Non
     _text(d, (x0, y1), f"{ks[0]:,.0f}", f, sty["sub"], "ld")
 
 
+def _draw_table(img: Image.Image, d: ImageDraw.ImageDraw, box, columns, rows,
+                sty: dict) -> None:
+    """A real table: header band, hairline rules, left-aligned columns.
+
+    The ranked-list layout puts one value hard right, which works for a
+    price ladder and reads as a mess for prose. Columns are sized to their
+    own widest cell, and the last one takes whatever is left, so a short
+    key column does not steal room from a sentence.
+    """
+    x0, y0, x1, y1 = box
+    n = len(rows) + 1
+    rh = min(ROW_H, (y1 - y0) / max(n, 1))
+    size = max(int(min(14, rh / SCALE * 0.60)), 9)
+    f, fb = _font(size * SCALE), _font(size * SCALE, True)
+
+    ncol = len(columns)
+    pad_c = 14 * SCALE
+    # every column but the last is as wide as its widest cell
+    widths = []
+    for i in range(ncol - 1):
+        cells = [str(columns[i])] + [str(r[i]) for r in rows if len(r) > i]
+        widths.append(max(d.textlength(c, font=fb) for c in cells) + pad_c * 2)
+    widths.append(max((x1 - x0) - sum(widths), pad_c * 4))
+
+    # header band, then a rule under it and one between each pair of rows
+    _paint_rgba(img, (x0, y0, x1, y0 + rh),
+                lambda od, ox, oy: od.rectangle(
+                    [0, 0, int(x1 - x0), int(rh)], fill=(255, 255, 255, 12)))
+    d = ImageDraw.Draw(img)
+    for i in range(n + 1):
+        yy = y0 + i * rh
+        d.line([(x0, yy), (x1, yy)], fill=sty["border"], width=max(1, SCALE // 2))
+
+    cx = x0
+    for i, head in enumerate(columns):
+        _text(d, (cx + pad_c, y0 + rh / 2), _caps(str(head)), fb,
+              sty["label"], "lm")
+        cx += widths[i]
+
+    for j, row in enumerate(rows):
+        ry = y0 + (j + 1) * rh + rh / 2
+        cx = x0
+        for i in range(ncol):
+            cell = str(row[i]) if len(row) > i else ""
+            # the first column names the thing; the rest report it
+            colour = sty["value"] if i == 0 else sty["sub"]
+            _text(d, (cx + pad_c, ry),
+                  cell, fb if i == 0 else f, colour, "lm")
+            cx += widths[i]
+
+
 def _initials(name: str) -> str:
     """Up to two initials from a handle, for when there is no picture."""
     parts = [p for p in re.split(r"[\s._\-@]+", str(name or "")) if p]
@@ -870,6 +931,7 @@ class _Tile:
     span: int
     bars: list | None = None
     rowspan: int = 1
+    columns: tuple = ()
 
 
 def _tile_need(t: _Tile) -> float:
@@ -884,7 +946,9 @@ def _tile_need(t: _Tile) -> float:
         return BARS_H
     if not t.rows:
         return TILE_H
-    return 22 * SCALE + 30 * SCALE + 16 * SCALE + len(t.rows) * ROW_H + 22 * SCALE
+    # a table carries a header row of its own
+    n = len(t.rows) + (1 if t.columns else 0)
+    return 22 * SCALE + 30 * SCALE + 16 * SCALE + n * ROW_H + 22 * SCALE
 
 
 def _place(tiles: list) -> tuple[int, list, list]:
@@ -971,7 +1035,8 @@ def build_share_card(a: Analysis, ticker: str = "", *,
     tiles = [_Tile(f.label, f.value(a), (f.sub(a) if f.sub else ""),
                    _hue_of(f, a), f.icon,
                    f.rows(a) if f.rows else None, max(1, f.span),
-                   f.bars(a) if f.bars else None, max(1, f.rowspan))
+                   f.bars(a) if f.bars else None, max(1, f.rowspan),
+                   tuple(f.columns))
              for f in spec]
     for i, extra in enumerate(extras or []):
         lab, val, sb = extra[0], extra[1], (extra[2] if len(extra) > 2 else "")
@@ -1116,7 +1181,11 @@ def build_share_card(a: Analysis, ticker: str = "", *,
         vy = y0 + inset + chip + 16 * SCALE
         room = th - (vy - y0) - inset
 
-        if t.bars:
+        if t.columns and t.rows:
+            _draw_table(img, d, (cx, vy, x0 + tile_w - 24 * SCALE,
+                                 y0 + th - inset), t.columns, t.rows, sty)
+            d = ImageDraw.Draw(img)
+        elif t.bars:
             _draw_bars(d, (cx, vy, x0 + tile_w - 24 * SCALE,
                            y0 + th - inset - 20 * SCALE),
                        t.bars, a.spot, sty)
