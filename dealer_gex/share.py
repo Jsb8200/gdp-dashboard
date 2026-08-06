@@ -973,9 +973,11 @@ def _draw_bars(d: ImageDraw.ImageDraw, box, data, spot: float, sty: dict) -> Non
     A strike axis laid out horizontally forces you to re-map the picture
     onto the chart you already have in your head.
 
-    The zero line is placed by the data, not down the middle: a book that
-    is long gamma nearly everywhere should show one shallow red stub beside
-    a wall of green, and centring the axis would draw that as balanced.
+    The zero line runs down the middle and both sides share one scale, set
+    by the largest absolute bar. Centring costs the axis its "how much of
+    this book is positive" read, but it keeps the two halves comparable —
+    a bar twice as long is twice the gamma, whichever side it is on — and
+    stops a single outlier from squeezing every other bar into a sliver.
 
     Only the five heaviest strikes are named. Labelling twenty-six of them
     turns the axis into a wall of digits and hides the thing worth reading;
@@ -986,17 +988,20 @@ def _draw_bars(d: ImageDraw.ImageDraw, box, data, spot: float, sty: dict) -> Non
     if not data:
         return
     vals = [v for _, v in data]
-    hi, lo = max(max(vals), 0.0), min(min(vals), 0.0)
-    span = (hi - lo) or 1.0
+    scale = max((abs(v) for v in vals), default=0.0) or 1.0
 
     f = _font(12 * SCALE)
     fb = _font(12 * SCALE, True)
     ks = [k for k, _ in data]
     # a gutter on the right for the strike labels, so the longest bar cannot
     # run into its own number
+    # equal gutters either side, so the zero line lands on the panel's own
+    # centre rather than the centre of whatever is left over after the
+    # right-hand labels have taken their room
     gutter = max(d.textlength(f"{k:,.0f}", font=fb) for k in ks) + 14 * SCALE
-    px1 = x1 - gutter
-    zero_x = x0 + (-lo / span) * (px1 - x0)
+    px0, px1 = x0 + gutter, x1 - gutter
+    zero_x = (px0 + px1) / 2
+    half = (px1 - px0) / 2
     bh = (y1 - y0) / len(data)
 
     # rank by absolute gamma: a big negative strike matters as much as a big
@@ -1008,7 +1013,7 @@ def _draw_bars(d: ImageDraw.ImageDraw, box, data, spot: float, sty: dict) -> Non
     marks = []
     for i, (k, v) in enumerate(data):
         cy = y1 - (i + 0.5) * bh
-        tip = zero_x + (v / span) * (px1 - x0)
+        tip = zero_x + (v / scale) * half
         colour = HUES["mint"] if v >= 0 else HUES["rose"]
         if i not in top:
             colour = _mix(colour, dim, 0.55)
@@ -1039,12 +1044,12 @@ def _draw_bars(d: ImageDraw.ImageDraw, box, data, spot: float, sty: dict) -> Non
         j = max(i for i, k in enumerate(ks) if k <= spot)
         frac = ((spot - ks[j]) / (ks[j + 1] - ks[j])) if j + 1 < len(ks) else 0.0
         sy = y1 - (j + 0.5 + frac) * bh
-        for xx in range(int(x0), int(px1), 8 * SCALE):
+        for xx in range(int(px0), int(px1), 8 * SCALE):
             d.line([(xx, sy), (xx + 4 * SCALE, sy)], fill=sty["label"], width=SCALE)
-        _text(d, (x0, sy - 4 * SCALE), f"{spot:,.0f}", f, sty["label"], "ld")
+        _text(d, (px0 - 8 * SCALE, sy), f"{spot:,.0f}", f, sty["label"], "rm")
 
-    _text(d, (x0, y0), f"{ks[-1]:,.0f}", f, sty["sub"], "la")
-    _text(d, (x0, y1), f"{ks[0]:,.0f}", f, sty["sub"], "ld")
+    _text(d, (px0 - 8 * SCALE, y0), f"{ks[-1]:,.0f}", f, sty["sub"], "ra")
+    _text(d, (px0 - 8 * SCALE, y1), f"{ks[0]:,.0f}", f, sty["sub"], "rd")
 
 
 def _draw_table(img: Image.Image, d: ImageDraw.ImageDraw, box, columns, rows,

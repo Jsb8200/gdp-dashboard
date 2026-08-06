@@ -388,20 +388,44 @@ def test_every_size_renders_at_its_declared_width(sample):
         assert im.size == card_size(len(CARD_FIELDS), size=name)
 
 
-def test_the_zero_line_follows_the_data_not_the_middle():
-    """A book that is long gamma nearly everywhere should show one shallow
-    red stub under a wall of green — centring the axis would draw that as a
-    balanced book."""
+def test_the_zero_line_is_centred_and_both_sides_share_one_scale():
+    """Centring keeps the halves comparable — a bar twice as long is twice
+    the gamma whichever side it is on — and stops one outlier squeezing
+    every other bar into a sliver."""
     from PIL import Image as _I, ImageDraw as _D
     from dealer_gex.share import STYLES, _draw_bars
-    im = _I.new("RGB", (200, 100), (0, 0, 0))
-    d = _D.Draw(im)
-    _draw_bars(d, (0, 0, 200, 100), [(1.0, 10.0), (2.0, 9.0), (3.0, -1.0)],
-               2.0, STYLES["midnight"])
+    W, H = 400, 90
+    im = _I.new("RGB", (W, H), (0, 0, 0))
+    _draw_bars(_D.Draw(im), (0, 0, W, H),
+               [(1.0, -5.0), (2.0, 10.0)], 1.5, STYLES["midnight"])
     px = np.asarray(im.convert("L"), dtype=float)
-    lit = np.flatnonzero(px.max(axis=1) > 20)
-    # most of the ink sits above the zero line, which is low in the frame
-    assert lit.size and np.median(lit) < 60
+
+    def run(row):
+        """Longest contiguous lit run on this row — the bar. Isolated glyphs
+        from the strike labels sit in the gutter and are shorter."""
+        lit = px[row] > 20
+        best = cur = None
+        for x, on in enumerate(lit):
+            if on:
+                cur = (x, x) if cur is None else (cur[0], x)
+                if best is None or (cur[1] - cur[0]) > (best[1] - best[0]):
+                    best = cur
+            else:
+                cur = None
+        return best
+
+    # rows are drawn high strike first: +10 on top, -5 below
+    pos = run(int(H * 0.25))
+    neg = run(int(H * 0.75))
+    assert pos and neg
+    centre = (pos[0] + neg[1]) / 2
+    # both bars start at the same x — the shared zero line
+    assert abs(pos[0] - neg[1]) < 4
+    # and it sits on the panel's own centre — equal gutters either side, so
+    # the right-hand strike labels do not push the axis left
+    assert centre == pytest.approx(W / 2, abs=3)
+    # twice the value, twice the length
+    assert (pos[1] - pos[0]) == pytest.approx(2 * (neg[1] - neg[0]), rel=0.15)
 
 
 def test_the_gex_ladder_is_a_tall_left_hand_tile(sample):
