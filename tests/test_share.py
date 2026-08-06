@@ -431,3 +431,54 @@ def test_the_ladder_puts_high_strikes_at_the_top():
     # the biggest bar belongs to the highest strike, so the ink is up top
     rows = px.sum(axis=1)
     assert rows[:40].sum() > rows[80:].sum()
+
+
+def _avatar_bytes(w=600, h=260):
+    """Deliberately not square: a profile picture is cover-cropped, not
+    squashed, and the wrong one shows up as a stretched face."""
+    from PIL import Image as _I, ImageDraw as _D
+    im = _I.new("RGB", (w, h), (18, 90, 140))
+    _D.Draw(im).ellipse([w // 2 - 60, 10, w // 2 + 60, 130], fill=(250, 200, 60))
+    buf = io.BytesIO(); im.save(buf, "PNG")
+    return buf.getvalue()
+
+
+def test_a_profile_changes_the_card(sample):
+    plain = build_share_card(sample, "SPX")
+    named = build_share_card(sample, "SPX", username="jsb8200")
+    withpic = build_share_card(sample, "SPX", username="jsb8200",
+                               avatar=_avatar_bytes())
+    assert len({plain, named, withpic}) == 3
+
+
+def test_initials_come_from_the_handle():
+    from dealer_gex.share import _initials
+    assert _initials("jsb8200") == "JS"
+    assert _initials("@jane.doe") == "JD"
+    assert _initials("Jane Doe") == "JD"
+    assert _initials("") == "?"
+    assert _initials(None) == "?"
+
+
+def test_a_broken_avatar_still_produces_a_card(sample):
+    """A picture that Pillow cannot open is not a reason to lose the
+    numbers — it falls back to initials."""
+    broken = build_share_card(sample, "SPX", username="jsb", avatar=b"not an image")
+    assert broken[:8] == b"\x89PNG\r\n\x1a\n"
+    assert broken == build_share_card(sample, "SPX", username="jsb")
+
+
+def test_the_profile_and_the_verdict_do_not_share_a_line(sample):
+    """The header holds two lines. With a profile in the corner the pill has
+    to drop, and the tagline yields to it rather than being overprinted."""
+    a = _open(build_share_card(sample, "SPX"))
+    b = _open(build_share_card(sample, "SPX", username="jsb8200"))
+    assert a.size == b.size            # the header does not grow
+    assert a.tobytes() != b.tobytes()
+
+
+def test_a_pil_image_is_accepted_as_an_avatar(sample):
+    from PIL import Image as _I
+    im = _I.new("RGB", (120, 120), (200, 40, 90))
+    got = build_share_card(sample, "SPX", username="x", avatar=im)
+    assert got != build_share_card(sample, "SPX", username="x")

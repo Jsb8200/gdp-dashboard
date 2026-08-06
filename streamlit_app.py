@@ -1622,6 +1622,20 @@ def share_card_section(a: Analysis, ticker: str,
             "Subtitle", value="", key="card_subtitle",
             placeholder="auto — instrument · multiplier · date · contracts",
             help="Leave empty to keep the generated line.")
+
+        # Whose read this is, for once the picture leaves the app.
+        p1, p2 = st.columns([1, 1])
+        card_user = p1.text_input(
+            "Profile name", value="", key="card_username", placeholder="@handle",
+            help="Shown in the card's upper-right corner. Setting a profile "
+                 "moves the regime pill to the second line.")
+        avatar_file = p2.file_uploader(
+            "Profile picture", type=["png", "jpg", "jpeg", "webp"],
+            key="card_avatar",
+            help="Cropped to a circle. Without one, the handle's initials are "
+                 "drawn instead.")
+        avatar_bytes = avatar_file.getvalue() if avatar_file is not None else None
+
         if conv.active:
             st.caption(
                 f"🔁 Card levels on **{conv.target}** — {conv.label()}. Dollar "
@@ -1641,8 +1655,8 @@ def share_card_section(a: Analysis, ticker: str,
 
     fields = [cat[k] for k in picked]
     png = build_share_card(a, title, fields=fields, style=style, size=size,
-                           footnote=footnote,
-                           subtitle=subtitle or None)
+                           footnote=footnote, subtitle=subtitle or None,
+                           username=card_user, avatar=avatar_bytes)
     st.image(png, use_container_width=True)
     c1, c2 = st.columns([1, 4])
     c1.download_button("⬇️ Download card (.png)", png,

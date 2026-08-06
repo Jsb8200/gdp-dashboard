@@ -756,6 +756,58 @@ def _draw_bars(d: ImageDraw.ImageDraw, box, data, spot: float, sty: dict) -> Non
     _text(d, (x0, y1), f"{ks[0]:,.0f}", f, sty["sub"], "ld")
 
 
+def _initials(name: str) -> str:
+    """Up to two initials from a handle, for when there is no picture."""
+    parts = [p for p in re.split(r"[\s._\-@]+", str(name or "")) if p]
+    if not parts:
+        return "?"
+    if len(parts) == 1:
+        return parts[0][:2].upper()
+    return (parts[0][:1] + parts[1][:1]).upper()
+
+
+def _draw_avatar(img: Image.Image, box, avatar, name: str, accent, sty: dict) -> None:
+    """A round profile picture, or initials on a tinted disc.
+
+    The image is cover-cropped to a square before the circular mask, so a
+    portrait or a banner-shaped file is centred rather than squashed. A file
+    that Pillow cannot open falls back to initials instead of failing the
+    whole card — a broken avatar is not a reason to lose the numbers.
+    """
+    x0, y0, x1, y1 = (int(v) for v in box)
+    size = min(x1 - x0, y1 - y0)
+    if size <= 2:
+        return
+    mask = Image.new("L", (size * 4, size * 4), 0)
+    ImageDraw.Draw(mask).ellipse([0, 0, size * 4 - 1, size * 4 - 1], fill=255)
+    mask = mask.resize((size, size), Image.LANCZOS)   # smooth rim at 1x cost
+
+    face = None
+    if avatar is not None:
+        try:
+            src = (avatar if isinstance(avatar, Image.Image)
+                   else Image.open(io.BytesIO(avatar)))
+            src = src.convert("RGB")
+            side = min(src.size)
+            left, top = (src.width - side) // 2, (src.height - side) // 2
+            face = src.crop((left, top, left + side, top + side)).resize(
+                (size, size), Image.LANCZOS)
+        except Exception:                              # noqa: BLE001 - see docstring
+            face = None
+    if face is None:
+        face = Image.new("RGB", (size, size), _mix(sty["panel"], accent, 0.28))
+        fd = ImageDraw.Draw(face)
+        txt = _initials(name)
+        fd.text((size / 2, size / 2 + SCALE), txt,
+                font=_font(int(size * 0.42), True), fill=accent, anchor="mm")
+
+    img.paste(face, (x0, y0), mask)
+    _paint_rgba(img, (x0, y0, x0 + size, y0 + size),
+                lambda od, ox, oy: od.ellipse(
+                    [0, 0, size - 1, size - 1],
+                    outline=tuple(accent) + (170,), width=max(1, SCALE)))
+
+
 _DELTA = re.compile(r"^([+\-−][\d.,]+%?)(.*)$")
 
 
@@ -871,7 +923,9 @@ def build_share_card(a: Analysis, ticker: str = "", *,
                      footnote: str = "",
                      style: str = DEFAULT_STYLE,
                      size: str = DEFAULT_SIZE,
-                     subtitle: str | None = None) -> bytes:
+                     subtitle: str | None = None,
+                     username: str = "",
+                     avatar: bytes | None = None) -> bytes:
     """Render the headline read as a PNG and return its bytes.
 
     ``fields`` is the tile set and its order (defaults to ``CARD_FIELDS``);
@@ -880,6 +934,11 @@ def build_share_card(a: Analysis, ticker: str = "", *,
     live on the Analysis. ``style`` picks the look, ``subtitle`` overrides
     the header's second line, ``footnote`` adds a line under the grid — all
     of it driven from the dashboard's card controls.
+
+    ``username`` and ``avatar`` put a profile in the upper-right corner so
+    the card carries whose read it is once it leaves the app. ``avatar``
+    takes image bytes or a PIL image; without one the initials of the handle
+    are drawn instead.
     """
     sty = STYLES.get(style, STYLES[DEFAULT_STYLE])
     theme = THEMES.get(a.regime, THEMES["long_gamma"])
@@ -953,13 +1012,29 @@ def build_share_card(a: Analysis, ticker: str = "", *,
               _fit(d, subtitle, w - 2 * pad - 300 * SCALE, 16, 11),
               sty["label"], "lm")
 
+    vx1 = w - pad - 30 * SCALE
+    # Profile in the upper-right corner. When one is set it takes the top
+    # line and the verdict pill drops to the second, where it displaces the
+    # tagline — the header holds two lines, and whose card this is outranks
+    # a sentence restating what the pill already says.
+    has_profile = bool(username or avatar)
+    if has_profile:
+        av = 40 * SCALE
+        acy = hy - 20 * SCALE
+        abox = (vx1 - av, acy - av / 2, vx1, acy + av / 2)
+        _draw_avatar(img, abox, avatar, username, theme["accent"], sty)
+        d = ImageDraw.Draw(img)
+        if username:
+            handle = username if username.startswith("@") else f"@{username}"
+            _text(d, (vx1 - av - 14 * SCALE, acy), handle,
+                  _fit(d, handle, w / 3, 19, 11, bold=True), sty["value"], "rm")
+
     # verdict pill, right-aligned in the header
     vtxt = theme["verdict"]
     vf = _font(21 * SCALE, True)
     track = 1.6 * SCALE
     vw = d.textlength(vtxt, font=vf) + 3 * track + 40 * SCALE
-    vx1 = w - pad - 30 * SCALE
-    vy0 = pad + head_h // 2 - 40 * SCALE
+    vy0 = (hy + 3 * SCALE) if has_profile else (pad + head_h // 2 - 40 * SCALE)
     pill = (vx1 - vw, vy0, vx1, vy0 + 44 * SCALE)
     _paint_rgba(img, pill, lambda od, ox, oy: od.rounded_rectangle(
         [pill[0] - ox, pill[1] - oy, pill[2] - ox - 1, pill[3] - oy - 1],
@@ -970,9 +1045,10 @@ def build_share_card(a: Analysis, ticker: str = "", *,
     _tracked(d, ((pill[0] + pill[2]) / 2 - pw / 2,
                  (pill[1] + pill[3]) / 2 - 13 * SCALE),
              vtxt, vf, theme["accent"], track)
-    tag = theme["tagline"]
-    _text(d, (vx1, pad + head_h - 24 * SCALE), tag,
-          _fit(d, tag, w / 2 - 40 * SCALE, 15, 10), sty["sub"], "rs")
+    if not has_profile:
+        tag = theme["tagline"]
+        _text(d, (vx1, pad + head_h - 24 * SCALE), tag,
+              _fit(d, tag, w / 2 - 40 * SCALE, 15, 10), sty["sub"], "rs")
 
     # --- tiles ----------------------------------------------------------
     for t, (r, c, span, rspan) in zip(tiles, places):
