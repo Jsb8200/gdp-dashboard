@@ -369,6 +369,27 @@ def card_catalog(a: Analysis, *, oi=None, magnets=None,
                  "lime" if str(r["kind"]).startswith("magnet") else "orange")
                 for _, r in t.iterrows()])
 
+    # What the numbers rest on. A card travels without the dashboard's
+    # methodology panel attached, so the caveats have to be able to travel
+    # with it — every level here is model output, not an observed price.
+    _weights = {"open_interest": "open interest (standing book)",
+                "volume": "volume (today's tape)",
+                "flow": "signed order flow"}
+    cat["assumptions"] = Field(
+        "assumptions", "Assumptions",
+        lambda a: "estimate",
+        lambda a: "levels are model output, not observed prices",
+        hue="slate", icon="flag", span=2,
+        rows=lambda a: [
+            ("Dealer sign", "long calls / short puts", "slate"),
+            ("Weighting", _weights.get(a.weight_mode, a.weight_mode), "slate"),
+            ("Multiplier", f"×{a.multiplier:g} per contract", "slate"),
+            ("Rate", f"{a.rate:.2%} risk-free", "slate"),
+            ("Greeks", "Black-Scholes, each contract's IV held fixed", "slate"),
+            ("Book", f"{a.n_contracts:,} contracts · {len(a.expiries)} expiries"
+                     " · expired excluded", "slate"),
+        ])
+
     fmove = getattr(forecast, "blended_pct", None) if forecast is not None else None
     if fmove is not None and getattr(forecast, "status", "") == "ok":
         cat["forecast"] = Field(

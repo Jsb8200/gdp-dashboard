@@ -509,3 +509,29 @@ def test_a_pil_image_is_accepted_as_an_avatar(sample):
     im = _I.new("RGB", (120, 120), (200, 40, 90))
     got = build_share_card(sample, "SPX", username="x", avatar=im)
     assert got != build_share_card(sample, "SPX", username="x")
+
+
+def test_the_assumptions_tile_reports_the_real_settings(sample):
+    """A card travels without the methodology panel, so the caveats have to
+    travel with it — and they have to be the settings actually used, not a
+    fixed blurb."""
+    cat = card_catalog(sample)
+    rows = dict((r[0], r[1]) for r in cat["assumptions"].rows(sample))
+    assert f"×{sample.multiplier:g}" in rows["Multiplier"]
+    assert f"{sample.rate:.2%}" in rows["Rate"]
+    assert f"{sample.n_contracts:,}" in rows["Book"]
+    assert "long calls / short puts" == rows["Dealer sign"]
+    assert cat["assumptions"].span == 2
+
+
+def test_the_assumptions_follow_the_weighting_and_multiplier(sample):
+    other = copy.copy(sample)
+    object.__setattr__(other, "weight_mode", "volume")
+    object.__setattr__(other, "multiplier", 50.0)
+    a_rows = dict((r[0], r[1]) for r in card_catalog(sample)["assumptions"].rows(sample))
+    b_rows = dict((r[0], r[1]) for r in card_catalog(other)["assumptions"].rows(other))
+    assert "open interest" in a_rows["Weighting"]
+    assert "volume" in b_rows["Weighting"]
+    assert "×50" in b_rows["Multiplier"]
+    assert build_share_card(sample, "SPX", fields=[card_catalog(sample)["assumptions"]]) \
+        != build_share_card(other, "SPX", fields=[card_catalog(other)["assumptions"]])
