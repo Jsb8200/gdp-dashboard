@@ -824,24 +824,22 @@ def test_block_tiles_come_from_the_real_flow_export(flow_prints):
     assert png[:8] == b"\x89PNG\r\n\x1a\n"
 
 
-def test_the_ladder_price_is_coloured_by_which_side_of_spot_it_is(sample):
-    """The ladder is price-sorted, so the colour break marks where price
-    actually is without having to find the Spot row."""
+def test_the_ladder_price_is_highlighted_and_spot_is_accented(sample):
+    """One colour for the prices — green/red would repeat what the walls and
+    the GEX bars already say — and the regime accent on the spot row, which
+    is all a price-sorted ladder needs to show where spot sits."""
     cat = card_catalog(sample)
     rows = cat["level_ladder"].rows(sample)
+    accent = THEMES[sample.regime]["accent"]
     seen_spot = False
     for level, price, _reading in rows:
         assert isinstance(price, tuple)          # (text, hue)
         text, hue = price
-        value = float(text.replace(",", ""))
-        if value > sample.spot:
-            assert hue == "mint", level
-            assert not seen_spot                 # greens all come first
-        elif value < sample.spot:
-            assert hue == "rose", level
-        else:
-            assert hue == "slate" and level == "Spot"
+        if float(text.replace(",", "")) == sample.spot:
+            assert hue == accent and level == "Spot"
             seen_spot = True
+        else:
+            assert hue == "sky", level
     assert seen_spot
 
 

@@ -545,14 +545,16 @@ def card_catalog(a: Analysis, *, oi=None, magnets=None, forecast=None,
             lambda a: "",
             hue="sky", icon="wall", span=6,
             columns=("Level", "Price", "Reading"),
-            # green above spot, red below, white on the spot row itself —
-            # the ladder is price-sorted, so the colour break marks where
-            # price actually is without needing to find the row
+            # One highlight colour for every price, and the regime accent on
+            # the spot row. Green/red here would repeat what the walls and
+            # the GEX bars already say in those two colours, and a price is
+            # not itself an up or a down — the ladder is price-sorted, so the
+            # accented row is all that is needed to see where spot sits.
             rows=lambda a, t=ladder: [
                 (str(r["Level"]),
                  (f"{float(r['Price']):,.2f}",
-                  "mint" if float(r["Price"]) > a.spot
-                  else "rose" if float(r["Price"]) < a.spot else "slate"),
+                  THEMES[a.regime]["accent"] if float(r["Price"]) == a.spot
+                  else "sky"),
                  str(r["Reading"]))
                 for _, r in t.iterrows()])
 
